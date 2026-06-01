@@ -10,7 +10,7 @@ use crate::tui::shared::{
 use crate::tui::{
     action_param_row_layouts, action_param_rows_for_dialog,
     format_prop_dialog_action_list_item_line, format_prop_dialog_list_item_line,
-    fullscreen_dialog_inner_area, prop_dialog_indices_for_tab, prop_dialog_title,
+    fullscreen_dialog_inner_area, lang_str, prop_dialog_indices_for_tab, prop_dialog_title,
     prop_edit_textarea_area, prop_editor_header_lines, prop_editor_layout,
     push_message_cli_preview_line, push_message_command_area, render_textarea_widget,
     single_line_textarea, textarea_visual_height, top_bottom_borders,
@@ -27,7 +27,7 @@ pub(crate) fn draw_prop_dialog(
     if let Some(dialog) = &mut app.prop_dialog {
         let popup = frame.area();
         frame.render_widget(Clear, popup);
-        let title = prop_dialog_title(dialog);
+        let title = prop_dialog_title(dialog, app.language);
         frame.render_widget(
             Block::default()
                 .title(title)
@@ -83,9 +83,9 @@ pub(crate) fn draw_prop_dialog(
             Style::default()
         };
         if dialog.editing {
-            let layout = prop_editor_layout(dialog, inner);
+            let layout = prop_editor_layout(dialog, inner, app.language);
             let top_text = Text::from(
-                prop_editor_header_lines(dialog)
+                prop_editor_header_lines(dialog, app.language)
                     .into_iter()
                     .map(Line::from)
                     .collect::<Vec<_>>(),
@@ -99,7 +99,7 @@ pub(crate) fn draw_prop_dialog(
             if dialog.active_tab == BoolDialogTab::ReadOnly {
                 if let Some(footer_area) = layout.footer_area {
                     let bottom_text = Text::from(
-                        super::super::prop_editor_bottom_lines(dialog)
+                        super::super::prop_editor_bottom_lines(dialog, app.language)
                             .into_iter()
                             .map(Line::from)
                             .collect::<Vec<_>>(),
@@ -222,7 +222,7 @@ pub(crate) fn draw_prop_dialog(
                     }
                 }
             }
-            let bottom_lines = super::super::prop_editor_bottom_lines(dialog);
+            let bottom_lines = super::super::prop_editor_bottom_lines(dialog, app.language);
             if let Some(footer_area) = layout.footer_area {
                 let bottom_text = if let Some(active) = selected_text.as_ref() {
                     if active.snapshot.surface == SelectionSurface::PropEditorFooter {
@@ -278,7 +278,7 @@ pub(crate) fn draw_prop_dialog(
                 .constraints([Constraint::Length(3), Constraint::Min(1)])
                 .split(inner);
             let visible_tabs = visible_prop_dialog_tabs(dialog);
-            let tab_titles = visible_prop_dialog_tab_titles(dialog)
+            let tab_titles = visible_prop_dialog_tab_titles(dialog, app.language)
                 .into_iter()
                 .map(|name| Line::from(Span::styled(name, Style::default().fg(Color::Blue))))
                 .collect::<Vec<_>>();
@@ -335,6 +335,7 @@ pub(crate) fn draw_prop_dialog(
                                 item,
                                 Some(position) == selected_local,
                                 dialog.loading,
+                                app.language,
                             )
                         }
                     };
@@ -428,7 +429,11 @@ pub(crate) fn draw_prop_dialog(
                 };
                 frame.render_widget(
                     Paragraph::new(reauth_text)
-                        .block(Block::default().borders(top_bottom_borders()).title("登录"))
+                        .block(
+                            Block::default()
+                                .borders(top_bottom_borders())
+                                .title(lang_str(app.language, "登录", "Login")),
+                        )
                         .wrap(Wrap { trim: true }),
                     popup,
                 );
@@ -441,7 +446,7 @@ pub(crate) fn draw_prop_dialog(
                 frame.render_widget(
                     Block::default()
                         .borders(top_bottom_borders())
-                        .title("推送通知"),
+                        .title(lang_str(app.language, "推送通知", "Push Notification")),
                     popup,
                 );
                 let inner = ratatui::layout::Rect::new(
@@ -461,15 +466,24 @@ pub(crate) fn draw_prop_dialog(
                     ])
                     .split(inner);
                 frame.render_widget(
-                    Paragraph::new(format!("账户 ID: {uid}\n\n消息:")).wrap(Wrap { trim: false }),
+                    Paragraph::new(format!(
+                        "{}: {uid}\n\n{}:",
+                        lang_str(app.language, "账户 ID", "Account ID"),
+                        lang_str(app.language, "消息", "Message")
+                    ))
+                    .wrap(Wrap { trim: false }),
                     sections[0],
                 );
                 let textarea = single_line_textarea(input, *cursor, true);
                 render_textarea_widget(&textarea, sections[1], frame.buffer_mut());
                 let command_area = push_message_command_area(frame.area(), input.as_str());
                 frame.render_widget(
-                    Paragraph::new(push_message_cli_preview_line(uid.as_str(), input.as_str()))
-                        .wrap(Wrap { trim: false }),
+                    Paragraph::new(push_message_cli_preview_line(
+                        uid.as_str(),
+                        input.as_str(),
+                        app.language,
+                    ))
+                    .wrap(Wrap { trim: false }),
                     command_area,
                 );
                 if let Some(active) = selected_text.as_ref() {

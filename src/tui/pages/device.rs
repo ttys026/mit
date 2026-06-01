@@ -3,11 +3,12 @@ use unicode_width::UnicodeWidthStr;
 
 #[cfg(test)]
 use crate::mico_api::Device;
+use crate::storage::Language;
+use crate::tui::device_list_header_titles;
 use crate::tui::shared::{
     display_truncate_pad, display_truncate_pad_with_ellipsis, shrink_largest_width,
     table_header_style,
 };
-use crate::tui::DEVICE_LIST_HEADER_TITLES;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DeviceListRow {
@@ -69,12 +70,14 @@ pub(crate) fn device_list_row(
 pub(crate) fn compute_device_list_columns(
     rows: &[DeviceListRow],
     available_width: usize,
+    lang: Language,
 ) -> DeviceListColumns {
+    let headers = device_list_header_titles(lang);
     let mut columns = DeviceListColumns {
-        name: UnicodeWidthStr::width(DEVICE_LIST_HEADER_TITLES[1]) + 2,
-        category: UnicodeWidthStr::width(DEVICE_LIST_HEADER_TITLES[2]) + 2,
-        room: UnicodeWidthStr::width(DEVICE_LIST_HEADER_TITLES[0]) + 2,
-        account: UnicodeWidthStr::width(DEVICE_LIST_HEADER_TITLES[3]) + 2,
+        name: UnicodeWidthStr::width(headers[1]) + 2,
+        category: UnicodeWidthStr::width(headers[2]) + 2,
+        room: UnicodeWidthStr::width(headers[0]) + 2,
+        account: UnicodeWidthStr::width(headers[3]) + 2,
     };
     for row in rows {
         columns.name = columns
@@ -115,31 +118,37 @@ pub(crate) fn format_device_list_item(
     account_label: &str,
 ) -> String {
     let row = device_list_row(&device.name, category, &device.room_name, account_label);
-    let columns = compute_device_list_columns(std::slice::from_ref(&row), usize::MAX);
+    let columns =
+        compute_device_list_columns(std::slice::from_ref(&row), usize::MAX, Language::Chinese);
     format_device_list_item_with_columns(&row, columns)
 }
 
 #[cfg(test)]
-pub(crate) fn format_device_list_header() -> String {
-    let columns = compute_device_list_columns(&[], usize::MAX);
-    format_device_list_header_with_columns(columns)
+pub(crate) fn format_device_list_header(lang: Language) -> String {
+    let columns = compute_device_list_columns(&[], usize::MAX, lang);
+    format_device_list_header_with_columns(columns, lang)
 }
 
-pub(crate) fn format_device_list_header_with_columns(columns: DeviceListColumns) -> String {
+pub(crate) fn format_device_list_header_with_columns(
+    columns: DeviceListColumns,
+    lang: Language,
+) -> String {
+    let headers = device_list_header_titles(lang);
     format!(
         "{}{}{}{}",
-        display_truncate_pad(DEVICE_LIST_HEADER_TITLES[0], columns.room),
-        display_truncate_pad(DEVICE_LIST_HEADER_TITLES[1], columns.name),
-        display_truncate_pad(DEVICE_LIST_HEADER_TITLES[2], columns.category),
-        display_truncate_pad(DEVICE_LIST_HEADER_TITLES[3], columns.account),
+        display_truncate_pad(headers[0], columns.room),
+        display_truncate_pad(headers[1], columns.name),
+        display_truncate_pad(headers[2], columns.category),
+        display_truncate_pad(headers[3], columns.account),
     )
 }
 
 pub(crate) fn format_device_list_header_line_with_columns(
     columns: DeviceListColumns,
+    lang: Language,
 ) -> Line<'static> {
     Line::from(Span::styled(
-        format_device_list_header_with_columns(columns),
+        format_device_list_header_with_columns(columns, lang),
         table_header_style(),
     ))
 }

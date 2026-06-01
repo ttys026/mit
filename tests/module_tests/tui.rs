@@ -20,7 +20,7 @@ use super::{
 };
 use crate::mico_api::Device;
 use crate::property_cache::PropertyCache;
-use crate::storage::{default_auth, normalize_account};
+use crate::storage::{default_auth, normalize_account, Language};
 use crate::tui::pages::account as account_page;
 use crossterm::event::{KeyCode, KeyModifiers};
 use mock_mico_server::MockMicoServer;
@@ -209,7 +209,7 @@ fn collect_readable_props_filters_by_format_and_access() {
             }
         ]
     });
-    let props = collect_readable_props(&spec);
+    let props = collect_readable_props(&spec, Language::Chinese);
     assert_eq!(props.len(), 4);
     assert_eq!(props[0].siid, 2);
     assert_eq!(props[0].piid, 1);
@@ -251,7 +251,7 @@ fn collect_readable_props_prefers_description_trans_copy() {
             }
         ]
     });
-    let props = collect_readable_props(&spec);
+    let props = collect_readable_props(&spec, Language::Chinese);
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].name, "电源");
     assert!(props[0].writable);
@@ -285,7 +285,7 @@ fn collect_readable_props_includes_read_only_and_combines_service_and_property_l
         ]
     });
 
-    let props = collect_readable_props(&spec);
+    let props = collect_readable_props(&spec, Language::Chinese);
     assert_eq!(props.len(), 2);
     assert_eq!(props[0].name, "扬声器服务 / 电源");
     assert_eq!(props[1].name, "扬声器服务 / 只读音量");
@@ -328,7 +328,7 @@ fn collect_readable_props_hides_properties_without_read_access() {
         ]
     });
 
-    let props = collect_readable_props(&spec);
+    let props = collect_readable_props(&spec, Language::Chinese);
     assert_eq!(props.len(), 1);
     assert_eq!(props[0].name, "Readable");
 }
@@ -434,21 +434,21 @@ fn format_device_list_item_does_not_show_mode_field() {
 
 #[test]
 fn format_device_list_header_contains_column_names() {
-    let header = format_device_list_header();
+    let header = format_device_list_header(Language::Chinese);
     assert!(
-        header.starts_with(super::DEVICE_LIST_HEADER_TITLES[0]),
+        header.starts_with(super::device_list_header_titles(Language::Chinese)[0]),
         "{header}"
     );
     assert!(
-        header.contains(super::DEVICE_LIST_HEADER_TITLES[1]),
+        header.contains(super::device_list_header_titles(Language::Chinese)[1]),
         "{header}"
     );
     assert!(
-        header.contains(super::DEVICE_LIST_HEADER_TITLES[2]),
+        header.contains(super::device_list_header_titles(Language::Chinese)[2]),
         "{header}"
     );
     assert!(
-        header.contains(super::DEVICE_LIST_HEADER_TITLES[3]),
+        header.contains(super::device_list_header_titles(Language::Chinese)[3]),
         "{header}"
     );
 }
@@ -468,7 +468,8 @@ fn format_device_list_item_caps_device_name_column_to_ten_chinese_chars_width() 
     };
 
     let row = device_list_row(&device.name, "sp", &device.room_name, "a1");
-    let columns = compute_device_list_columns(std::slice::from_ref(&row), usize::MAX);
+    let columns =
+        compute_device_list_columns(std::slice::from_ref(&row), usize::MAX, Language::Chinese);
     let line = format_device_list_item_with_columns(&row, columns);
     assert_eq!(columns.name, 20);
     assert_eq!(
@@ -496,7 +497,8 @@ fn format_device_list_item_uses_longest_value_plus_one_for_columns() {
     let category = "cat";
     let account_label = "acc";
     let row = device_list_row(&device.name, category, &device.room_name, account_label);
-    let columns = compute_device_list_columns(std::slice::from_ref(&row), usize::MAX);
+    let columns =
+        compute_device_list_columns(std::slice::from_ref(&row), usize::MAX, Language::Chinese);
     let line = format_device_list_item_with_columns(&row, columns);
     assert!(line.starts_with("客厅"), "{line}");
     assert!(line.contains("name"), "{line}");
@@ -541,11 +543,11 @@ fn computed_device_list_columns_match_longest_plus_one_with_name_cap() {
             "账号ABC(12345)",
         ),
     ];
-    let columns = compute_device_list_columns(&rows, usize::MAX);
+    let columns = compute_device_list_columns(&rows, usize::MAX, Language::Chinese);
     assert_eq!(columns.name, 20);
     assert_eq!(
         columns.category,
-        UnicodeWidthStr::width(super::DEVICE_LIST_HEADER_TITLES[2]) + 2
+        UnicodeWidthStr::width(super::device_list_header_titles(Language::Chinese)[2]) + 2
     );
     assert_eq!(
         columns.account,
@@ -571,10 +573,10 @@ fn computed_device_list_columns_shrink_to_available_width() {
     let rows = vec![device_list_row(
         "A very long device name that exceeds the cap",
         "speaker-category",
-        super::DEVICE_LIST_HEADER_TITLES[0],
+        super::device_list_header_titles(Language::Chinese)[0],
         "account-123",
     )];
-    let columns = compute_device_list_columns(&rows, 28);
+    let columns = compute_device_list_columns(&rows, 28, Language::Chinese);
     assert_eq!(columns.total_width(), 28);
 }
 
@@ -612,7 +614,7 @@ fn read_device_categories_from_template_returns_model_category_mapping() {
     )
     .unwrap();
 
-    let categories = read_device_categories_from_template(home.as_path()).unwrap();
+    let categories = read_device_categories_from_template(home.as_path(), Language::Chinese).unwrap();
 
     assert_eq!(
         categories
@@ -809,6 +811,8 @@ fn draw_accounts_selected_row_uses_reversed_style() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -878,6 +882,8 @@ fn draw_devices_selected_row_uses_reversed_style() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -944,6 +950,8 @@ fn draw_accounts_scrolls_to_keep_active_row_visible() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
 
@@ -1005,6 +1013,8 @@ fn draw_devices_scrolls_to_keep_active_row_visible() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
 
@@ -1066,6 +1076,8 @@ fn device_viewport_keeps_window_anchor_when_moving_up_from_bottom_item() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
 
@@ -1144,6 +1156,8 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -1213,6 +1227,8 @@ fn account_action_menu_mouse_wheel_changes_selected_item() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let area = ratatui::layout::Rect::new(0, 0, 80, 24);
     let popup = super::centered_rect(48, 34, area);
@@ -1299,6 +1315,8 @@ fn clicking_selected_account_action_executes_it() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let area = ratatui::layout::Rect::new(0, 0, 80, 24);
     let popup = super::centered_rect(48, 34, area);
@@ -1370,6 +1388,8 @@ fn push_message_action_opens_input_dialog() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -1432,6 +1452,8 @@ fn push_message_dialog_shows_cursor_and_moves_with_left_right() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1510,6 +1532,8 @@ fn push_message_cursor_row_stays_stable_when_typing_first_char() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1581,6 +1605,8 @@ fn push_message_dialog_submits_text_for_selected_account_uid() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -1654,6 +1680,8 @@ fn escaping_push_message_dialog_restores_previous_menu_selection() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -1728,6 +1756,8 @@ fn add_account_port_conflict_shows_error_dialog_without_quitting_tui() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -1783,6 +1813,8 @@ fn draw_does_not_render_command_bar() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1969,6 +2001,8 @@ fn draw_devices_tab_uses_local_cache_when_device_list_is_empty() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2183,6 +2217,8 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     }
 }
 
@@ -2332,6 +2368,8 @@ fn test_app_with_prop_dialog(dialog: BoolDialog) -> TuiApp {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     }
 }
 
@@ -2408,6 +2446,8 @@ fn draw_shows_loading_splash_while_boot_loading() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -2456,6 +2496,8 @@ fn handle_key_blocks_normal_actions_until_boot_ready() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let changed = handle_key(
@@ -2557,6 +2599,8 @@ fn opening_prop_dialog_failure_shows_offline_instead_of_quitting() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -2669,6 +2713,8 @@ fn opening_prop_dialog_uses_device_account_instead_of_selected_account() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -2749,6 +2795,8 @@ fn pressing_j_does_not_move_selection_anymore() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -2842,6 +2890,8 @@ fn devices_tab_enter_opens_prop_dialog_and_p_does_not() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -2948,6 +2998,8 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -3066,6 +3118,8 @@ fn clicking_devices_row_only_changes_active_index() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     // Device tab has a 1-line header. Clicking the header row should not select a device.
@@ -3196,6 +3250,8 @@ fn clicking_selected_device_row_opens_dialog() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_mouse(
@@ -3323,6 +3379,8 @@ fn device_row_mouse_up_does_not_open_dialog() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_mouse(
@@ -3416,6 +3474,8 @@ fn clicking_accounts_row_selects_account() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     handle_mouse(
         &mut app,
@@ -3493,6 +3553,8 @@ fn mouse_wheel_scroll_changes_active_item() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_mouse(
@@ -3616,6 +3678,8 @@ fn mouse_click_is_ignored_while_prop_editing() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_mouse(
@@ -3671,6 +3735,8 @@ fn number_shortcuts_switch_tabs() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -3751,6 +3817,8 @@ fn devices_tab_r_starts_background_sync() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -3811,6 +3879,8 @@ fn devices_tab_s_no_longer_starts_background_sync() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let quit = handle_key(
@@ -3860,6 +3930,8 @@ fn clicking_top_bar_tabs_switches_active_tab() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_mouse(
@@ -3970,6 +4042,8 @@ fn settings_tab_enter_purges_devices_cache_after_single_confirm() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 1,
     };
     app.property_cache.set_device_properties(
         "dev-1".to_string(),
@@ -3991,7 +4065,7 @@ fn settings_tab_enter_purges_devices_cache_after_single_confirm() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let text = terminal_text(&terminal);
     let compact = text.replace(' ', "");
-    assert!(compact.contains("操作：重置设备缓存"), "{text}");
+    assert!(compact.contains("操作:重置设备缓存"), "{text}");
     assert!(!compact.contains("该操作不可恢复"), "{text}");
 
     let quit = handle_key(
@@ -4063,6 +4137,8 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 2,
     };
 
     let quit = handle_key(
@@ -4076,7 +4152,7 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let text = terminal_text(&terminal);
     let compact = text.replace(' ', "");
-    assert!(compact.contains("操作：重置全部设置"), "{text}");
+    assert!(compact.contains("操作:重置全部设置"), "{text}");
     assert!(compact.contains("该操作不可恢复"), "{text}");
 
     let quit = handle_key(
@@ -4131,6 +4207,8 @@ fn settings_tab_shows_only_cache_clear_and_reset_actions() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -4201,6 +4279,8 @@ fn clicking_footer_does_not_copy_status_line() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let _guard = env_guard();
@@ -4284,6 +4364,8 @@ fn mouse_selection_state_is_thread_local() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     assert!(!super::selection_start(
         &push_app,
@@ -4336,6 +4418,8 @@ fn mouse_selection_state_is_thread_local() {
             bootstrap_tx,
             bootstrap_rx,
             property_cache: Arc::new(PropertyCache::new()),
+            language: Language::Chinese,
+            settings_selected: 0,
         };
         let [_tabs_area, list_area, _status_gap_area, _status_bar_area] =
             super::split_main_layout(ratatui::layout::Rect::new(0, 0, 80, 24));
@@ -4413,6 +4497,8 @@ fn selected_push_message_textarea_text_uses_selection_background() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     super::clear_selection_state();
@@ -4507,6 +4593,8 @@ fn footer_leaves_blank_rows_above_and_below_status_text() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -4558,6 +4646,8 @@ fn dragging_logs_text_autocopies_selection() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let _guard = env_guard();
@@ -4643,6 +4733,8 @@ fn dragging_beyond_last_log_still_copies_all_logs() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let _guard = env_guard();
@@ -4728,6 +4820,8 @@ fn shift_c_recopies_last_mouse_selection() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let _guard = env_guard();
@@ -4819,6 +4913,8 @@ fn plain_click_outside_selected_text_clears_selection() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let _guard = env_guard();
@@ -4923,6 +5019,8 @@ fn copy_status_badge_uses_chinese_text_and_expires_in_one_second() {
         bootstrap_tx: mpsc::channel::<BootstrapMessage>().0,
         bootstrap_rx: mpsc::channel::<BootstrapMessage>().1,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let line = super::footer_line(&app, 10_999);
@@ -4970,6 +5068,8 @@ fn copy_status_badge_uses_blue_style() {
         bootstrap_tx: mpsc::channel::<BootstrapMessage>().0,
         bootstrap_rx: mpsc::channel::<BootstrapMessage>().1,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let line = super::footer_line(&app, 10_999);
     assert_eq!(line.spans[1].style.fg, Some(Color::Blue));
@@ -5023,6 +5123,8 @@ fn selected_footer_keeps_dim_style() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     handle_mouse(
@@ -5096,6 +5198,8 @@ fn footer_copied_badge_is_bold_and_expires_after_one_second() {
         bootstrap_tx: mpsc::channel::<BootstrapMessage>().0,
         bootstrap_rx: mpsc::channel::<BootstrapMessage>().1,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let line = super::footer_line(&app, 10_999);
@@ -5167,14 +5271,16 @@ fn footer_text_matches_requested_status_copy() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
-    assert_eq!(super::footer_text(&app), super::ACCOUNT_TAB_STATUS_TEXT);
+    assert_eq!(super::footer_text(&app), "A: 新增账户 Enter: 账户操作");
 
     app.active_tab = 1;
     assert_eq!(
         super::footer_text(&app),
-        format!("{}1 当前设备: dev-1", super::DEVICE_TAB_STATUS_PREFIX)
+        "R: 刷新, Enter: 查看设备, 设备总数: 1 当前设备: dev-1"
     );
 
     app.prop_dialog = Some(BoolDialog {
@@ -5213,7 +5319,7 @@ fn footer_text_matches_requested_status_copy() {
     });
     assert_eq!(
         super::footer_text(&app),
-        format!("{}dev-1", super::PROP_DIALOG_WRITABLE_STATUS_PREFIX)
+        "R: 刷新, Esc: 返回, Enter: 修改属性, 当前设备: dev-1"
     );
 
     if let Some(dialog) = app.prop_dialog.as_mut() {
@@ -5221,7 +5327,7 @@ fn footer_text_matches_requested_status_copy() {
     }
     assert_eq!(
         super::footer_text(&app),
-        format!("{}dev-1", super::PROP_DIALOG_READONLY_STATUS_PREFIX)
+        "R: 刷新, Esc: 返回, Enter: 查看属性, 当前设备: dev-1"
     );
 
     if let Some(dialog) = app.prop_dialog.as_mut() {
@@ -5231,10 +5337,7 @@ fn footer_text_matches_requested_status_copy() {
 
     app.prop_dialog = None;
     app.account_action_dialog = Some(AccountActionDialog::Menu { selected: 0 });
-    assert_eq!(
-        super::footer_text(&app),
-        super::ACCOUNT_ACTION_MENU_STATUS_TEXT
-    );
+    assert_eq!(super::footer_text(&app), "Enter: 选择, Esc: 返回");
 
     app.account_action_dialog = Some(AccountActionDialog::PushMessage {
         uid: "1001".to_string(),
@@ -5242,7 +5345,7 @@ fn footer_text_matches_requested_status_copy() {
         cursor: 0,
         return_to_menu_selected: 0,
     });
-    assert_eq!(super::footer_text(&app), super::PUSH_MESSAGE_STATUS_TEXT);
+    assert_eq!(super::footer_text(&app), "Enter: 发送, Esc: 返回");
 
     app.account_action_dialog = Some(AccountActionDialog::Reauth {
         status: "reauth".to_string(),
@@ -5298,6 +5401,8 @@ fn clicking_refresh_operation_in_footer_triggers_sync() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let terminal_area = ratatui::layout::Rect::new(0, 0, 100, 24);
@@ -5421,6 +5526,8 @@ fn clicking_non_operation_footer_text_has_no_effect() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let terminal_area = ratatui::layout::Rect::new(0, 0, 100, 24);
@@ -5486,6 +5593,8 @@ fn start_bootstrap_without_current_account_enters_ready_state() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.start_bootstrap();
@@ -5593,6 +5702,8 @@ fn start_bootstrap_uses_cached_devices_immediately_while_syncing_in_background()
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.start_bootstrap();
@@ -5666,6 +5777,8 @@ fn process_bootstrap_message_marks_app_ready_after_success() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -5783,6 +5896,8 @@ fn process_bootstrap_message_preserves_selected_device_did_when_present() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -5853,6 +5968,8 @@ fn request_local_transport_refresh_skips_account_after_session_warm() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.request_local_transport_refresh(false);
@@ -5913,6 +6030,8 @@ fn request_local_transport_refresh_force_rewarms_same_account() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.request_local_transport_refresh(true);
@@ -5973,6 +6092,8 @@ fn request_local_transport_refresh_force_queues_when_fetching() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.request_local_transport_refresh(true);
@@ -6053,6 +6174,8 @@ fn request_local_transport_refresh_queues_on_account_switch_while_fetching() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.request_local_transport_refresh(false);
@@ -6114,6 +6237,8 @@ fn process_background_messages_logs_local_transport_refresh_errors() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     local_transport_tx
@@ -6181,6 +6306,8 @@ fn process_background_messages_clears_local_transport_refresh_device_id_on_error
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     local_transport_tx
@@ -6241,6 +6368,8 @@ fn process_auth_flow_completion_closes_reauth_dialog() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.auth_flow_tx
@@ -6297,6 +6426,8 @@ fn failed_auth_flow_shows_port_8000_hint_in_reauth_dialog() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.auth_flow_tx
@@ -6404,6 +6535,8 @@ fn prop_dialog_does_not_force_black_popup_background() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -6495,6 +6628,8 @@ fn prop_dialog_refresh_starts_background_worker() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.request_prop_dialog_refresh();
@@ -6586,6 +6721,8 @@ fn prop_dialog_r_key_starts_background_refresh() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -6701,6 +6838,8 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -6827,6 +6966,8 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     // Replace channel with one that already has a completed refresh payload.
@@ -6965,6 +7106,8 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.process_prop_dialog_loading();
@@ -7069,6 +7212,8 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -7162,6 +7307,8 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -7262,6 +7409,8 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -7432,6 +7581,8 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -7556,6 +7707,8 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -7577,7 +7730,7 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
 #[test]
 fn dialog_subtab_click_bounds_handle_wide_char_titles() {
     let area = ratatui::layout::Rect::new(1, 1, 40, 3);
-    let titles = super::all_prop_dialog_tab_titles();
+    let titles = super::all_prop_dialog_tab_titles(Language::Chinese);
     // "操作" uses wide glyphs and still occupies this column in the first tab.
     assert_eq!(tab_index_for_column_with_titles(7, area, &titles), Some(0));
 }
@@ -7683,7 +7836,7 @@ fn prop_dialog_visible_tab_titles_are_renumbered_one_based() {
     };
 
     assert_eq!(
-        super::visible_prop_dialog_tab_titles(&dialog),
+        super::visible_prop_dialog_tab_titles(&dialog, Language::Chinese),
         vec!["1:修改参数".to_string(), "2:只读属性".to_string()]
     );
 }
@@ -7716,7 +7869,7 @@ fn prop_dialog_visible_tab_titles_empty_when_no_actions_or_properties() {
     };
 
     assert_eq!(
-        super::visible_prop_dialog_tab_titles(&dialog),
+        super::visible_prop_dialog_tab_titles(&dialog, Language::Chinese),
         Vec::<String>::new()
     );
 }
@@ -7756,7 +7909,7 @@ fn prop_dialog_visible_tab_titles_actions_only_renumber_from_one() {
     };
 
     assert_eq!(
-        super::visible_prop_dialog_tab_titles(&dialog),
+        super::visible_prop_dialog_tab_titles(&dialog, Language::Chinese),
         vec!["1:快捷操作".to_string()]
     );
 }
@@ -7799,7 +7952,7 @@ fn prop_dialog_visible_tab_titles_readonly_only_renumber_from_one() {
     };
 
     assert_eq!(
-        super::visible_prop_dialog_tab_titles(&dialog),
+        super::visible_prop_dialog_tab_titles(&dialog, Language::Chinese),
         vec!["1:只读属性".to_string()]
     );
 }
@@ -7856,7 +8009,7 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
 
     let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
     let tabs_area = prop_dialog_tabs_area(terminal_area);
-    let visible_titles = super::visible_prop_dialog_tab_titles(app.prop_dialog.as_ref().unwrap());
+    let visible_titles = super::visible_prop_dialog_tab_titles(app.prop_dialog.as_ref().unwrap(), Language::Chinese);
     let first_visible_tab_column = tab_column_for_index(tabs_area, &visible_titles, 0);
 
     handle_mouse(
@@ -8095,6 +8248,8 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_mouse(
@@ -8242,6 +8397,8 @@ fn clicking_active_prop_dialog_item_executes_it() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_mouse(
@@ -8365,6 +8522,8 @@ fn prop_dialog_actions_tab_renders_action_items() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -8390,7 +8549,7 @@ fn action_param_labels_use_same_service_property_translations() {
             }]
         }]
     });
-    let actions = extract_actions_from_spec(&spec);
+    let actions = extract_actions_from_spec(&spec, Language::Chinese);
     assert_eq!(actions.len(), 1);
     assert_eq!(
         actions[0].input_labels,
@@ -8476,6 +8635,8 @@ fn action_param_edit_supports_tab_and_click_focus_switch() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -8495,6 +8656,7 @@ fn action_param_edit_supports_tab_and_click_focus_switch() {
     let editor_area = super::prop_editor_layout(
         app.prop_dialog.as_ref().unwrap(),
         ratatui::layout::Rect::new(1, 1, 78, 22),
+        Language::Chinese,
     )
     .editor_area;
     handle_mouse(
@@ -8589,6 +8751,8 @@ fn action_param_textarea_row_focus_updates_cursor_and_input() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -8700,6 +8864,8 @@ fn clicking_action_param_textarea_moves_cursor_to_clicked_character() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -8802,6 +8968,8 @@ fn draw_edit_mode_shows_visible_input_cursor() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -8893,6 +9061,8 @@ fn clicking_prop_edit_textarea_moves_cursor_to_clicked_character() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -9002,6 +9172,8 @@ fn action_param_edit_mode_shows_action_title_not_property_title() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -9111,6 +9283,8 @@ fn action_bool_param_uses_selector_editor() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -9380,6 +9554,8 @@ fn action_enum_param_uses_selector_editor() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -9420,7 +9596,7 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
             }]
         }]
     });
-    let actions = extract_actions_from_spec(&spec);
+    let actions = extract_actions_from_spec(&spec, Language::Chinese);
 
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -9491,6 +9667,8 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -9545,7 +9723,7 @@ fn prop_editor_bottom_lines_show_get_then_set_for_writable_props() {
     };
 
     assert_eq!(
-        super::prop_editor_bottom_lines(&dialog),
+        super::prop_editor_bottom_lines(&dialog, Language::Chinese),
         vec![
             "CLI 命令(读取): mit props get dev-1 2 1 --json".to_string(),
             "CLI 命令(执行): mit props set dev-1 2 1 true".to_string(),
@@ -9627,7 +9805,7 @@ fn action_enum_param_without_readable_prop_still_uses_selector_editor() {
             }]
         }]
     });
-    let actions = extract_actions_from_spec(&spec);
+    let actions = extract_actions_from_spec(&spec, Language::Chinese);
 
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -9698,6 +9876,8 @@ fn action_enum_param_without_readable_prop_still_uses_selector_editor() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -9796,6 +9976,8 @@ fn writable_bool_prop_enters_selector_editor_before_execution() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -9902,6 +10084,8 @@ fn writable_bool_prop_selector_highlights_current_option_in_green() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -10009,6 +10193,8 @@ fn writable_enum_prop_enters_selector_editor_before_execution() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -10136,6 +10322,8 @@ fn action_enum_param_selector_highlights_current_option_in_green() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -10230,6 +10418,8 @@ fn clicking_writable_bool_prop_selector_option_updates_selection() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -10362,6 +10552,8 @@ fn clicking_action_enum_param_selector_option_updates_selection() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -10502,6 +10694,8 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -10627,6 +10821,8 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -10678,6 +10874,8 @@ fn dragging_selected_text_shows_footer_copied_badge() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let _guard = env_guard();
@@ -10844,6 +11042,8 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -10985,6 +11185,8 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
@@ -11093,6 +11295,8 @@ fn action_param_textarea_grows_height_when_value_wraps() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
@@ -11196,6 +11400,8 @@ fn prop_edit_mode_moves_cursor_with_left_right() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     handle_key(
@@ -11271,6 +11477,8 @@ fn process_bootstrap_message_ignores_stale_results_when_not_pending() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -11344,6 +11552,8 @@ fn process_bootstrap_message_ignores_stale_results_for_wrong_generation() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -11434,6 +11644,8 @@ fn process_bootstrap_message_applies_refreshed_auth_state() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -11513,6 +11725,8 @@ fn process_bootstrap_message_rewarms_local_transport_when_snapshot_missing() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -11586,6 +11800,8 @@ fn process_bootstrap_failure_logs_error_and_keeps_tui_ready() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -11676,6 +11892,8 @@ fn process_bootstrap_failure_applies_refreshed_auth_state() {
         bootstrap_tx: bootstrap_tx.clone(),
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     bootstrap_tx
@@ -11793,6 +12011,8 @@ fn sync_failure_uses_cached_devices_without_quitting() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     let result = app.exec_command("sync");
@@ -11871,6 +12091,8 @@ fn sync_command_keeps_ui_ready_while_background_sync_runs() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.exec_command("sync").unwrap();
@@ -11947,6 +12169,8 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.exec_command("sync").unwrap();
@@ -12074,6 +12298,8 @@ fn start_bootstrap_creates_local_credentials_snapshot_without_restart() {
         bootstrap_tx,
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        settings_selected: 0,
     };
 
     app.start_bootstrap();

@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
-use crate::storage::{get_auth_accounts, save_auth, AuthAccount};
+use crate::storage::{get_auth_accounts, save_auth, AuthAccount, Language};
 use crate::tui::extract_auth_url_from_line;
 #[cfg(not(test))]
 use crate::tui::open_url_in_browser;
@@ -20,8 +20,8 @@ use crate::tui::shared::{
     table_header_style,
 };
 use crate::tui::{
-    apply_single_line_textarea_key, device_account_uid, AccountActionDialog, BoolDialog,
-    BoolDialogTab, TuiApp, ACCOUNT_LIST_HEADER_TITLES,
+    account_list_header_titles, apply_single_line_textarea_key, device_account_uid, lang_str,
+    AccountActionDialog, BoolDialog, BoolDialogTab, TuiApp,
 };
 #[cfg(not(test))]
 use crate::tui::{
@@ -102,7 +102,11 @@ impl AccountListColumns {
     }
 }
 
-pub(crate) fn account_list_row(account: &AuthAccount, offline: bool) -> AccountListRow {
+pub(crate) fn account_list_row(
+    account: &AuthAccount,
+    offline: bool,
+    lang: Language,
+) -> AccountListRow {
     let region = if account.region.trim().is_empty() {
         "-"
     } else {
@@ -118,23 +122,31 @@ pub(crate) fn account_list_row(account: &AuthAccount, offline: bool) -> AccountL
     } else {
         account.user.uid.trim()
     };
+    let status = match (offline, lang) {
+        (true, Language::Chinese) => "离线",
+        (true, Language::English) => "Offline",
+        (false, Language::Chinese) => "在线",
+        (false, Language::English) => "Online",
+    };
     AccountListRow {
         region: region.to_string().to_uppercase(),
         nickname: nickname.to_string(),
         uid: uid.to_string(),
-        status: if offline { "离线" } else { "在线" }.to_string(),
+        status: status.to_string(),
     }
 }
 
 pub(crate) fn compute_account_list_columns(
     rows: &[AccountListRow],
     available_width: usize,
+    lang: Language,
 ) -> AccountListColumns {
+    let headers = account_list_header_titles(lang);
     let mut columns = AccountListColumns {
-        region: UnicodeWidthStr::width(ACCOUNT_LIST_HEADER_TITLES[0]) + 2,
-        nickname: UnicodeWidthStr::width(ACCOUNT_LIST_HEADER_TITLES[1]) + 2,
-        uid: UnicodeWidthStr::width(ACCOUNT_LIST_HEADER_TITLES[2]) + 2,
-        status: UnicodeWidthStr::width(ACCOUNT_LIST_HEADER_TITLES[3]) + 2,
+        region: UnicodeWidthStr::width(headers[0]) + 2,
+        nickname: UnicodeWidthStr::width(headers[1]) + 2,
+        uid: UnicodeWidthStr::width(headers[2]) + 2,
+        status: UnicodeWidthStr::width(headers[3]) + 2,
     };
     for row in rows {
         columns.region = columns
@@ -167,21 +179,26 @@ pub(crate) fn format_account_list_item_with_columns(
     )
 }
 
-pub(crate) fn format_account_list_header_with_columns(columns: AccountListColumns) -> String {
+pub(crate) fn format_account_list_header_with_columns(
+    columns: AccountListColumns,
+    lang: Language,
+) -> String {
+    let headers = account_list_header_titles(lang);
     format!(
         "{}{}{}{}",
-        display_truncate_pad(ACCOUNT_LIST_HEADER_TITLES[0], columns.region),
-        display_truncate_pad(ACCOUNT_LIST_HEADER_TITLES[1], columns.nickname),
-        display_truncate_pad(ACCOUNT_LIST_HEADER_TITLES[2], columns.uid),
-        display_truncate_pad(ACCOUNT_LIST_HEADER_TITLES[3], columns.status),
+        display_truncate_pad(headers[0], columns.region),
+        display_truncate_pad(headers[1], columns.nickname),
+        display_truncate_pad(headers[2], columns.uid),
+        display_truncate_pad(headers[3], columns.status),
     )
 }
 
 pub(crate) fn format_account_list_header_line_with_columns(
     columns: AccountListColumns,
+    lang: Language,
 ) -> Line<'static> {
     Line::from(Span::styled(
-        format_account_list_header_with_columns(columns),
+        format_account_list_header_with_columns(columns, lang),
         table_header_style(),
     ))
 }
@@ -427,7 +444,8 @@ impl TuiApp {
             Ok(auth_url) => {
                 self.log(format!("{action} url ({uid}): {auth_url}"));
                 self.account_action_dialog = Some(AccountActionDialog::Reauth {
-                    status: "等待登录回调".to_string(),
+                    status: lang_str(self.language, "等待登录回调", "Waiting for login callback")
+                        .to_string(),
                     auth_url,
                 });
             }
