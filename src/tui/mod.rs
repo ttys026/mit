@@ -31,6 +31,9 @@ use std::process::Command;
 
 use crate::cli::ensure_fresh_account;
 use crate::mico_api::{Device, MicoClient};
+use crate::mips_cloud::{
+    config_from_account, start_property_cache_listener, CloudMipsHandle, CloudMipsStatus,
+};
 use crate::property_cache::PropertyCache;
 use crate::spec_cache::{load_spec, specs_dir, sync_model_spec};
 use crate::storage::{
@@ -87,11 +90,19 @@ struct ActiveAuthProcess {
     pid: u32,
 }
 
-pub(in crate::tui) fn lang_str(
-    lang: Language,
-    zh: &'static str,
-    en: &'static str,
-) -> &'static str {
+struct CloudMipsRuntime {
+    key: String,
+    _handles: Vec<CloudMipsHandle>,
+    rx: Receiver<CloudMipsStatus>,
+}
+
+static CLOUD_MIPS_RUNTIME: OnceLock<Mutex<Option<CloudMipsRuntime>>> = OnceLock::new();
+
+fn cloud_mips_runtime() -> &'static Mutex<Option<CloudMipsRuntime>> {
+    CLOUD_MIPS_RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+pub(in crate::tui) fn lang_str(lang: Language, zh: &'static str, en: &'static str) -> &'static str {
     match lang {
         Language::Chinese => zh,
         Language::English => en,
@@ -267,6 +278,7 @@ fn run_loop(
         let boot_was_loading = matches!(app.boot_state, BootState::Loading);
         app.process_background_messages();
         app.process_prop_dialog_loading();
+        app.apply_cached_prop_dialog_updates();
         if boot_was_loading && !matches!(app.boot_state, BootState::Loading) {
             drain_pending_input_events()?;
         }
@@ -498,9 +510,7 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
 
 fn settings_action_label(action: SettingsAction, lang: Language) -> &'static str {
     match action {
-        SettingsAction::ClearCacheKeepAuth => {
-            lang_str(lang, "重置设备缓存", "Reset Device Cache")
-        }
+        SettingsAction::ClearCacheKeepAuth => lang_str(lang, "重置设备缓存", "Reset Device Cache"),
         SettingsAction::ResetAll => lang_str(lang, "重置全部设置", "Reset All Settings"),
         SettingsAction::ToggleLanguage => unreachable!("ToggleLanguage has no confirm dialog"),
     }
@@ -1580,9 +1590,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
                     List::new(items).block(
-                        Block::default()
-                            .borders(all_borders())
-                            .title(lang_str(app.language, "账户操作", "Account Actions")),
+                        Block::default().borders(all_borders()).title(lang_str(
+                            app.language,
+                            "账户操作",
+                            "Account Actions",
+                        )),
                     ),
                     popup,
                 );
@@ -2105,12 +2117,11 @@ impl TuiApp {
                             home_dir.as_path(),
                             missing_spec_models.as_slice(),
                         ));
-                        device_categories =
-                            read_device_categories_from_template(
-                                home_dir.as_path(),
-                                Language::Chinese,
-                            )
-                            .unwrap_or_default();
+                        device_categories = read_device_categories_from_template(
+                            home_dir.as_path(),
+                            Language::Chinese,
+                        )
+                        .unwrap_or_default();
                     }
                     if let Err(error) = cache_devices_for_accounts(
                         home_dir.as_path(),
@@ -2166,6 +2177,181 @@ impl TuiApp {
         self.accounts.get(self.account_index)
     }
 
+    fn refresh_cloud_mips_listeners(&mut self) {
+        if cloud_mips_disabled() {
+            if cloud_mips_disabled_by_user() {
+                self.log("cloud MIPS not started: disabled by MIT_DISABLE_CLOUD_MIPS");
+            }
+            if let Ok(mut runtime) = cloud_mips_runtime().lock() {
+                *runtime = None;
+            }
+            return;
+        }
+
+        let groups = self.cloud_mips_account_device_groups();
+        if groups.is_empty() {
+            let account_count = self.accounts.len();
+            let oauth_account_count = self
+                .accounts
+                .iter()
+                .filter(|account| !account.access_token.trim().is_empty())
+                .count();
+            let offline_account_count = self.offline_account_uids.len();
+            let tagged_device_count = self
+                .devices
+                .iter()
+                .filter(|device| device_account_uid(device).is_some())
+                .count();
+            self.log(format!(
+                "cloud MIPS not started: no eligible OAuth account/device groups \
+                 (accounts={account_count}, oauth_accounts={oauth_account_count}, \
+                 offline_accounts={offline_account_count}, devices={}, tagged_devices={tagged_device_count})",
+                self.devices.len()
+            ));
+            if let Ok(mut runtime) = cloud_mips_runtime().lock() {
+                *runtime = None;
+            }
+            return;
+        }
+
+        let key = cloud_mips_runtime_key(&groups);
+        let Ok(mut runtime) = cloud_mips_runtime().lock() else {
+            self.log("cloud MIPS runtime lock poisoned");
+            return;
+        };
+        if runtime.as_ref().is_some_and(|current| current.key == key) {
+            return;
+        }
+
+        let account_count = groups.len();
+        let device_count = groups.iter().map(|(_, dids)| dids.len()).sum::<usize>();
+        self.log(format!(
+            "cloud MIPS starting: accounts={account_count} devices={device_count}"
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        let mut errors = Vec::new();
+        for (account, dids) in groups {
+            match config_from_account(&account).and_then(|config| {
+                start_property_cache_listener(
+                    config,
+                    dids,
+                    self.property_cache.clone(),
+                    Some(tx.clone()),
+                )
+            }) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => errors.push(format!(
+                    "{}: {error}",
+                    account_page::format_account_label(&account)
+                )),
+            }
+        }
+        drop(tx);
+
+        let started_count = handles.len();
+        if handles.is_empty() {
+            *runtime = None;
+        } else {
+            *runtime = Some(CloudMipsRuntime {
+                key,
+                _handles: handles,
+                rx,
+            });
+        }
+        drop(runtime);
+
+        for error in errors {
+            self.log(format!("cloud MIPS start failed: {error}"));
+        }
+        if started_count > 0 {
+            self.log(format!(
+                "cloud MIPS listener threads spawned: {started_count}"
+            ));
+        }
+    }
+
+    fn cloud_mips_account_device_groups(&self) -> Vec<(AuthAccount, Vec<String>)> {
+        let mut groups = Vec::new();
+        for account in &self.accounts {
+            if account.access_token.trim().is_empty()
+                || self.offline_account_uids.contains(&account.user.uid)
+            {
+                continue;
+            }
+            let dids = self
+                .devices
+                .iter()
+                .filter(|device| device_account_uid(device) == Some(account.user.uid.as_str()))
+                .map(|device| device.did.clone())
+                .collect::<Vec<_>>();
+            if dids.is_empty() {
+                continue;
+            }
+            groups.push((account.clone(), dids));
+        }
+        groups
+    }
+
+    fn process_cloud_mips_messages(&mut self) {
+        let statuses = {
+            let Ok(mut runtime) = cloud_mips_runtime().lock() else {
+                self.log("cloud MIPS runtime lock poisoned");
+                return;
+            };
+            let Some(runtime) = runtime.as_mut() else {
+                return;
+            };
+            runtime.rx.try_iter().collect::<Vec<_>>()
+        };
+
+        for status in statuses {
+            match status {
+                CloudMipsStatus::Started { host, device_count } => self.log(format!(
+                    "cloud MIPS listening on {host} for {device_count} devices"
+                )),
+                CloudMipsStatus::EventReceived { direction, summary } => {
+                    self.log(format!("cloud MIPS mqtt {direction}: {summary}"))
+                }
+                CloudMipsStatus::MessageReceived { topic, payload_len } => self.log(format!(
+                    "cloud MIPS message: topic={topic} bytes={payload_len}"
+                )),
+                CloudMipsStatus::PropertyApplied { did, siid, piid } => self.log(format!(
+                    "cloud MIPS property update: did={did} siid={siid} piid={piid}"
+                )),
+                CloudMipsStatus::Error { message } => {
+                    self.log(format!("cloud MIPS error: {message}"))
+                }
+                CloudMipsStatus::IgnoredMessage { reason } => {
+                    self.log(format!("cloud MIPS ignored message: {reason}"))
+                }
+                CloudMipsStatus::Stopped => self.log("cloud MIPS stopped"),
+            }
+        }
+    }
+
+    fn apply_cached_prop_dialog_updates(&mut self) {
+        let Some(dialog) = self.prop_dialog.as_mut() else {
+            return;
+        };
+        if dialog.loading || dialog.editing {
+            return;
+        }
+        for item in &mut dialog.items {
+            let Some(cached) = self.property_cache.get_property(
+                dialog.device_did.as_str(),
+                item.prop.siid,
+                item.prop.piid,
+            ) else {
+                continue;
+            };
+            if let Some(value) = extract_prop_value(&cached) {
+                item.value = value;
+            }
+        }
+    }
+
     fn should_apply_bootstrap(&self, generation: u64, uid: &str) -> bool {
         self.bootstrap_pending
             .as_ref()
@@ -2173,6 +2359,7 @@ impl TuiApp {
     }
 
     fn process_background_messages(&mut self) {
+        self.process_cloud_mips_messages();
         while let Ok(message) = self.bootstrap_rx.try_recv() {
             match message {
                 BootstrapMessage::Ready {
@@ -2234,6 +2421,7 @@ impl TuiApp {
                     for log in logs {
                         self.log(log);
                     }
+                    self.refresh_cloud_mips_listeners();
                     let should_rewarm_local_transport = refresh_local_transport_if_missing
                         && self
                             .current_uid()
@@ -2325,6 +2513,7 @@ impl TuiApp {
                                 if self.account_index >= self.accounts.len() {
                                     self.account_index = 0;
                                 }
+                                self.refresh_cloud_mips_listeners();
                             }
                             Err(error) => {
                                 self.log(format!("auth flow reload failed: {error}"));
@@ -3788,9 +3977,7 @@ fn sync_specs_for_models(home_dir: &std::path::Path, models: &[String]) -> Vec<S
 
 fn read_device_categories(home_dir: &std::path::Path, lang: Language) -> HashMap<String, String> {
     let mut categories = read_device_categories_from_cached_devices(home_dir).unwrap_or_default();
-    categories.extend(
-        read_device_categories_from_template(home_dir, lang).unwrap_or_default(),
-    );
+    categories.extend(read_device_categories_from_template(home_dir, lang).unwrap_or_default());
     categories
 }
 
@@ -4171,6 +4358,38 @@ fn device_account_uid(device: &Device) -> Option<&str> {
         .strip_prefix(CACHE_ACCOUNT_PREFIX)
         .map(str::trim)
         .filter(|uid| !uid.is_empty())
+}
+
+fn cloud_mips_runtime_key(groups: &[(AuthAccount, Vec<String>)]) -> String {
+    let mut entries = groups
+        .iter()
+        .map(|(account, dids)| {
+            let mut dids = dids.clone();
+            dids.sort();
+            format!(
+                "{}:{}:{}:{}",
+                account.user.uid,
+                account.uuid,
+                account.access_token,
+                dids.join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.join("|")
+}
+
+fn cloud_mips_disabled_by_user() -> bool {
+    std::env::var("MIT_DISABLE_CLOUD_MIPS")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn cloud_mips_disabled() -> bool {
+    if cloud_mips_disabled_by_user() {
+        return true;
+    }
+    cfg!(test) && std::env::var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS").is_err()
 }
 
 fn merge_devices(into: &mut Vec<Device>, extra: Vec<Device>) {
@@ -5724,8 +5943,7 @@ fn read_device_categories_from_template(
     let mut direct_model_categories = HashMap::new();
     let mut type_categories = HashMap::new();
     for entry in template_entries {
-        let category =
-            category_from_template_entry(entry, lang).unwrap_or_else(|| "-".to_string());
+        let category = category_from_template_entry(entry, lang).unwrap_or_else(|| "-".to_string());
 
         if let Some(model) = entry
             .get("model")

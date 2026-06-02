@@ -21,10 +21,10 @@
 
 - **Full-screen TUI** — navigate accounts, rooms, and devices; read/write MIoT properties; invoke actions; all keyboard-driven
 - **Local-first LAN control** — automatically discovers local IPs and tokens, probes reachability, and falls back to cloud seamlessly
-- **CLI props access** — read/write device properties and trigger actions without opening the TUI
+- **CLI props access** — read/write device properties, trigger actions, and subscribe to live property changes without opening the TUI
 - **Push notifications** — send messages to any logged-in Xiaomi account
 - **Multi-account** — log in with multiple accounts across different regions
-- **JSON output** — every command has a `--json` mode for scripting and automation
+- **JSON output** — commands have a `--json` mode for scripting and automation
 
 ---
 
@@ -111,12 +111,16 @@ mit push --uid 1001 "Hello World"                # Push to a specific account
 mit props get did-1 2 1                          # Read property (siid=2, piid=1)
 mit props set did-1 2 1 true                     # Write property
 mit props act did-1 5 1 1 2                      # Invoke action with parameters
+mit props sub                                    # Subscribe to all device property changes
+mit props sub did-1                              # Subscribe to all changes for one device
+mit props sub did-1 2 1                          # Subscribe to one property
 ```
 
 ### Notes
 
 - After browser login completes, `mit auth login` finalises auth automatically and shows a success page in the browser.
-- `mit props get/set/act` work directly without opening the TUI.
+- `mit props get/set/act/sub` work directly without opening the TUI.
+- `mit props sub` streams subscription logs and property updates to stdout until interrupted.
 - `mit tui` syncs devices and caches MIoT specs under `~/.mit/cache/specs/`.
 - bare `auth` keeps compatibility with `mit auth --help`.
 - bare `devices` keeps compatibility with `mit devices --help`.
@@ -142,7 +146,7 @@ mit props act did-1 5 1 1 2                      # Invoke action with parameters
 
 ## JSON Output
 
-Every command supports machine-readable JSON output via the global `--json` flag:
+Commands support machine-readable JSON output via the global `--json` flag:
 
 ```bash
 mit --json                  # Help as JSON
@@ -152,6 +156,7 @@ mit --json push "hello"     # Push result as JSON
 ```
 
 - `--json` applies only to successful stdout. Parse errors and runtime errors are always printed as human-readable text on stderr.
+- Streaming commands such as `mit props sub` print live text lines to stdout and do not support `--json`.
 - This makes `mit` easy to use in scripts, CI pipelines, or any automation that needs structured output.
 
 ---

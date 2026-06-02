@@ -5,10 +5,15 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command as ProcessCommand;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::mico_api::{is_auth_expired, parse_callback_input, MicoClient};
+use crate::mips_cloud::{
+    config_from_account, property_subscription_for, start_stdout_subscription, CloudMipsHandle,
+    CloudMipsSubscription,
+};
 use crate::storage::{
     clear_pending_auth, find_auth_account_by_uid, generate_uuid, get_auth_accounts,
     get_pending_auth, load_auth, normalize_account, save_auth, set_pending_auth,
@@ -107,6 +112,8 @@ pub enum PropsCommand {
     Set(PropsSetArgs),
     #[command(about = "调用一个 action")]
     Act(PropsActArgs),
+    #[command(about = "订阅属性变化")]
+    Sub(PropsSubArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -144,6 +151,16 @@ pub struct PropsActArgs {
         num_args = 0..
     )]
     pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct PropsSubArgs {
+    #[arg(help = "设备 DID；省略则订阅所有设备")]
+    pub did: Option<String>,
+    #[arg(help = "服务 IID；需与属性 IID 一起提供", requires = "piid")]
+    pub siid: Option<i64>,
+    #[arg(help = "属性 IID；需与服务 IID 一起提供", requires = "siid")]
+    pub piid: Option<i64>,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -1228,6 +1245,11 @@ struct PropActOutput {
     result: Value,
 }
 
+struct PropsSubscriptionGroup {
+    account: AuthAccount,
+    subscriptions: Vec<CloudMipsSubscription>,
+}
+
 fn handle_props(output_mode: OutputMode, args: PropsArgs) -> Result<()> {
     let Some(command) = args.command else {
         return show_subcommand_help(output_mode, "props");
@@ -1331,7 +1353,101 @@ fn handle_props(output_mode: OutputMode, args: PropsArgs) -> Result<()> {
             }
             Ok(())
         }
+        PropsCommand::Sub(args) => handle_props_sub(output_mode, args),
     }
+}
+
+fn handle_props_sub(output_mode: OutputMode, args: PropsSubArgs) -> Result<()> {
+    if output_mode == OutputMode::Json {
+        bail!("props sub 不支持 --json");
+    }
+    let property = subscription_property_selector(&args)?;
+    let groups = props_subscription_groups(args.did.as_deref(), property)?;
+    let account_count = groups.len();
+    let filter_count = groups
+        .iter()
+        .map(|group| group.subscriptions.len())
+        .sum::<usize>();
+    if groups.is_empty() || filter_count == 0 {
+        bail!("未找到可订阅设备");
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let mut handles: Vec<CloudMipsHandle> = Vec::new();
+    for group in groups {
+        let config = config_from_account(&group.account)?;
+        let handle = start_stdout_subscription(config, group.subscriptions, tx.clone())?;
+        handles.push(handle);
+    }
+    drop(tx);
+
+    println!(
+        "cloud MIPS subscription started: accounts={account_count} subscriptions={filter_count}"
+    );
+    for line in rx {
+        println!("{line}");
+    }
+    drop(handles);
+
+    Ok(())
+}
+
+fn subscription_property_selector(args: &PropsSubArgs) -> Result<Option<(i64, i64)>> {
+    match (args.siid, args.piid) {
+        (Some(siid), Some(piid)) => Ok(Some((siid, piid))),
+        (None, None) => Ok(None),
+        _ => bail!("siid 和 piid 必须同时提供"),
+    }
+}
+
+fn props_subscription_groups(
+    did: Option<&str>,
+    property: Option<(i64, i64)>,
+) -> Result<Vec<PropsSubscriptionGroup>> {
+    if let Some(did) = did {
+        let target = find_target_device(did)?;
+        return Ok(vec![PropsSubscriptionGroup {
+            account: target.fresh.auth,
+            subscriptions: vec![property_subscription_for(
+                target.device.did.as_str(),
+                property,
+            )],
+        }]);
+    }
+    if property.is_some() {
+        bail!("指定 siid/piid 时也必须指定 did");
+    }
+
+    let auth_state = load_auth()?;
+    let accounts = get_auth_accounts(&auth_state)?
+        .into_iter()
+        .filter(|account| !account.access_token.is_empty() || !account.refresh_token.is_empty())
+        .collect::<Vec<_>>();
+    if accounts.is_empty() {
+        bail!("未授权，请先执行 mit auth login");
+    }
+
+    let mut working_auth_state = auth_state;
+    let mut groups = Vec::new();
+    for account in accounts {
+        let fresh = ensure_fresh_account(working_auth_state.clone(), account)?;
+        working_auth_state = fresh.auth_state.clone();
+        let subscriptions = fresh
+            .client
+            .get_devices()?
+            .into_iter()
+            .map(|device| property_subscription_for(device.did.as_str(), None))
+            .collect::<Vec<_>>();
+        if subscriptions.is_empty() {
+            continue;
+        }
+        groups.push(PropsSubscriptionGroup {
+            account: fresh.auth,
+            subscriptions,
+        });
+    }
+
+    Ok(groups)
 }
 
 fn format_device_line_in_group(device: &crate::mico_api::Device) -> String {

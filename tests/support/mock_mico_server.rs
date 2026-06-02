@@ -280,6 +280,7 @@ fn route(
                         {
                             "id": "home-1",
                             "name": "我家",
+                            "uid": 1001,
                             "dids": ["dev-1", "dev-2", "dev-3"],
                             "roomlist": [
                                 {
@@ -329,6 +330,58 @@ fn route(
                 }
             }),
         },
+
+        ("POST", "/app/v2/home/home_device_list") => {
+            let body: Value = serde_json::from_str(&request.body).unwrap_or_else(|_| json!({}));
+            let include_third = body
+                .get("get_third_device")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut device_info = vec![
+                json!({
+                    "did": "dev-1",
+                    "name": "living-room",
+                    "model": "xiaomi.wifispeaker.lx04",
+                    "isOnline": true,
+                    "localip": "192.168.1.10",
+                    "token": "token-dev-1"
+                }),
+                json!({
+                    "did": "dev-2",
+                    "name": "bedroom",
+                    "model": "xiaomi.wifispeaker.oh2p",
+                    "isOnline": false,
+                    "localip": "192.168.1.11",
+                    "token": "token-dev-2"
+                }),
+                json!({
+                    "did": "dev-3",
+                    "name": "kitchen",
+                    "model": "xiaomi.wifispeaker.oh4w",
+                    "isOnline": true,
+                    "localip": "",
+                    "token": ""
+                }),
+            ];
+            if include_third {
+                device_info.push(json!({
+                    "did": "third-1",
+                    "name": "third-party-light",
+                    "model": "third.party.light",
+                    "isOnline": true,
+                    "localip": "",
+                    "token": ""
+                }));
+            }
+            json!({
+                "code": 0,
+                "result": {
+                    "device_info": device_info,
+                    "has_more": false,
+                    "max_did": ""
+                }
+            })
+        }
 
         ("POST", "/app/v2/home/device_list_page") => match fixture {
             MockFixture::Default | MockFixture::SubDeviceDidRequiresRoot => json!({

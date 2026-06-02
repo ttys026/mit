@@ -21,10 +21,10 @@
 
 - **全屏 TUI** — 键盘驱动，浏览账号、房间和设备，读写 MIoT 属性，触发 Action
 - **本地优先局域网控制** — 自动探测设备本地 IP 和 token，优先走局域网 UDP/MIIO 协议，不可达时无缝回退到云端
-- **CLI 属性操作** — 不启动 TUI 直接读写设备属性、触发 Action
+- **CLI 属性操作** — 不启动 TUI 直接读写设备属性、触发 Action，或订阅属性变化
 - **推送通知** — 向任意已登录的小米账号发送消息
 - **多账号** — 支持不同区域的多个账号同时登录
-- **JSON 输出** — 所有命令均支持 `--json` 模式，方便脚本和自动化集成
+- **JSON 输出** — 支持 `--json` 模式，方便脚本和自动化集成
 
 ---
 
@@ -111,12 +111,16 @@ mit push --uid 1001 "Hello World"                # 向指定账号推送
 mit props get did-1 2 1                          # 读取属性（siid=2, piid=1）
 mit props set did-1 2 1 true                     # 写入属性
 mit props act did-1 5 1 1 2                      # 触发 Action 并传入参数
+mit props sub                                    # 订阅所有设备属性变化
+mit props sub did-1                              # 订阅单个设备的所有属性变化
+mit props sub did-1 2 1                          # 订阅单个属性
 ```
 
 ### 说明
 
 - 浏览器完成授权后，`mit auth login` 会自动完成认证，并在浏览器中显示成功页面。
-- `mit props get/set/act` 可以直接使用，无需进入 TUI。
+- `mit props get/set/act/sub` 可以直接使用，无需进入 TUI。
+- `mit props sub` 会将 Cloud MIPS MQTT 订阅日志和属性变化实时输出到 stdout，直到手动中断。
 - `mit tui` 会同步设备并将 MIoT 规格缓存到 `~/.mit/cache/specs/`。
 - 直接运行 `mit auth` 兼容 `mit auth --help` 的帮助展示行为。
 - 直接运行 `mit devices` 兼容 `mit devices --help` 的帮助展示行为。
@@ -142,7 +146,7 @@ mit props act did-1 5 1 1 2                      # 触发 Action 并传入参数
 
 ## JSON 输出
 
-所有命令均支持全局 `--json` 标志，输出机器可读的 JSON：
+命令支持全局 `--json` 标志，输出机器可读的 JSON：
 
 ```bash
 mit --json                  # 帮助信息（JSON 格式）
@@ -152,6 +156,7 @@ mit --json push "hello"     # 推送结果（JSON 格式）
 ```
 
 - `--json` 只影响成功时的标准输出。解析错误和运行时错误始终以可读文本输出到标准错误。
+- `mit props sub` 等流式命令会将实时文本行输出到 stdout，不支持 `--json`。
 - 此特性使 `mit` 易于在脚本、CI 流水线或任何需要结构化输出的自动化场景中使用。
 
 ---

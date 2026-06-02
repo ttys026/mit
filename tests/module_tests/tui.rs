@@ -614,7 +614,8 @@ fn read_device_categories_from_template_returns_model_category_mapping() {
     )
     .unwrap();
 
-    let categories = read_device_categories_from_template(home.as_path(), Language::Chinese).unwrap();
+    let categories =
+        read_device_categories_from_template(home.as_path(), Language::Chinese).unwrap();
 
     assert_eq!(
         categories
@@ -8009,7 +8010,8 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
 
     let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
     let tabs_area = prop_dialog_tabs_area(terminal_area);
-    let visible_titles = super::visible_prop_dialog_tab_titles(app.prop_dialog.as_ref().unwrap(), Language::Chinese);
+    let visible_titles =
+        super::visible_prop_dialog_tab_titles(app.prop_dialog.as_ref().unwrap(), Language::Chinese);
     let first_visible_tab_column = tab_column_for_index(tabs_area, &visible_titles, 0);
 
     handle_mouse(
@@ -8034,6 +8036,167 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
     let text = terminal_text(&terminal);
     assert!(text.contains("writable-only-item"), "{text}");
     assert!(!text.contains("readonly-only-item"), "{text}");
+}
+
+#[test]
+fn prop_dialog_applies_cached_mips_property_updates() {
+    let mut app = test_app_with_prop_dialog(BoolDialog {
+        device_did: "dev-1".to_string(),
+        device_name: "dev-1".to_string(),
+        account_uid: "1001".to_string(),
+        items: vec![BoolToggleItem {
+            prop: BoolPropItem {
+                siid: 2,
+                piid: 1,
+                name: "switch".to_string(),
+                format: "bool".to_string(),
+                writable: true,
+                value_options: Vec::new(),
+            },
+            value: Value::Bool(false),
+        }],
+        selected: 0,
+        active_tab: BoolDialogTab::Writable,
+        writable_selected: 0,
+        readonly_selected: 0,
+        actions: Vec::new(),
+        actions_selected: 0,
+        writable_list_state: ListState::default(),
+        readonly_list_state: ListState::default(),
+        actions_list_state: ListState::default(),
+        loading: false,
+        loading_rx: None,
+        status: None,
+        editing: false,
+        edit_buffer: String::new(),
+        edit_cursor: 0,
+        edit_error: None,
+        refreshing: false,
+        refresh_rx: None,
+    });
+    app.property_cache
+        .set_property("dev-1".to_string(), 2, 1, json!(true));
+
+    app.apply_cached_prop_dialog_updates();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert_eq!(dialog.items[0].value, Value::Bool(true));
+}
+
+#[test]
+fn process_cloud_mips_messages_logs_messages_and_errors() {
+    let _guard = env_guard();
+    let dialog = BoolDialog {
+        device_did: "dev-1".to_string(),
+        device_name: "dev-1".to_string(),
+        account_uid: "1001".to_string(),
+        items: Vec::new(),
+        selected: 0,
+        active_tab: BoolDialogTab::Writable,
+        writable_selected: 0,
+        readonly_selected: 0,
+        actions: Vec::new(),
+        actions_selected: 0,
+        writable_list_state: ListState::default(),
+        readonly_list_state: ListState::default(),
+        actions_list_state: ListState::default(),
+        loading: false,
+        loading_rx: None,
+        status: None,
+        editing: false,
+        edit_buffer: String::new(),
+        edit_cursor: 0,
+        edit_error: None,
+        refreshing: false,
+        refresh_rx: None,
+    };
+    let mut app = test_app_with_prop_dialog(dialog);
+    let (tx, rx) = mpsc::channel();
+    tx.send(crate::mips_cloud::CloudMipsStatus::EventReceived {
+        direction: "incoming".to_string(),
+        summary: "ConnAck".to_string(),
+    })
+    .unwrap();
+    tx.send(crate::mips_cloud::CloudMipsStatus::MessageReceived {
+        topic: "device/dev-1/up/properties_changed/2/1".to_string(),
+        payload_len: 42,
+    })
+    .unwrap();
+    tx.send(crate::mips_cloud::CloudMipsStatus::PropertyApplied {
+        did: "dev-1".to_string(),
+        siid: 2,
+        piid: 1,
+    })
+    .unwrap();
+    tx.send(crate::mips_cloud::CloudMipsStatus::Error {
+        message: "mqtt auth failed".to_string(),
+    })
+    .unwrap();
+    drop(tx);
+    {
+        let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+        *runtime = Some(super::CloudMipsRuntime {
+            key: "test-runtime".to_string(),
+            _handles: Vec::new(),
+            rx,
+        });
+    }
+
+    app.process_cloud_mips_messages();
+    let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(logs.contains("cloud MIPS mqtt incoming: ConnAck"));
+    assert!(
+        logs.contains("cloud MIPS message: topic=device/dev-1/up/properties_changed/2/1 bytes=42")
+    );
+    assert!(logs.contains("cloud MIPS property update: did=dev-1 siid=2 piid=1"));
+    assert!(logs.contains("cloud MIPS error: mqtt auth failed"));
+
+    let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+    *runtime = None;
+}
+
+#[test]
+fn refresh_cloud_mips_listeners_logs_when_no_eligible_device_groups() {
+    let _guard = env_guard();
+    std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
+    std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
+
+    let mut app = test_app_with_prop_dialog(BoolDialog {
+        device_did: "dev-1".to_string(),
+        device_name: "dev-1".to_string(),
+        account_uid: "1001".to_string(),
+        items: Vec::new(),
+        selected: 0,
+        active_tab: BoolDialogTab::Writable,
+        writable_selected: 0,
+        readonly_selected: 0,
+        actions: Vec::new(),
+        actions_selected: 0,
+        writable_list_state: ListState::default(),
+        readonly_list_state: ListState::default(),
+        actions_list_state: ListState::default(),
+        loading: false,
+        loading_rx: None,
+        status: None,
+        editing: false,
+        edit_buffer: String::new(),
+        edit_cursor: 0,
+        edit_error: None,
+        refreshing: false,
+        refresh_rx: None,
+    });
+
+    app.refresh_cloud_mips_listeners();
+    std::env::remove_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS");
+
+    let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(logs.contains(
+        "cloud MIPS not started: no eligible OAuth account/device groups \
+         (accounts=1, oauth_accounts=1, offline_accounts=0, devices=0, tagged_devices=0)"
+    ));
+
+    let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+    *runtime = None;
 }
 
 #[test]
@@ -12209,7 +12372,7 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
             .get("devices")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(3)
+        Some(4)
     );
     assert_eq!(
         cached_payload

@@ -325,6 +325,8 @@ impl MicoClient {
     pub fn get_devices(&self) -> Result<Vec<Device>> {
         let homes = self.get_homes()?;
         let mut placements = HashMap::new();
+        let mut devices = Vec::new();
+        let mut seen_dids = HashSet::new();
         for key in ["homelist", "share_home_list"] {
             let Some(list) = homes.get(key).and_then(Value::as_array) else {
                 continue;
@@ -332,6 +334,12 @@ impl MicoClient {
             for home in list {
                 let home_id = normalize_text_value(home.get("id"));
                 let home_name = normalize_text_value(home.get("name"));
+                let home_owner = home
+                    .get("uid")
+                    .and_then(Value::as_i64)
+                    .or_else(|| self.account_uid.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                let home_id_int = home_id.parse::<i64>().unwrap_or(0);
                 let dids = home
                     .get("dids")
                     .and_then(Value::as_array)
@@ -373,36 +381,30 @@ impl MicoClient {
                         );
                     }
                 }
-            }
-        }
 
-        let mut dids = placements
-            .keys()
-            .filter(|did| !did.trim().is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        dids.sort();
-
-        let mut devices = Vec::new();
-        for batch in dids.chunks(150) {
-            let page = self.get_device_list_page(batch, "")?;
-            for did in batch {
-                let Some(info) = page.get(did) else {
-                    continue;
-                };
-                let placement = placements.get(did).cloned().unwrap_or_else(|| {
-                    (String::new(), String::new(), String::new(), String::new())
-                });
-                devices.push(Device {
-                    did: info.did.clone(),
-                    name: info.name.clone(),
-                    model: info.model.clone(),
-                    online: info.online,
-                    home_id: placement.0,
-                    home_name: placement.1,
-                    room_id: placement.2,
-                    room_name: placement.3,
-                });
+                for info in self.get_home_device_list(home_owner, home_id_int)? {
+                    if info.did.is_empty() || !seen_dids.insert(info.did.clone()) {
+                        continue;
+                    }
+                    let placement = placements.get(&info.did).cloned().unwrap_or_else(|| {
+                        (
+                            home_id.clone(),
+                            home_name.clone(),
+                            String::new(),
+                            String::new(),
+                        )
+                    });
+                    devices.push(Device {
+                        did: info.did,
+                        name: info.name,
+                        model: info.model,
+                        online: info.online,
+                        home_id: placement.0,
+                        home_name: placement.1,
+                        room_id: placement.2,
+                        room_name: placement.3,
+                    });
+                }
             }
         }
 
@@ -1136,6 +1138,56 @@ impl MicoClient {
                 break;
             }
             next_start_did = candidate;
+        }
+        Ok(devices)
+    }
+
+    fn get_home_device_list(&self, home_owner: i64, home_id: i64) -> Result<Vec<DeviceSummary>> {
+        let mut start_did = String::new();
+        let mut devices = Vec::new();
+        loop {
+            let result = self.post_encrypted(
+                "/app/v2/home/home_device_list",
+                &json!({
+                    "home_owner": home_owner,
+                    "home_id": home_id,
+                    "limit": 200,
+                    "start_did": start_did,
+                    "get_split_device": true,
+                    "support_smart_home": true,
+                    "get_cariot_device": true,
+                    "get_third_device": true,
+                }),
+            )?;
+            if let Some(list) = result.get("device_info").and_then(Value::as_array) {
+                for raw in list {
+                    let did = normalize_text_value(raw.get("did"));
+                    let model = normalize_text_value(raw.get("model"));
+                    if did.is_empty() || model.is_empty() {
+                        continue;
+                    }
+                    devices.push(DeviceSummary {
+                        did,
+                        name: normalize_text_value(raw.get("name")),
+                        model,
+                        online: raw
+                            .get("isOnline")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        local_ip: normalize_text_value(raw.get("localip")),
+                        token: normalize_text_value(raw.get("token")),
+                    });
+                }
+            }
+
+            start_did = normalize_text_value(result.get("max_did"));
+            let has_more = result
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !has_more || start_did.is_empty() {
+                break;
+            }
         }
         Ok(devices)
     }

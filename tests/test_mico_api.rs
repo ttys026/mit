@@ -66,3 +66,37 @@ fn mico_get_props_batch_sends_single_batched_request() {
     assert_eq!(result.as_array().unwrap().len(), 3);
     std::env::remove_var("MIT_MICO_BASE_URL");
 }
+
+#[test]
+fn mico_get_devices_requests_third_party_devices() {
+    let _guard = env_guard();
+    let server = MockMicoServer::start();
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "abcd1234abcd1234abcd1234abcd1234",
+        "accessToken": "token-a",
+        "user": {"uid": "1001"}
+    }));
+
+    std::env::set_var("MIT_MICO_BASE_URL", server.base_url());
+    let client = MicoClient::new(&account).unwrap();
+    let devices = client.get_devices().unwrap();
+
+    assert!(
+        devices.iter().any(|device| device.did == "third-1"),
+        "third-party devices should be returned when get_third_device is requested"
+    );
+    let requests = server.requests();
+    let request = requests
+        .iter()
+        .find(|request| request.path == "/app/v2/home/home_device_list")
+        .expect("home_device_list should be requested");
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(
+        body.get("get_third_device")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    std::env::remove_var("MIT_MICO_BASE_URL");
+}
