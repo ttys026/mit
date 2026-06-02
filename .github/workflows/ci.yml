@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: mit
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-24.04", "macos-26", "windows-2025"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-features
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            method: musl-native
+            ext: ""
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04
+            method: cross
+            ext: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            method: cross
+            ext: ""
+          - target: x86_64-apple-darwin
+            runner: macos-26
+            method: native
+            ext: ""
+          - target: aarch64-apple-darwin
+            runner: macos-26
+            method: native
+            ext: ""
+          - target: x86_64-pc-windows-msvc
+            runner: ubuntu-24.04
+            method: xwin
+            ext: ".exe"
+          - target: aarch64-pc-windows-msvc
+            runner: ubuntu-24.04
+            method: xwin
+            ext: ".exe"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: matrix.method == 'musl-native'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.method == 'cross'
+        env:
+          CROSS_VERSION: "0.2.5"
+          CROSS_SHA256: "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad"
+        run: |
+          curl -fsSL "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" \
+            -o cross.tar.gz
+          echo "${CROSS_SHA256}  cross.tar.gz" | shasum -a 256 --check
+          tar xzf cross.tar.gz -C /usr/local/bin
+          rm cross.tar.gz
+          cross --version
+
+      - name: Install cargo-xwin
+        if: matrix.method == 'xwin'
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang llvm lld
+          cargo install cargo-xwin
+          cargo-xwin --version
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          case "${{ matrix.method }}" in
+            native|musl-native)
+              cargo build --release --locked --target "${{ matrix.target }}"
+              ;;
+            cross)
+              cross build --release --locked --target "${{ matrix.target }}"
+              ;;
+            xwin)
+              cargo xwin build --release --locked --target "${{ matrix.target }}" --cross-compiler clang
+              ;;
+          esac
+
+      - name: Check built binary
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ matrix.ext }}"
+          test -f "$BIN"
+          ls -lh "$BIN"
