@@ -68,6 +68,20 @@ impl PropertyCache {
         }
     }
 
+    /// Set a single property for a device.
+    pub fn set_property(&self, device_id: String, siid: i64, piid: i64, value: Value) {
+        let device_id = prop_cache_lookup_did(&device_id);
+        let mut devices = self.devices.write().unwrap();
+        let device_props = devices.entry(device_id).or_default();
+        device_props.properties.insert(
+            (siid, piid),
+            CachedValue {
+                value,
+                timestamp: Instant::now(),
+            },
+        );
+    }
+
     /// Clear all properties for a device.
     pub fn clear_device(&self, device_id: &str) {
         let device_id = prop_cache_lookup_did(device_id);

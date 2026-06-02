@@ -299,6 +299,26 @@ fn props_act_json_mode_accepts_separate_value_args() {
     let _ = fs::remove_dir_all(&test_home);
 }
 
+#[test]
+fn props_sub_rejects_json_mode_before_subscribing() {
+    let test_home = make_temp_dir("mit-cli-output-props-sub-json");
+    write_auth_fixture(&test_home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "props", "sub"])
+        .env("MIT_HOME", &test_home)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("props sub 不支持 --json"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
 fn make_temp_dir(prefix: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -9,6 +9,45 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_REGION: &str = "cn";
 pub const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8000/login_redirect";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Language {
+    #[default]
+    Chinese,
+    English,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSettings {
+    #[serde(default)]
+    pub language: Language,
+}
+
+pub fn get_settings_path() -> PathBuf {
+    get_mit_dir().join("settings.json")
+}
+
+pub fn load_settings() -> UserSettings {
+    let path = get_settings_path();
+    if !path.exists() {
+        return UserSettings::default();
+    }
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return UserSettings::default(),
+    };
+    serde_json::from_str::<UserSettings>(&text).unwrap_or_default()
+}
+
+pub fn save_settings(settings: &UserSettings) -> Result<()> {
+    let path = get_settings_path();
+    ensure_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let mut text = serde_json::to_string_pretty(settings)?;
+    text.push('\n');
+    write_private_text_file(&path, &text)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserProfile {

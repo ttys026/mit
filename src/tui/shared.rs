@@ -12,9 +12,10 @@ use super::{
     fullscreen_dialog_inner_area, logs_lines_for_display, note_copy_success, now_epoch_millis,
     prop_dialog_indices_for_tab, prop_edit_textarea_area, prop_editor_bottom_lines,
     prop_editor_layout, push_message_cli_preview_line, push_message_command_area,
-    push_message_textarea_area, rendered_textarea_lines, split_main_layout, AccountActionDialog,
-    BoolDialogTab, TuiApp,
+    push_message_textarea_area, rendered_textarea_lines, split_main_layout, tab_titles,
+    AccountActionDialog, BoolDialogTab, TuiApp,
 };
+use crate::storage::Language;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectionSurface {
@@ -82,8 +83,8 @@ pub(crate) fn top_bottom_borders() -> Borders {
     Borders::TOP | Borders::BOTTOM
 }
 
-pub(crate) fn tab_index_for_column(column: u16, tabs_area: Rect) -> Option<usize> {
-    tab_index_for_column_with_titles(column, tabs_area, &super::TAB_TITLES)
+pub(crate) fn tab_index_for_column(column: u16, tabs_area: Rect, lang: Language) -> Option<usize> {
+    tab_index_for_column_with_titles(column, tabs_area, &tab_titles(lang))
 }
 
 pub(crate) fn tab_index_for_column_with_titles<S: AsRef<str>>(
@@ -403,7 +404,11 @@ pub(crate) fn selection_snapshot_for_mouse(
                     return Some(SelectionSnapshot {
                         surface: SelectionSurface::PushMessageCommand,
                         area: command_area,
-                        lines: vec![push_message_cli_preview_line(uid.as_str(), input.as_str())],
+                        lines: vec![push_message_cli_preview_line(
+                        uid.as_str(),
+                        input.as_str(),
+                        app.language,
+                    )],
                     });
                 }
             }
@@ -416,7 +421,7 @@ pub(crate) fn selection_snapshot_for_mouse(
         let popup = terminal_area;
         let inner = fullscreen_dialog_inner_area(popup);
         if dialog.editing {
-            let layout = prop_editor_layout(dialog, inner);
+            let layout = prop_editor_layout(dialog, inner, app.language);
             let editor_area = layout.editor_area;
             if dialog.active_tab == BoolDialogTab::Actions {
                 let rows = action_param_rows_for_dialog(dialog);
@@ -479,7 +484,7 @@ pub(crate) fn selection_snapshot_for_mouse(
                     return Some(SelectionSnapshot {
                         surface: SelectionSurface::PropEditorFooter,
                         area: footer_area,
-                        lines: prop_editor_bottom_lines(dialog),
+                        lines: prop_editor_bottom_lines(dialog, app.language),
                     });
                 }
             }
@@ -533,6 +538,7 @@ pub(crate) fn selection_snapshot_for_mouse(
                             item,
                             Some(position) == selected_local,
                             dialog.loading,
+                            app.language,
                         )
                     })
                     .collect::<Vec<_>>();

@@ -31,11 +31,14 @@ use std::process::Command;
 
 use crate::cli::ensure_fresh_account;
 use crate::mico_api::{Device, MicoClient};
+use crate::mips_cloud::{
+    config_from_account, start_property_cache_listener, CloudMipsHandle, CloudMipsStatus,
+};
 use crate::property_cache::PropertyCache;
 use crate::spec_cache::{load_spec, specs_dir, sync_model_spec};
 use crate::storage::{
-    default_auth, get_auth_accounts, get_home_dir, load_auth, normalize_auth, AuthAccount,
-    AuthState,
+    default_auth, get_auth_accounts, get_home_dir, load_auth, load_settings, normalize_auth,
+    save_settings, AuthAccount, AuthState, Language, UserSettings,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -53,31 +56,70 @@ const LOG_MAX: usize = 120;
 const FOOTER_COPY_LOG_PREFIX: &str = "__footer_copied_at=";
 const FOOTER_COPY_BADGE_TEXT: &str = " [已复制]";
 const CACHE_ACCOUNT_PREFIX: &str = "cache-account:";
-const TAB_TITLES: [&str; 4] = ["1:账号", "2:设备", "3:日志", "4:设置"];
-const ACCOUNT_LIST_HEADER_TITLES: [&str; 4] = ["地区", "昵称", "ID", "状态"];
-const DEVICE_LIST_HEADER_TITLES: [&str; 4] = ["房间", "名称", "类别", "账户"];
-const ACCOUNT_TAB_STATUS_TEXT: &str = "A: 新增账户 Enter: 账户操作";
-const ACCOUNT_ACTION_MENU_STATUS_TEXT: &str = "Enter: 选择, Esc: 返回";
-const PUSH_MESSAGE_STATUS_TEXT: &str = "Enter: 发送, Esc: 返回";
-const REAUTH_STATUS_TEXT: &str = "Esc: 返回";
-const PROP_EDIT_STATUS_TEXT: &str = "Enter: 执行, Esc: 返回";
-const DEVICE_TAB_STATUS_PREFIX: &str = "R: 刷新, Enter: 查看设备, 设备总数: ";
-const SETTINGS_TAB_STATUS_TEXT: &str = "Enter: 选择";
-const PROP_DIALOG_WRITABLE_STATUS_PREFIX: &str = "R: 刷新, Esc: 返回, Enter: 修改属性, 当前设备: ";
-const PROP_DIALOG_READONLY_STATUS_PREFIX: &str = "R: 刷新, Esc: 返回, Enter: 查看属性, 当前设备: ";
+pub(crate) fn tab_titles(lang: Language) -> [&'static str; 4] {
+    match lang {
+        Language::Chinese => ["1:账号", "2:设备", "3:日志", "4:设置"],
+        Language::English => ["1:Account", "2:Device", "3:Log", "4:Settings"],
+    }
+}
+pub(crate) fn account_list_header_titles(lang: Language) -> [&'static str; 4] {
+    match lang {
+        Language::Chinese => ["地区", "昵称", "ID", "状态"],
+        Language::English => ["Region", "Nickname", "ID", "Status"],
+    }
+}
+pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 4] {
+    match lang {
+        Language::Chinese => ["房间", "名称", "类别", "账户"],
+        Language::English => ["Room", "Name", "Category", "Account"],
+    }
+}
 const STATUS_BAR_MARGIN_TOP: u16 = 1;
-const SETTINGS_ITEM_COUNT: usize = 2;
+const SETTINGS_ITEM_COUNT: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsAction {
     ClearCacheKeepAuth,
     ResetAll,
+    ToggleLanguage,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ActiveAuthProcess {
     generation: u64,
     pid: u32,
+}
+
+struct CloudMipsRuntime {
+    key: String,
+    _handles: Vec<CloudMipsHandle>,
+    rx: Receiver<CloudMipsStatus>,
+}
+
+static CLOUD_MIPS_RUNTIME: OnceLock<Mutex<Option<CloudMipsRuntime>>> = OnceLock::new();
+
+fn cloud_mips_runtime() -> &'static Mutex<Option<CloudMipsRuntime>> {
+    CLOUD_MIPS_RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+pub(in crate::tui) fn lang_str(lang: Language, zh: &'static str, en: &'static str) -> &'static str {
+    match lang {
+        Language::Chinese => zh,
+        Language::English => en,
+    }
+}
+
+fn spec_node_label<'a>(node: &'a Value, lang: Language) -> Option<&'a str> {
+    match lang {
+        Language::Chinese => node
+            .get("description_trans")
+            .and_then(Value::as_str)
+            .or_else(|| node.get("description").and_then(Value::as_str)),
+        Language::English => node
+            .get("description")
+            .and_then(Value::as_str)
+            .or_else(|| node.get("description_trans").and_then(Value::as_str)),
+    }
 }
 
 fn readonly_prop_detail_command(dialog: &BoolDialog) -> Option<String> {
@@ -236,6 +278,7 @@ fn run_loop(
         let boot_was_loading = matches!(app.boot_state, BootState::Loading);
         app.process_background_messages();
         app.process_prop_dialog_loading();
+        app.apply_cached_prop_dialog_updates();
         if boot_was_loading && !matches!(app.boot_state, BootState::Loading) {
             drain_pending_input_events()?;
         }
@@ -465,29 +508,50 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
     Ok(false)
 }
 
-fn settings_action_label(action: SettingsAction) -> &'static str {
+fn settings_action_label(action: SettingsAction, lang: Language) -> &'static str {
     match action {
-        SettingsAction::ClearCacheKeepAuth => "重置设备缓存",
-        SettingsAction::ResetAll => "重置全部设置",
+        SettingsAction::ClearCacheKeepAuth => lang_str(lang, "重置设备缓存", "Reset Device Cache"),
+        SettingsAction::ResetAll => lang_str(lang, "重置全部设置", "Reset All Settings"),
+        SettingsAction::ToggleLanguage => unreachable!("ToggleLanguage has no confirm dialog"),
     }
 }
 
-fn settings_confirm_lines(action: SettingsAction) -> Vec<String> {
+fn settings_confirm_lines(action: SettingsAction, lang: Language) -> Vec<String> {
     let (action_line, show_irreversible_warning) = match action {
         SettingsAction::ClearCacheKeepAuth => (
-            "将删除 ~/.mit 中除 auth.json 外的所有缓存".to_string(),
+            lang_str(
+                lang,
+                "将删除 ~/.mit 中除 auth.json 外的所有缓存",
+                "Will delete all caches in ~/.mit except auth.json",
+            )
+            .to_string(),
             false,
         ),
-        SettingsAction::ResetAll => ("将彻底删除 ~/.mit 目录（包括账号授权）".to_string(), true),
+        SettingsAction::ResetAll => (
+            lang_str(
+                lang,
+                "将彻底删除 ~/.mit 目录（包括账号授权）",
+                "Will permanently delete the ~/.mit directory (including account auth)",
+            )
+            .to_string(),
+            true,
+        ),
+        SettingsAction::ToggleLanguage => unreachable!("ToggleLanguage has no confirm dialog"),
     };
     let mut lines = vec![
-        format!("操作：{}", settings_action_label(action)),
+        format!(
+            "{}: {}",
+            lang_str(lang, "操作", "Action"),
+            settings_action_label(action, lang)
+        ),
         String::new(),
         action_line,
     ];
     if show_irreversible_warning {
         lines.push(String::new());
-        lines.push("⚠️ 该操作不可恢复".to_string());
+        lines.push(
+            lang_str(lang, "⚠️ 该操作不可恢复", "⚠️ This action is irreversible").to_string(),
+        );
     }
     lines
 }
@@ -618,7 +682,7 @@ fn handle_mouse(
                     let editor_area = app
                         .prop_dialog
                         .as_ref()
-                        .map(|dialog| prop_editor_layout(dialog, inner).editor_area)
+                        .map(|dialog| prop_editor_layout(dialog, inner, app.language).editor_area)
                         .unwrap_or(inner);
                     if editing_actions {
                         if mouse.row >= editor_area.y
@@ -815,7 +879,8 @@ fn handle_mouse(
                 .as_ref()
                 .map(visible_prop_dialog_tabs)
                 .unwrap_or_default();
-            let tab_titles = numbered_prop_dialog_tab_titles(visible_tabs.iter().copied());
+            let tab_titles =
+                numbered_prop_dialog_tab_titles(visible_tabs.iter().copied(), app.language);
             if let Some(index) =
                 tab_index_for_column_with_titles(mouse.column, tabs_area, &tab_titles)
             {
@@ -873,7 +938,7 @@ fn handle_mouse(
             .y
             .saturating_add(tabs_area.height.saturating_sub(1));
         if mouse.row >= tab_inner_top && mouse.row < tab_inner_bottom_exclusive {
-            if let Some(index) = tab_index_for_column(mouse.column, tabs_area) {
+            if let Some(index) = tab_index_for_column(mouse.column, tabs_area, app.language) {
                 app.active_tab = index;
                 return Ok(());
             }
@@ -1009,158 +1074,179 @@ fn build_footer_segments(
 }
 
 fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
+    let lang = app.language;
     if let Some(dialog) = &app.account_action_dialog {
         return match dialog {
-            AccountActionDialog::Menu { .. } => {
-                let (enter, back) = ACCOUNT_ACTION_MENU_STATUS_TEXT
-                    .split_once(", ")
-                    .expect("menu footer format");
-                build_footer_segments(
-                    &[
-                        (enter, FooterOperation::Enter),
-                        (back, FooterOperation::Back),
-                    ],
-                    None,
-                )
-            }
-            AccountActionDialog::PushMessage { .. } => {
-                let (enter, back) = PUSH_MESSAGE_STATUS_TEXT
-                    .split_once(", ")
-                    .expect("push footer format");
-                build_footer_segments(
-                    &[
-                        (enter, FooterOperation::Enter),
-                        (back, FooterOperation::Back),
-                    ],
-                    None,
-                )
-            }
+            AccountActionDialog::Menu { .. } => build_footer_segments(
+                &[
+                    (
+                        lang_str(lang, "Enter: 选择", "Enter: Select"),
+                        FooterOperation::Enter,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
+                ],
+                None,
+            ),
+            AccountActionDialog::PushMessage { .. } => build_footer_segments(
+                &[
+                    (
+                        lang_str(lang, "Enter: 发送", "Enter: Send"),
+                        FooterOperation::Enter,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
+                ],
+                None,
+            ),
             AccountActionDialog::Reauth { auth_url, .. } => {
-                let mut ops = Vec::new();
+                let mut ops: Vec<(&str, FooterOperation)> = Vec::new();
                 if !auth_url.trim().is_empty() && auth_url.trim() != "-" {
-                    ops.push(("C: 复制", FooterOperation::Copy));
+                    ops.push((lang_str(lang, "C: 复制", "C: Copy"), FooterOperation::Copy));
                 }
-                ops.push((REAUTH_STATUS_TEXT, FooterOperation::Back));
+                ops.push((
+                    lang_str(lang, "Esc: 返回", "Esc: Back"),
+                    FooterOperation::Back,
+                ));
                 build_footer_segments(ops.as_slice(), None)
             }
             AccountActionDialog::SettingsConfirm { .. } => build_footer_segments(
                 &[
-                    ("Enter: 确认", FooterOperation::Enter),
-                    ("Esc: 返回", FooterOperation::Back),
+                    (
+                        lang_str(lang, "Enter: 确认", "Enter: Confirm"),
+                        FooterOperation::Enter,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
                 ],
                 None,
             ),
         };
     }
 
+    let current_device_label = lang_str(lang, "当前设备", "Current Device");
     if let Some(dialog) = &app.prop_dialog {
         if dialog.editing {
             if dialog.active_tab == BoolDialogTab::ReadOnly {
                 return build_footer_segments(
-                    &[("Esc: 返回", FooterOperation::Back)],
-                    Some(format!("当前设备: {}", dialog.device_did)),
+                    &[(
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    )],
+                    Some(format!("{current_device_label}: {}", dialog.device_did)),
                 );
             }
-            let (enter, back) = PROP_EDIT_STATUS_TEXT
-                .split_once(", ")
-                .expect("prop edit footer format");
             return build_footer_segments(
                 &[
-                    (enter, FooterOperation::Enter),
-                    (back, FooterOperation::Back),
+                    (
+                        lang_str(lang, "Enter: 执行", "Enter: Execute"),
+                        FooterOperation::Enter,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
                 ],
-                Some(format!("当前设备: {}", dialog.device_did)),
+                Some(format!("{current_device_label}: {}", dialog.device_did)),
             );
         }
         return match dialog.active_tab {
-            BoolDialogTab::Writable => {
-                let parts = PROP_DIALOG_WRITABLE_STATUS_PREFIX
-                    .strip_suffix("当前设备: ")
-                    .expect("writable footer suffix")
-                    .split(", ")
-                    .collect::<Vec<_>>();
-                build_footer_segments(
-                    &[
-                        (parts[0], FooterOperation::Refresh),
-                        (parts[1], FooterOperation::Back),
-                        (parts[2], FooterOperation::Enter),
-                    ],
-                    Some(format!("当前设备: {}", dialog.device_did)),
-                )
-            }
-            BoolDialogTab::ReadOnly => {
-                let parts = PROP_DIALOG_READONLY_STATUS_PREFIX
-                    .strip_suffix("当前设备: ")
-                    .expect("readonly footer suffix")
-                    .split(", ")
-                    .collect::<Vec<_>>();
-                build_footer_segments(
-                    &[
-                        (parts[0], FooterOperation::Refresh),
-                        (parts[1], FooterOperation::Back),
-                        (parts[2], FooterOperation::Enter),
-                    ],
-                    Some(format!("当前设备: {}", dialog.device_did)),
-                )
-            }
-            BoolDialogTab::Actions => {
-                let parts = PROP_DIALOG_READONLY_STATUS_PREFIX
-                    .strip_suffix("当前设备: ")
-                    .expect("actions footer suffix")
-                    .split(", ")
-                    .collect::<Vec<_>>();
-                build_footer_segments(
-                    &[
-                        (parts[0], FooterOperation::Refresh),
-                        (parts[1], FooterOperation::Back),
-                    ],
-                    Some(format!("当前设备: {}", dialog.device_did)),
-                )
-            }
+            BoolDialogTab::Writable => build_footer_segments(
+                &[
+                    (
+                        lang_str(lang, "R: 刷新", "R: Refresh"),
+                        FooterOperation::Refresh,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
+                    (
+                        lang_str(lang, "Enter: 修改属性", "Enter: Edit Property"),
+                        FooterOperation::Enter,
+                    ),
+                ],
+                Some(format!("{current_device_label}: {}", dialog.device_did)),
+            ),
+            BoolDialogTab::ReadOnly => build_footer_segments(
+                &[
+                    (
+                        lang_str(lang, "R: 刷新", "R: Refresh"),
+                        FooterOperation::Refresh,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
+                    (
+                        lang_str(lang, "Enter: 查看属性", "Enter: View Property"),
+                        FooterOperation::Enter,
+                    ),
+                ],
+                Some(format!("{current_device_label}: {}", dialog.device_did)),
+            ),
+            BoolDialogTab::Actions => build_footer_segments(
+                &[
+                    (
+                        lang_str(lang, "R: 刷新", "R: Refresh"),
+                        FooterOperation::Refresh,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
+                ],
+                Some(format!("{current_device_label}: {}", dialog.device_did)),
+            ),
         };
     }
 
     match app.active_tab {
-        0 => {
-            let (add, enter_suffix) = ACCOUNT_TAB_STATUS_TEXT
-                .split_once(" Enter: ")
-                .expect("account tab footer format");
-            let enter = format!("Enter: {enter_suffix}");
-            vec![
-                FooterSegment {
-                    text: add.to_string(),
-                    operation: Some(FooterOperation::AddAccount),
-                },
-                FooterSegment {
-                    text: " ".to_string(),
-                    operation: None,
-                },
-                FooterSegment {
-                    text: enter,
-                    operation: Some(FooterOperation::Enter),
-                },
-            ]
-        }
+        0 => vec![
+            FooterSegment {
+                text: lang_str(lang, "A: 新增账户", "A: Add Account").to_string(),
+                operation: Some(FooterOperation::AddAccount),
+            },
+            FooterSegment {
+                text: " ".to_string(),
+                operation: None,
+            },
+            FooterSegment {
+                text: lang_str(lang, "Enter: 账户操作", "Enter: Account Actions").to_string(),
+                operation: Some(FooterOperation::Enter),
+            },
+        ],
         1 => {
-            let parts = DEVICE_TAB_STATUS_PREFIX
-                .strip_suffix("设备总数: ")
-                .expect("device footer suffix")
-                .split(", ")
-                .collect::<Vec<_>>();
+            let total_label = lang_str(lang, "设备总数", "Total Devices");
             build_footer_segments(
                 &[
-                    (parts[0], FooterOperation::Refresh),
-                    (parts[1], FooterOperation::Enter),
+                    (
+                        lang_str(lang, "R: 刷新", "R: Refresh"),
+                        FooterOperation::Refresh,
+                    ),
+                    (
+                        lang_str(lang, "Enter: 查看设备", "Enter: View Device"),
+                        FooterOperation::Enter,
+                    ),
                 ],
                 Some(format!(
-                    "设备总数: {} 当前设备: {}",
+                    "{total_label}: {} {current_device_label}: {}",
                     app.devices.len(),
                     app.selected_device_did().unwrap_or("-")
                 )),
             )
         }
         3 => build_footer_segments(
-            &[(SETTINGS_TAB_STATUS_TEXT, FooterOperation::Enter)],
+            &[(
+                lang_str(lang, "Enter: 选择", "Enter: Select"),
+                FooterOperation::Enter,
+            )],
             Some("".to_string()),
         ),
         _ => vec![FooterSegment {
@@ -1272,7 +1358,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     let [tabs_area, content_area, _status_gap_area, status_bar_area] =
         split_main_layout(frame.area());
 
-    let titles = TAB_TITLES
+    let titles = tab_titles(app.language)
         .iter()
         .map(|name| Line::from(Span::styled(*name, Style::default().fg(Color::Blue))))
         .collect::<Vec<_>>();
@@ -1286,7 +1372,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         .select(app.active_tab);
     frame.render_widget(tabs, tabs_area);
     if app.bootstrap_pending.is_some() {
-        let badge = "刷新中...";
+        let badge = lang_str(app.language, "刷新中...", "Refreshing...");
         let badge_width = badge.chars().count() as u16 + 4;
         if tabs_area.width > badge_width + 2 {
             let badge_area = ratatui::layout::Rect::new(
@@ -1327,11 +1413,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                     account_page::account_list_row(
                         account,
                         app.offline_account_uids.contains(account.user.uid.as_str()),
+                        app.language,
                     )
                 })
                 .collect::<Vec<_>>();
-            let columns =
-                account_page::compute_account_list_columns(&rows, header_area.width as usize);
+            let columns = account_page::compute_account_list_columns(
+                &rows,
+                header_area.width as usize,
+                app.language,
+            );
             let items = rows
                 .iter()
                 .enumerate()
@@ -1348,6 +1438,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             frame.render_widget(
                 Paragraph::new(account_page::format_account_list_header_line_with_columns(
                     columns,
+                    app.language,
                 )),
                 header_area,
             );
@@ -1355,7 +1446,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         }
         1 => {
             app.hydrate_devices_from_cache_if_empty();
-            let device_categories = read_device_categories(app.home_dir.as_path());
+            let device_categories = read_device_categories(app.home_dir.as_path(), app.language);
             let selected = if app.devices.is_empty() {
                 None
             } else {
@@ -1383,7 +1474,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                     )
                 })
                 .collect::<Vec<_>>();
-            let columns = compute_device_list_columns(&rows, header_area.width as usize);
+            let columns =
+                compute_device_list_columns(&rows, header_area.width as usize, app.language);
             let items = rows
                 .iter()
                 .enumerate()
@@ -1397,7 +1489,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 })
                 .collect::<Vec<_>>();
             frame.render_widget(
-                Paragraph::new(format_device_list_header_line_with_columns(columns)),
+                Paragraph::new(format_device_list_header_line_with_columns(
+                    columns,
+                    app.language,
+                )),
                 header_area,
             );
             frame.render_stateful_widget(List::new(items), list_area, &mut app.device_list_state);
@@ -1412,11 +1507,29 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .areas(content_area);
-            frame.render_widget(Paragraph::new("设置项"), header_area);
+            frame.render_widget(
+                Paragraph::new(lang_str(app.language, "设置项", "Settings")),
+                header_area,
+            );
 
+            let lang_label = match app.language {
+                Language::Chinese => "语言 / Language: 中文",
+                Language::English => "Language / 语言: English",
+            };
             let rows = [
-                "重置设备缓存（重新同步设备）".to_string(),
-                "重置全部设置（删除 ~/.mit）".to_string(),
+                lang_label.to_string(),
+                lang_str(
+                    app.language,
+                    "重置设备缓存（重新同步设备）",
+                    "Reset Device Cache (Re-sync Devices)",
+                )
+                .to_string(),
+                lang_str(
+                    app.language,
+                    "重置全部设置（删除 ~/.mit）",
+                    "Reset All Settings (Delete ~/.mit)",
+                )
+                .to_string(),
             ];
             let selected_idx = app.settings_selected_index();
             let items = rows
@@ -1462,18 +1575,27 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         match dialog {
             AccountActionDialog::Menu { selected } => {
                 let popup = centered_rect(48, 34, frame.area());
-                let items = ["推送消息", "登录", "退出登录"]
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, item)| {
-                        let selected_marker = if idx == *selected { ">" } else { " " };
-                        ListItem::new(format!("{selected_marker} {item}"))
-                    })
-                    .collect::<Vec<_>>();
+                let items = [
+                    lang_str(app.language, "推送消息", "Push Message"),
+                    lang_str(app.language, "登录", "Login"),
+                    lang_str(app.language, "退出登录", "Logout"),
+                ]
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| {
+                    let selected_marker = if idx == *selected { ">" } else { " " };
+                    ListItem::new(format!("{selected_marker} {item}"))
+                })
+                .collect::<Vec<_>>();
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
-                    List::new(items)
-                        .block(Block::default().borders(all_borders()).title("账户操作")),
+                    List::new(items).block(
+                        Block::default().borders(all_borders()).title(lang_str(
+                            app.language,
+                            "账户操作",
+                            "Account Actions",
+                        )),
+                    ),
                     popup,
                 );
             }
@@ -1512,7 +1634,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 };
                 frame.render_widget(
                     Paragraph::new(reauth_text)
-                        .block(Block::default().borders(top_bottom_borders()).title("登录"))
+                        .block(
+                            Block::default()
+                                .borders(top_bottom_borders())
+                                .title(lang_str(app.language, "登录", "Login")),
+                        )
                         .wrap(Wrap { trim: true }),
                     popup,
                 );
@@ -1525,7 +1651,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 frame.render_widget(
                     Block::default()
                         .borders(top_bottom_borders())
-                        .title("推送通知"),
+                        .title(lang_str(app.language, "推送通知", "Push Notification")),
                     popup,
                 );
                 let inner = ratatui::layout::Rect::new(
@@ -1543,14 +1669,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                     ])
                     .split(inner);
                 frame.render_widget(
-                    Paragraph::new(format!("账户 ID: {uid}\n\n消息内容:"))
-                        .wrap(Wrap { trim: false }),
+                    Paragraph::new(format!(
+                        "{}: {uid}\n\n{}:",
+                        lang_str(app.language, "账户 ID", "Account ID"),
+                        lang_str(app.language, "消息内容", "Message")
+                    ))
+                    .wrap(Wrap { trim: false }),
                     sections[0],
                 );
                 let textarea = single_line_textarea(input, *cursor, true);
                 render_textarea_widget(&textarea, sections[1], frame.buffer_mut());
                 let command_area = push_message_command_area(frame.area(), input.as_str());
-                let command_line = push_message_cli_preview_line(uid.as_str(), input.as_str());
+                let command_line =
+                    push_message_cli_preview_line(uid.as_str(), input.as_str(), app.language);
                 {
                     let buffer = frame.buffer_mut();
                     for x in command_area.x..command_area.x.saturating_add(command_area.width) {
@@ -1587,13 +1718,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             AccountActionDialog::SettingsConfirm { action } => {
                 let popup = centered_rect(74, 42, frame.area());
                 frame.render_widget(Clear, popup);
-                let lines = settings_confirm_lines(*action);
+                let lines = settings_confirm_lines(*action, app.language);
                 frame.render_widget(
                     Paragraph::new(lines.join("\n"))
                         .block(
                             Block::default()
                                 .borders(top_bottom_borders())
-                                .title("确认操作"),
+                                .title(lang_str(app.language, "确认操作", "Confirm Action")),
                         )
                         .wrap(Wrap { trim: true }),
                     popup,
@@ -1722,6 +1853,8 @@ struct TuiApp {
     bootstrap_tx: Sender<BootstrapMessage>,
     bootstrap_rx: Receiver<BootstrapMessage>,
     property_cache: Arc<PropertyCache>,
+    language: Language,
+    settings_selected: usize,
 }
 
 impl TuiApp {
@@ -1739,6 +1872,7 @@ impl TuiApp {
             .unwrap_or(0);
 
         let home_dir = get_home_dir();
+        let settings = load_settings();
         let (local_transport_tx, local_transport_rx) = mpsc::channel();
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel();
         let (auth_flow_tx, auth_flow_rx) = mpsc::channel();
@@ -1777,6 +1911,8 @@ impl TuiApp {
             bootstrap_tx,
             bootstrap_rx,
             property_cache,
+            language: settings.language,
+            settings_selected: 0,
         })
     }
 
@@ -1967,7 +2103,8 @@ impl TuiApp {
                     vec![format!("loaded {count} devices")]
                 };
                 let mut device_categories =
-                    read_device_categories_from_template(home_dir.as_path()).unwrap_or_default();
+                    read_device_categories_from_template(home_dir.as_path(), Language::Chinese)
+                        .unwrap_or_default();
                 if fetched_remote_any {
                     let missing_spec_models =
                         device_models_missing_local_specs(home_dir.as_path(), &merged_devices);
@@ -1980,9 +2117,11 @@ impl TuiApp {
                             home_dir.as_path(),
                             missing_spec_models.as_slice(),
                         ));
-                        device_categories =
-                            read_device_categories_from_template(home_dir.as_path())
-                                .unwrap_or_default();
+                        device_categories = read_device_categories_from_template(
+                            home_dir.as_path(),
+                            Language::Chinese,
+                        )
+                        .unwrap_or_default();
                     }
                     if let Err(error) = cache_devices_for_accounts(
                         home_dir.as_path(),
@@ -2038,6 +2177,181 @@ impl TuiApp {
         self.accounts.get(self.account_index)
     }
 
+    fn refresh_cloud_mips_listeners(&mut self) {
+        if cloud_mips_disabled() {
+            if cloud_mips_disabled_by_user() {
+                self.log("cloud MIPS not started: disabled by MIT_DISABLE_CLOUD_MIPS");
+            }
+            if let Ok(mut runtime) = cloud_mips_runtime().lock() {
+                *runtime = None;
+            }
+            return;
+        }
+
+        let groups = self.cloud_mips_account_device_groups();
+        if groups.is_empty() {
+            let account_count = self.accounts.len();
+            let oauth_account_count = self
+                .accounts
+                .iter()
+                .filter(|account| !account.access_token.trim().is_empty())
+                .count();
+            let offline_account_count = self.offline_account_uids.len();
+            let tagged_device_count = self
+                .devices
+                .iter()
+                .filter(|device| device_account_uid(device).is_some())
+                .count();
+            self.log(format!(
+                "cloud MIPS not started: no eligible OAuth account/device groups \
+                 (accounts={account_count}, oauth_accounts={oauth_account_count}, \
+                 offline_accounts={offline_account_count}, devices={}, tagged_devices={tagged_device_count})",
+                self.devices.len()
+            ));
+            if let Ok(mut runtime) = cloud_mips_runtime().lock() {
+                *runtime = None;
+            }
+            return;
+        }
+
+        let key = cloud_mips_runtime_key(&groups);
+        let Ok(mut runtime) = cloud_mips_runtime().lock() else {
+            self.log("cloud MIPS runtime lock poisoned");
+            return;
+        };
+        if runtime.as_ref().is_some_and(|current| current.key == key) {
+            return;
+        }
+
+        let account_count = groups.len();
+        let device_count = groups.iter().map(|(_, dids)| dids.len()).sum::<usize>();
+        self.log(format!(
+            "cloud MIPS starting: accounts={account_count} devices={device_count}"
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        let mut errors = Vec::new();
+        for (account, dids) in groups {
+            match config_from_account(&account).and_then(|config| {
+                start_property_cache_listener(
+                    config,
+                    dids,
+                    self.property_cache.clone(),
+                    Some(tx.clone()),
+                )
+            }) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => errors.push(format!(
+                    "{}: {error}",
+                    account_page::format_account_label(&account)
+                )),
+            }
+        }
+        drop(tx);
+
+        let started_count = handles.len();
+        if handles.is_empty() {
+            *runtime = None;
+        } else {
+            *runtime = Some(CloudMipsRuntime {
+                key,
+                _handles: handles,
+                rx,
+            });
+        }
+        drop(runtime);
+
+        for error in errors {
+            self.log(format!("cloud MIPS start failed: {error}"));
+        }
+        if started_count > 0 {
+            self.log(format!(
+                "cloud MIPS listener threads spawned: {started_count}"
+            ));
+        }
+    }
+
+    fn cloud_mips_account_device_groups(&self) -> Vec<(AuthAccount, Vec<String>)> {
+        let mut groups = Vec::new();
+        for account in &self.accounts {
+            if account.access_token.trim().is_empty()
+                || self.offline_account_uids.contains(&account.user.uid)
+            {
+                continue;
+            }
+            let dids = self
+                .devices
+                .iter()
+                .filter(|device| device_account_uid(device) == Some(account.user.uid.as_str()))
+                .map(|device| device.did.clone())
+                .collect::<Vec<_>>();
+            if dids.is_empty() {
+                continue;
+            }
+            groups.push((account.clone(), dids));
+        }
+        groups
+    }
+
+    fn process_cloud_mips_messages(&mut self) {
+        let statuses = {
+            let Ok(mut runtime) = cloud_mips_runtime().lock() else {
+                self.log("cloud MIPS runtime lock poisoned");
+                return;
+            };
+            let Some(runtime) = runtime.as_mut() else {
+                return;
+            };
+            runtime.rx.try_iter().collect::<Vec<_>>()
+        };
+
+        for status in statuses {
+            match status {
+                CloudMipsStatus::Started { host, device_count } => self.log(format!(
+                    "cloud MIPS listening on {host} for {device_count} devices"
+                )),
+                CloudMipsStatus::EventReceived { direction, summary } => {
+                    self.log(format!("cloud MIPS mqtt {direction}: {summary}"))
+                }
+                CloudMipsStatus::MessageReceived { topic, payload_len } => self.log(format!(
+                    "cloud MIPS message: topic={topic} bytes={payload_len}"
+                )),
+                CloudMipsStatus::PropertyApplied { did, siid, piid } => self.log(format!(
+                    "cloud MIPS property update: did={did} siid={siid} piid={piid}"
+                )),
+                CloudMipsStatus::Error { message } => {
+                    self.log(format!("cloud MIPS error: {message}"))
+                }
+                CloudMipsStatus::IgnoredMessage { reason } => {
+                    self.log(format!("cloud MIPS ignored message: {reason}"))
+                }
+                CloudMipsStatus::Stopped => self.log("cloud MIPS stopped"),
+            }
+        }
+    }
+
+    fn apply_cached_prop_dialog_updates(&mut self) {
+        let Some(dialog) = self.prop_dialog.as_mut() else {
+            return;
+        };
+        if dialog.loading || dialog.editing {
+            return;
+        }
+        for item in &mut dialog.items {
+            let Some(cached) = self.property_cache.get_property(
+                dialog.device_did.as_str(),
+                item.prop.siid,
+                item.prop.piid,
+            ) else {
+                continue;
+            };
+            if let Some(value) = extract_prop_value(&cached) {
+                item.value = value;
+            }
+        }
+    }
+
     fn should_apply_bootstrap(&self, generation: u64, uid: &str) -> bool {
         self.bootstrap_pending
             .as_ref()
@@ -2045,6 +2359,7 @@ impl TuiApp {
     }
 
     fn process_background_messages(&mut self) {
+        self.process_cloud_mips_messages();
         while let Ok(message) = self.bootstrap_rx.try_recv() {
             match message {
                 BootstrapMessage::Ready {
@@ -2106,6 +2421,7 @@ impl TuiApp {
                     for log in logs {
                         self.log(log);
                     }
+                    self.refresh_cloud_mips_listeners();
                     let should_rewarm_local_transport = refresh_local_transport_if_missing
                         && self
                             .current_uid()
@@ -2197,6 +2513,7 @@ impl TuiApp {
                                 if self.account_index >= self.accounts.len() {
                                     self.account_index = 0;
                                 }
+                                self.refresh_cloud_mips_listeners();
                             }
                             Err(error) => {
                                 self.log(format!("auth flow reload failed: {error}"));
@@ -2324,16 +2641,18 @@ impl TuiApp {
         if SETTINGS_ITEM_COUNT == 0 {
             return 0;
         }
-        self.boot_spinner_index % SETTINGS_ITEM_COUNT
+        self.settings_selected
+            .min(SETTINGS_ITEM_COUNT.saturating_sub(1))
     }
 
     fn select_settings_item(&mut self, index: usize) {
-        self.boot_spinner_index = index.min(SETTINGS_ITEM_COUNT.saturating_sub(1));
+        self.settings_selected = index.min(SETTINGS_ITEM_COUNT.saturating_sub(1));
     }
 
     fn selected_settings_action(&self) -> SettingsAction {
         match self.settings_selected_index() {
-            0 => SettingsAction::ClearCacheKeepAuth,
+            0 => SettingsAction::ToggleLanguage,
+            1 => SettingsAction::ClearCacheKeepAuth,
             _ => SettingsAction::ResetAll,
         }
     }
@@ -2342,6 +2661,16 @@ impl TuiApp {
         match action {
             SettingsAction::ClearCacheKeepAuth => self.purge_devices_cache_keep_auth(),
             SettingsAction::ResetAll => self.reset_all_settings(),
+            SettingsAction::ToggleLanguage => {
+                self.language = match self.language {
+                    Language::Chinese => Language::English,
+                    Language::English => Language::Chinese,
+                };
+                let _ = save_settings(&UserSettings {
+                    language: self.language,
+                });
+                Ok(())
+            }
         }
     }
 
@@ -2410,17 +2739,22 @@ impl TuiApp {
 
     fn execute_selected_settings_action(&mut self) -> Result<()> {
         let action = self.selected_settings_action();
-        self.account_action_dialog = Some(AccountActionDialog::SettingsConfirm { action });
-        Ok(())
+        match action {
+            SettingsAction::ToggleLanguage => self.execute_settings_action(action),
+            _ => {
+                self.account_action_dialog = Some(AccountActionDialog::SettingsConfirm { action });
+                Ok(())
+            }
+        }
     }
 
     fn next_tab(&mut self) {
-        self.active_tab = (self.active_tab + 1) % TAB_TITLES.len();
+        self.active_tab = (self.active_tab + 1) % tab_titles(self.language).len();
     }
 
     fn prev_tab(&mut self) {
         self.active_tab = if self.active_tab == 0 {
-            TAB_TITLES.len().saturating_sub(1)
+            tab_titles(self.language).len().saturating_sub(1)
         } else {
             self.active_tab - 1
         };
@@ -3124,8 +3458,8 @@ impl TuiApp {
             .to_string();
         let spec = load_spec(&self.home_dir, &selected.model)?;
         let spec = spec.ok_or_else(|| anyhow!("未找到设备规格，请先 sync-specs"))?;
-        let props = collect_readable_props(&spec);
-        let actions = extract_actions_from_spec(&spec);
+        let props = collect_readable_props(&spec, self.language);
+        let actions = extract_actions_from_spec(&spec, self.language);
         if props.is_empty() && actions.is_empty() {
             bail!("该设备规格没有可用属性或操作");
         }
@@ -3641,9 +3975,9 @@ fn sync_specs_for_models(home_dir: &std::path::Path, models: &[String]) -> Vec<S
     logs
 }
 
-fn read_device_categories(home_dir: &std::path::Path) -> HashMap<String, String> {
+fn read_device_categories(home_dir: &std::path::Path, lang: Language) -> HashMap<String, String> {
     let mut categories = read_device_categories_from_cached_devices(home_dir).unwrap_or_default();
-    categories.extend(read_device_categories_from_template(home_dir).unwrap_or_default());
+    categories.extend(read_device_categories_from_template(home_dir, lang).unwrap_or_default());
     categories
 }
 
@@ -4026,6 +4360,38 @@ fn device_account_uid(device: &Device) -> Option<&str> {
         .filter(|uid| !uid.is_empty())
 }
 
+fn cloud_mips_runtime_key(groups: &[(AuthAccount, Vec<String>)]) -> String {
+    let mut entries = groups
+        .iter()
+        .map(|(account, dids)| {
+            let mut dids = dids.clone();
+            dids.sort();
+            format!(
+                "{}:{}:{}:{}",
+                account.user.uid,
+                account.uuid,
+                account.access_token,
+                dids.join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.join("|")
+}
+
+fn cloud_mips_disabled_by_user() -> bool {
+    std::env::var("MIT_DISABLE_CLOUD_MIPS")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn cloud_mips_disabled() -> bool {
+    if cloud_mips_disabled_by_user() {
+        return true;
+    }
+    cfg!(test) && std::env::var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS").is_err()
+}
+
 fn merge_devices(into: &mut Vec<Device>, extra: Vec<Device>) {
     let mut seen = into
         .iter()
@@ -4284,8 +4650,16 @@ pub(in crate::tui) fn push_message_command_area(terminal_area: Rect, input: &str
     )
 }
 
-pub(in crate::tui) fn push_message_cli_preview_line(uid: &str, input: &str) -> String {
-    format!("CLI 命令: {}", format_preview_push_command(uid, input))
+pub(in crate::tui) fn push_message_cli_preview_line(
+    uid: &str,
+    input: &str,
+    lang: Language,
+) -> String {
+    format!(
+        "{}: {}",
+        lang_str(lang, "CLI 命令", "CLI Command"),
+        format_preview_push_command(uid, input)
+    )
 }
 
 fn push_message_dialog_sections(terminal_area: Rect, input: &str) -> [Rect; 3] {
@@ -4737,28 +5111,31 @@ fn all_prop_dialog_tabs() -> [BoolDialogTab; 3] {
     ]
 }
 
-fn prop_dialog_tab_title(tab: BoolDialogTab) -> &'static str {
+fn prop_dialog_tab_title(tab: BoolDialogTab, lang: Language) -> &'static str {
     match tab {
-        BoolDialogTab::Actions => "快捷操作",
-        BoolDialogTab::Writable => "修改参数",
-        BoolDialogTab::ReadOnly => "只读属性",
+        BoolDialogTab::Actions => lang_str(lang, "快捷操作", "Quick Actions"),
+        BoolDialogTab::Writable => lang_str(lang, "修改参数", "Edit Properties"),
+        BoolDialogTab::ReadOnly => lang_str(lang, "只读属性", "Read-only Properties"),
     }
 }
 
-fn numbered_prop_dialog_tab_titles(tabs: impl IntoIterator<Item = BoolDialogTab>) -> Vec<String> {
+fn numbered_prop_dialog_tab_titles(
+    tabs: impl IntoIterator<Item = BoolDialogTab>,
+    lang: Language,
+) -> Vec<String> {
     tabs.into_iter()
         .enumerate()
-        .map(|(index, tab)| format!("{}:{}", index + 1, prop_dialog_tab_title(tab)))
+        .map(|(index, tab)| format!("{}:{}", index + 1, prop_dialog_tab_title(tab, lang)))
         .collect()
 }
 
 #[cfg(test)]
-fn all_prop_dialog_tab_titles() -> Vec<String> {
-    numbered_prop_dialog_tab_titles(all_prop_dialog_tabs())
+fn all_prop_dialog_tab_titles(lang: Language) -> Vec<String> {
+    numbered_prop_dialog_tab_titles(all_prop_dialog_tabs(), lang)
 }
 
-fn visible_prop_dialog_tab_titles(dialog: &BoolDialog) -> Vec<String> {
-    numbered_prop_dialog_tab_titles(visible_prop_dialog_tabs(dialog))
+fn visible_prop_dialog_tab_titles(dialog: &BoolDialog, lang: Language) -> Vec<String> {
+    numbered_prop_dialog_tab_titles(visible_prop_dialog_tabs(dialog), lang)
 }
 
 fn prop_dialog_indices_for_tab(dialog: &BoolDialog, tab: BoolDialogTab) -> Vec<usize> {
@@ -4795,6 +5172,7 @@ fn format_prop_dialog_list_item_line(
     item: &BoolToggleItem,
     selected: bool,
     loading: bool,
+    lang: Language,
 ) -> String {
     let selected_marker = if selected { ">" } else { " " };
     let value = if (loading && item.value.is_null())
@@ -4820,7 +5198,8 @@ fn format_prop_dialog_list_item_line(
         String::new()
     } else {
         format!(
-            " | 选项: {}",
+            " | {}: {}",
+            lang_str(lang, "选项", "Options"),
             item.prop
                 .value_options
                 .iter()
@@ -4931,29 +5310,39 @@ fn format_preview_push_command(uid: &str, text: &str) -> String {
     format!("mit push --uid {} {}", uid, preview_param(text))
 }
 
-pub(in crate::tui) fn prop_dialog_title(dialog: &BoolDialog) -> String {
+pub(in crate::tui) fn prop_dialog_title(dialog: &BoolDialog, lang: Language) -> String {
     let dialog_title = if dialog.device_name.trim().is_empty() {
         dialog.device_did.as_str()
     } else {
         dialog.device_name.as_str()
     };
     if dialog.loading || dialog.refreshing {
-        format!("{dialog_title} (刷新中...)")
+        format!(
+            "{dialog_title} ({})",
+            lang_str(lang, "刷新中...", "Loading...")
+        )
     } else {
         dialog_title.to_string()
     }
 }
 
-pub(in crate::tui) fn prop_editor_header_lines(dialog: &BoolDialog) -> Vec<String> {
+pub(in crate::tui) fn prop_editor_header_lines(dialog: &BoolDialog, lang: Language) -> Vec<String> {
     if dialog.active_tab == BoolDialogTab::ReadOnly {
         let Some(item) = dialog.items.get(dialog.selected) else {
             return vec!["No selected property".to_string()];
         };
         return vec![
-            format!("当前属性: {} [{}]", item.prop.name, item.prop.format),
-            format!("当前值: {}", format_prop_value_for_dialog(&item.value)),
-            String::new(),
-            "按 Esc 返回".to_string(),
+            format!(
+                "{}: {} [{}]",
+                lang_str(lang, "当前属性", "Property"),
+                item.prop.name,
+                item.prop.format
+            ),
+            format!(
+                "{}: {}",
+                lang_str(lang, "当前值", "Value"),
+                format_prop_value_for_dialog(&item.value)
+            ),
         ];
     }
     if dialog.active_tab == BoolDialogTab::Actions {
@@ -4968,13 +5357,22 @@ pub(in crate::tui) fn prop_editor_header_lines(dialog: &BoolDialog) -> Vec<Strin
         return vec!["No selected property".to_string()];
     };
     let selector_hint = if prop_edit_selector_options_text(dialog).is_some() {
-        "选择值:"
+        lang_str(lang, "选择值:", "Select value:")
     } else {
-        "输入值:"
+        lang_str(lang, "输入值:", "Enter value:")
     };
     let mut lines = vec![
-        format!("当前操作: {} [{}]", item.prop.name, item.prop.format),
-        format!("当前值: {}", format_prop_value_for_dialog(&item.value)),
+        format!(
+            "{}: {} [{}]",
+            lang_str(lang, "当前操作", "Action"),
+            item.prop.name,
+            item.prop.format
+        ),
+        format!(
+            "{}: {}",
+            lang_str(lang, "当前值", "Value"),
+            format_prop_value_for_dialog(&item.value)
+        ),
     ];
     if !item.prop.value_options.is_empty() {
         lines.push(format!(
@@ -5090,8 +5488,12 @@ pub(in crate::tui) struct PropEditorLayout {
     pub(in crate::tui) footer_area: Option<Rect>,
 }
 
-pub(in crate::tui) fn prop_editor_layout(dialog: &BoolDialog, inner: Rect) -> PropEditorLayout {
-    let header_lines = prop_editor_header_lines(dialog)
+pub(in crate::tui) fn prop_editor_layout(
+    dialog: &BoolDialog,
+    inner: Rect,
+    lang: Language,
+) -> PropEditorLayout {
+    let header_lines = prop_editor_header_lines(dialog, lang)
         .iter()
         .map(|line| wrapped_text_line_count(line, inner.width))
         .sum::<u16>();
@@ -5137,7 +5539,7 @@ pub(in crate::tui) fn prop_editor_layout(dialog: &BoolDialog, inner: Rect) -> Pr
     } else {
         wrapped_text_line_count(dialog.edit_buffer.as_str(), inner.width).max(2)
     };
-    let footer_lines = prop_editor_bottom_lines(dialog)
+    let footer_lines = prop_editor_bottom_lines(dialog, lang)
         .iter()
         .map(|line| wrapped_text_line_count(line, inner.width))
         .sum::<u16>();
@@ -5177,16 +5579,24 @@ pub(in crate::tui) fn prop_editor_layout(dialog: &BoolDialog, inner: Rect) -> Pr
     }
 }
 
-fn prop_editor_bottom_lines(dialog: &BoolDialog) -> Vec<String> {
+fn prop_editor_bottom_lines(dialog: &BoolDialog, lang: Language) -> Vec<String> {
     if dialog.active_tab == BoolDialogTab::ReadOnly {
         return readonly_prop_detail_command(dialog)
-            .map(|command| vec![format!("CLI 命令(读取): {command}")])
+            .map(|command| {
+                vec![format!(
+                    "{}: {command}",
+                    lang_str(lang, "CLI 命令(读取)", "CLI Command (Read)")
+                )]
+            })
             .unwrap_or_default();
     }
     let mut bottom_lines = Vec::new();
     if dialog.active_tab != BoolDialogTab::Actions {
         if let Some(command) = prop_edit_get_command(dialog) {
-            bottom_lines.push(format!("CLI 命令(读取): {command}"));
+            bottom_lines.push(format!(
+                "{}: {command}",
+                lang_str(lang, "CLI 命令(读取)", "CLI Command (Read)")
+            ));
         }
     }
     let command_preview = if dialog.active_tab == BoolDialogTab::Actions {
@@ -5195,7 +5605,10 @@ fn prop_editor_bottom_lines(dialog: &BoolDialog) -> Vec<String> {
         prop_edit_command_preview(dialog)
     };
     if let Some(command) = command_preview {
-        bottom_lines.push(format!("CLI 命令(执行): {command}"));
+        bottom_lines.push(format!(
+            "{}: {command}",
+            lang_str(lang, "CLI 命令(执行)", "CLI Command (Execute)")
+        ));
     }
     if let Some(error) = &dialog.edit_error {
         if !bottom_lines.is_empty() {
@@ -5206,17 +5619,14 @@ fn prop_editor_bottom_lines(dialog: &BoolDialog) -> Vec<String> {
     bottom_lines
 }
 
-fn collect_readable_props(spec: &Value) -> Vec<BoolPropItem> {
+fn collect_readable_props(spec: &Value, lang: Language) -> Vec<BoolPropItem> {
     let mut out = Vec::new();
     let Some(services) = spec.get("services").and_then(Value::as_array) else {
         return out;
     };
     for service in services {
         let siid = service.get("iid").and_then(Value::as_i64).unwrap_or(0);
-        let service_name = service
-            .get("description_trans")
-            .and_then(Value::as_str)
-            .or_else(|| service.get("description").and_then(Value::as_str))
+        let service_name = spec_node_label(service, lang)
             .map(str::trim)
             .filter(|text| !text.is_empty());
         let Some(properties) = service.get("properties").and_then(Value::as_array) else {
@@ -5249,10 +5659,7 @@ fn collect_readable_props(spec: &Value) -> Vec<BoolPropItem> {
                         .iter()
                         .filter_map(|entry| {
                             let value = entry.get("value")?.clone();
-                            let label = entry
-                                .get("description_trans")
-                                .and_then(Value::as_str)
-                                .or_else(|| entry.get("description").and_then(Value::as_str))
+                            let label = spec_node_label(entry, lang)
                                 .map(str::trim)
                                 .filter(|text| !text.is_empty())
                                 .map(ToString::to_string)
@@ -5269,10 +5676,7 @@ fn collect_readable_props(spec: &Value) -> Vec<BoolPropItem> {
             if siid <= 0 || piid <= 0 {
                 continue;
             }
-            let prop_name = prop
-                .get("description_trans")
-                .and_then(Value::as_str)
-                .or_else(|| prop.get("description").and_then(Value::as_str))
+            let prop_name = spec_node_label(prop, lang)
                 .map(str::trim)
                 .unwrap_or_default()
                 .to_string();
@@ -5331,7 +5735,7 @@ fn extract_prop_value(raw: &Value) -> Option<Value> {
     Some(first)
 }
 
-fn extract_actions_from_spec(spec: &Value) -> Vec<ActionItem> {
+fn extract_actions_from_spec(spec: &Value, lang: Language) -> Vec<ActionItem> {
     let mut actions = Vec::new();
     if let Some(services) = spec.get("services").and_then(|v| v.as_array()) {
         for service in services {
@@ -5344,10 +5748,7 @@ fn extract_actions_from_spec(spec: &Value) -> Vec<ActionItem> {
                         .iter()
                         .filter_map(|p| {
                             let piid = p.get("iid").and_then(Value::as_i64)?;
-                            let name = p
-                                .get("description_trans")
-                                .or_else(|| p.get("description"))
-                                .and_then(Value::as_str)
+                            let name = spec_node_label(p, lang)
                                 .map(str::trim)
                                 .filter(|text| !text.is_empty())
                                 .unwrap_or("")
@@ -5365,12 +5766,7 @@ fn extract_actions_from_spec(spec: &Value) -> Vec<ActionItem> {
                                         .iter()
                                         .filter_map(|entry| {
                                             let value = entry.get("value")?.clone();
-                                            let label = entry
-                                                .get("description_trans")
-                                                .and_then(Value::as_str)
-                                                .or_else(|| {
-                                                    entry.get("description").and_then(Value::as_str)
-                                                })
+                                            let label = spec_node_label(entry, lang)
                                                 .map(str::trim)
                                                 .filter(|text| !text.is_empty())
                                                 .map(ToString::to_string)
@@ -5401,11 +5797,8 @@ fn extract_actions_from_spec(spec: &Value) -> Vec<ActionItem> {
             if let Some(service_actions) = service.get("actions").and_then(|v| v.as_array()) {
                 for action in service_actions {
                     if let Some(aiid) = action.get("iid").and_then(|v| v.as_i64()) {
-                        let name = action
-                            .get("description_trans")
-                            .or_else(|| action.get("description"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("未知操作")
+                        let name = spec_node_label(action, lang)
+                            .unwrap_or(lang_str(lang, "未知操作", "Unknown Action"))
                             .to_string();
                         let input_piids = action
                             .get("in")
@@ -5534,6 +5927,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 fn read_device_categories_from_template(
     home_dir: &std::path::Path,
+    lang: Language,
 ) -> Result<HashMap<String, String>> {
     let specs = specs_dir(home_dir);
     let template_path = specs.join("sources").join("template_list_device.json");
@@ -5549,7 +5943,7 @@ fn read_device_categories_from_template(
     let mut direct_model_categories = HashMap::new();
     let mut type_categories = HashMap::new();
     for entry in template_entries {
-        let category = category_from_template_entry(entry).unwrap_or_else(|| "-".to_string());
+        let category = category_from_template_entry(entry, lang).unwrap_or_else(|| "-".to_string());
 
         if let Some(model) = entry
             .get("model")
@@ -5604,14 +5998,17 @@ fn read_device_categories_from_template(
     Ok(resolved)
 }
 
-fn category_from_template_entry(entry: &Value) -> Option<String> {
+fn category_from_template_entry(entry: &Value, lang: Language) -> Option<String> {
+    let keys: &[&str] = match lang {
+        Language::Chinese => &["zh_cn", "en"],
+        Language::English => &["en", "zh_cn"],
+    };
     entry
         .get("description")
         .and_then(Value::as_object)
         .and_then(|description| {
-            ["zh_cn", "en"]
-                .into_iter()
-                .find_map(|key| description.get(key).and_then(Value::as_str))
+            keys.iter()
+                .find_map(|key| description.get(*key).and_then(Value::as_str))
         })
         .map(str::trim)
         .filter(|value| !value.is_empty())

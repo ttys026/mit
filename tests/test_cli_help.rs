@@ -160,6 +160,35 @@ fn nested_help_lists_props_subcommands() {
     assert!(props_stdout.contains("写入一个属性"));
     assert!(props_stdout.contains("act"));
     assert!(props_stdout.contains("调用一个 action"));
+    assert!(props_stdout.contains("sub"));
+    assert!(props_stdout.contains("订阅属性变化"));
+}
+
+#[test]
+fn props_sub_help_lists_optional_subscription_arguments() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["props", "sub", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("订阅属性变化"));
+    assert!(stdout.contains("设备 DID"));
+    assert!(stdout.contains("服务 IID"));
+    assert!(stdout.contains("属性 IID"));
+}
+
+#[test]
+fn props_sub_requires_siid_and_piid_together() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["props", "sub", "dev-1", "2"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("<PIID>"));
+    assert!(stderr.contains("Usage: mit props sub <DID> <SIID> <PIID>"));
 }
 
 #[test]
