@@ -199,6 +199,7 @@ fn parse_non_empty_text(value: &str) -> Result<String, String> {
 
 pub fn build_command() -> Command {
     Cli::command()
+        .bin_name("mit")
         .disable_help_flag(true)
         .disable_help_subcommand(true)
         .arg(

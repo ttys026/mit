@@ -192,6 +192,19 @@ fn props_sub_requires_siid_and_piid_together() {
 }
 
 #[test]
+fn clap_errors_use_stable_binary_name_when_argv0_has_windows_extension() {
+    let args = ["mit.exe", "props", "sub", "dev-1", "2"].map(String::from);
+    let error = mit::cli::build_command()
+        .try_get_matches_from(mit::cli::normalize_args_for_clap(&args))
+        .unwrap_err();
+    let stderr = strip_ansi_sequences(&error.to_string());
+
+    assert!(stderr.contains("<PIID>"));
+    assert!(stderr.contains("Usage: mit props sub <DID> <SIID> <PIID>"));
+    assert!(!stderr.contains("Usage: mit.exe"));
+}
+
+#[test]
 fn push_help_lists_argument_and_option_descriptions() {
     let output = Command::new(env!("CARGO_BIN_EXE_mit"))
         .args(["push", "--help"])
