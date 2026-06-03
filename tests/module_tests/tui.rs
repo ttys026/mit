@@ -12,11 +12,10 @@ use super::{
     format_device_list_item_with_columns, format_preview_props_set_command,
     format_preview_push_command, format_prop_dialog_action_list_item_line,
     format_prop_value_for_dialog, handle_key, handle_mouse, load_cached_devices_from_home,
-    parse_bool_prop_value, parse_command, read_device_categories_from_template,
-    single_line_textarea, tab_index_for_column_with_titles, AccountActionDialog, ActionItem,
-    AuthFlowMessage, AuthState, BoolDialog, BoolDialogTab, BoolPropItem, BoolToggleItem, BootState,
-    BootstrapMessage, BootstrapPending, ListState, LocalTransportRefreshMessage, TuiApp,
-    TuiCommand,
+    parse_bool_prop_value, read_device_categories_from_template, single_line_textarea,
+    tab_index_for_column_with_titles, AccountActionDialog, ActionItem, AuthFlowMessage, AuthState,
+    BoolDialog, BoolDialogTab, BoolPropItem, BoolToggleItem, BootState, BootstrapMessage,
+    BootstrapPending, ListState, LocalTransportRefreshMessage, TuiApp,
 };
 use crate::mico_api::Device;
 use crate::property_cache::PropertyCache;
@@ -36,33 +35,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
-
-#[test]
-fn parse_get_command() {
-    let parsed = parse_command("get @ 2 1").unwrap();
-    assert_eq!(
-        parsed,
-        TuiCommand::Get {
-            did: "@".to_string(),
-            siid: 2,
-            piid: 1
-        }
-    );
-}
-
-#[test]
-fn parse_set_command() {
-    let parsed = parse_command("set dev-1 2 1 true").unwrap();
-    assert_eq!(
-        parsed,
-        TuiCommand::Set {
-            did: "dev-1".to_string(),
-            siid: 2,
-            piid: 1,
-            value: json!(true),
-        }
-    );
-}
 
 #[test]
 fn render_text_input_line_uses_reversed_block_cursor() {
@@ -98,21 +70,6 @@ fn preview_set_command_masks_long_params() {
     assert_eq!(
         format_preview_props_set_command("device-123", 2, 1, &json!(1234567)),
         "mit props set device-123 2 1 \"...\""
-    );
-}
-
-#[test]
-fn parse_act_command_requires_json_array() {
-    assert!(parse_command("act dev-1 5 1 {}").is_err());
-    let parsed = parse_command(r#"act dev-1 5 1 ["你好"]"#).unwrap();
-    assert_eq!(
-        parsed,
-        TuiCommand::Act {
-            did: "dev-1".to_string(),
-            siid: 5,
-            aiid: 1,
-            values: vec![json!("你好")]
-        }
     );
 }
 
@@ -788,8 +745,12 @@ fn draw_accounts_selected_row_uses_reversed_style() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -813,6 +774,7 @@ fn draw_accounts_selected_row_uses_reversed_style() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -859,8 +821,12 @@ fn draw_devices_selected_row_uses_reversed_style() {
         device_index: 1,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -884,6 +850,7 @@ fn draw_devices_selected_row_uses_reversed_style() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -891,6 +858,1364 @@ fn draw_devices_selected_row_uses_reversed_style() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
     assert!(terminal_has_reversed_cell(&terminal));
+}
+
+#[test]
+fn devices_tab_slash_focuses_search_and_filters_visible_rows() {
+    let mut app = devices_tab_test_app(vec![
+        test_device("dev-kitchen", "kitchen plug", "Kitchen", "A(1001)"),
+        test_device("dev-bed", "bedroom lamp", "Bedroom", "A(1001)"),
+        test_device("dev-hall", "hall camera", "Hall", "A(1001)"),
+    ]);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['b', 'e', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("bedroom lamp"), "{text}");
+    assert!(!text.contains("kitchen plug"), "{text}");
+    assert!(!text.contains("hall camera"), "{text}");
+    assert_eq!(app.devices.len(), 3);
+}
+
+#[test]
+fn devices_search_escape_blurs_and_restores_number_shortcuts() {
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 1);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 2);
+}
+
+#[test]
+fn devices_search_tab_shortcut_blurs_and_switches_tabs() {
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert_eq!(app.active_tab, 2);
+    assert!(!app.input_mode);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 0);
+}
+
+#[test]
+fn devices_search_mouse_tab_switch_blurs_and_keeps_tabs_clickable() {
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [tabs_area, _content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app.input_mode);
+
+    let logs_column = tab_column_for_index(tabs_area, &super::tab_titles(app.language), 2);
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: logs_column,
+            row: tabs_area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    assert_eq!(app.active_tab, 2);
+    assert!(!app.input_mode);
+
+    let devices_column = tab_column_for_index(tabs_area, &super::tab_titles(app.language), 1);
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: devices_column,
+            row: tabs_area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 1);
+}
+
+#[test]
+fn devices_search_refocus_preserves_previous_query() {
+    let mut app = devices_tab_test_app(vec![
+        test_device("dev-kitchen", "kitchen plug", "Kitchen", "A(1001)"),
+        test_device("dev-bed", "bedroom lamp", "Bedroom", "A(1001)"),
+    ]);
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['b', 'e', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app.input_mode);
+    assert_eq!(app.input, "bed");
+    assert_eq!(app.device_search_cursor, 3);
+
+    for ch in ['k', 'i', 't'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: content_area.x.saturating_add(2),
+            row: content_area.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(app.input_mode);
+    assert_eq!(app.input, "bedkit");
+}
+
+#[test]
+fn devices_search_focused_click_moves_cursor_to_character() {
+    let mut app = devices_tab_test_app(Vec::new());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['a', 'b', 'c', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: content_area
+                .x
+                .saturating_add("/ Search: ".width() as u16)
+                .saturating_add(2),
+            row: content_area.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert_eq!(app.input, "abXcd");
+}
+
+#[test]
+fn clicking_device_search_field_focuses_search() {
+    let mut app = devices_tab_test_app(vec![
+        test_device("dev-kitchen", "kitchen plug", "Kitchen", "A(1001)"),
+        test_device("dev-bed", "bedroom lamp", "Bedroom", "A(1001)"),
+    ]);
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: content_area.x.saturating_add(2),
+            row: content_area.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    for ch in ['b', 'e', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("bedroom lamp"), "{text}");
+    assert!(!text.contains("kitchen plug"), "{text}");
+}
+
+#[test]
+fn devices_search_with_no_matches_does_not_open_hidden_device() {
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['z', 'z', 'z'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert!(app.prop_dialog.is_none());
+}
+
+#[test]
+fn devices_search_clicking_away_blurs_and_restores_shortcuts() {
+    let mut app = devices_tab_test_app(vec![
+        test_device("dev-kitchen", "kitchen plug", "Kitchen", "A(1001)"),
+        test_device("dev-bed", "bedroom lamp", "Bedroom", "A(1001)"),
+    ]);
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app.input_mode);
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: content_area.x.saturating_add(2),
+            row: content_area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(!app.input_mode);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 2);
+}
+
+#[test]
+fn devices_search_clicking_status_gap_blurs() {
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, _content_area, status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app.input_mode);
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: status_gap_area.x,
+            row: status_gap_area.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(!app.input_mode);
+}
+
+#[test]
+fn devices_search_focus_footer_shows_enter_escape_and_match_count() {
+    let mut app = devices_tab_test_app(vec![
+        test_device("dev-kitchen", "kitchen plug", "Kitchen", "A(1001)"),
+        test_device("dev-bed", "bedroom lamp", "Bedroom", "A(1001)"),
+    ]);
+    app.language = Language::English;
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['b', 'e', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        super::footer_text(&app),
+        "Esc: Back, Enter: View Device, Matched devices: 1 Current Device: dev-bed"
+    );
+}
+
+#[test]
+fn devices_search_left_and_right_move_text_cursor() {
+    let mut app = devices_tab_test_app(Vec::new());
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for key in [
+        KeyCode::Char('a'),
+        KeyCode::Char('c'),
+        KeyCode::Left,
+        KeyCode::Char('b'),
+        KeyCode::Right,
+        KeyCode::Char('d'),
+    ] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(key, KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(app.input, "abcd");
+}
+
+#[test]
+fn devices_search_up_and_down_navigate_matching_items() {
+    let mut app = devices_tab_test_app(vec![
+        test_device("dev-kitchen", "kitchen plug", "Kitchen", "A(1001)"),
+        test_device("dev-bed", "bedroom lamp", "Bedroom", "A(1001)"),
+        test_device("dev-desk", "desk lamp", "Office", "A(1001)"),
+    ]);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['l', 'a', 'm', 'p'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    assert_eq!(app.devices[app.device_index].did, "dev-bed");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.devices[app.device_index].did, "dev-desk");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.devices[app.device_index].did, "dev-bed");
+}
+
+#[test]
+fn devices_search_bar_renders_plain_with_bottom_border_under_it() {
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    let lines = text.lines().collect::<Vec<_>>();
+    let search_row = content_area.y as usize;
+    let border_row = content_area.y.saturating_add(1) as usize;
+    let header_row = content_area.y.saturating_add(2) as usize;
+    assert!(lines[search_row].contains("/ Search:"), "{text}");
+    assert!(!lines[search_row].starts_with("│"), "{text}");
+    assert!(lines[border_row].contains("─"), "{text}");
+    assert!(!lines[border_row].contains("Search"), "{text}");
+    assert!(lines[header_row].contains("Room"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with("┌") && line.contains("─") && line.contains("Search")),
+        "{text}"
+    );
+}
+
+#[test]
+fn devices_search_matches_room_name_device_name_and_category_only() {
+    let home = make_temp_dir("tui-device-search-fields");
+    let cached_device_dir = home.join(".mit").join("accounts").join("1001");
+    fs::create_dir_all(&cached_device_dir).unwrap();
+    fs::write(
+        cached_device_dir.join("devices.json"),
+        serde_json::to_string_pretty(&json!({
+            "categories": {
+                "xiaomi.wifispeaker.lx04": "Smart Category"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    for query in ["Kitchen", "kitchen plug", "Smart Category"] {
+        let mut app = devices_tab_test_app(vec![test_device(
+            "hidden-did",
+            "kitchen plug",
+            "Kitchen",
+            "A(1001)",
+        )]);
+        app.home_dir = home.clone();
+        app.language = Language::English;
+        app.input = query.to_string();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("kitchen plug"), "query={query} text={text}");
+    }
+
+    let mut app = devices_tab_test_app(vec![test_device(
+        "hidden-did",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+    app.home_dir = home.clone();
+    app.language = Language::English;
+    app.input = "hidden-did".to_string();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(!text.contains("kitchen plug"), "{text}");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn accounts_tab_slash_focuses_search_and_filters_visible_rows() {
+    let mut app = accounts_tab_test_app(vec![
+        test_account_with("1001", "Kitchen Account", "cn"),
+        test_account_with("2002", "Bedroom Account", "sg"),
+    ]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['b', 'e', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("Bedroom Account"), "{text}");
+    assert!(!text.contains("Kitchen Account"), "{text}");
+    assert_eq!(app.accounts.len(), 2);
+}
+
+#[test]
+fn accounts_search_matches_region_nickname_and_uid() {
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    for query in ["sg", "Bedroom Account", "2002"] {
+        let mut app = accounts_tab_test_app(vec![
+            test_account_with("1001", "Kitchen Account", "cn"),
+            test_account_with("2002", "Bedroom Account", "sg"),
+        ]);
+        app.language = Language::English;
+        app.input = query.to_string();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(
+            text.contains("Bedroom Account"),
+            "query={query} text={text}"
+        );
+        assert!(
+            !text.contains("Kitchen Account"),
+            "query={query} text={text}"
+        );
+    }
+}
+
+#[test]
+fn logs_tab_slash_focuses_search_and_filters_visible_rows() {
+    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['s', 'y', 'n', 'c'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("beta sync done"), "{text}");
+    assert!(!text.contains("alpha boot complete"), "{text}");
+}
+
+#[test]
+fn log_buffer_keeps_latest_1000_entries_fifo() {
+    let mut app = logs_tab_test_app(Vec::new());
+
+    for idx in 0..1005 {
+        app.log(format!("log-{idx:04}"));
+    }
+
+    assert_eq!(app.logs.len(), 1000);
+    assert_eq!(
+        app.logs.front().map(|line| super::log_entry_message(line)),
+        Some("log-0005")
+    );
+    assert_eq!(
+        app.logs.back().map(|line| super::log_entry_message(line)),
+        Some("log-1004")
+    );
+}
+
+#[test]
+fn logs_tab_renders_timestamp_before_each_log_line() {
+    let mut app = logs_tab_test_app(vec!["mqtt connected"]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    let line = text
+        .lines()
+        .find(|line| line.contains("mqtt connected"))
+        .unwrap_or_else(|| panic!("{text}"));
+    let prefix = line
+        .split("mqtt connected")
+        .next()
+        .unwrap_or_default()
+        .trim_start();
+    assert_clock_timestamp_prefix(prefix, &text);
+}
+
+#[test]
+fn logs_tab_mouse_wheel_scrolls_to_older_entries() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = terminal_text(&terminal);
+    assert!(before.contains("log-29"), "{before}");
+    assert!(!before.contains("log-00"), "{before}");
+
+    for _ in 0..20 {
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = terminal_text(&terminal);
+    assert!(after.contains("log-00"), "{after}");
+    assert!(!after.contains("log-29"), "{after}");
+}
+
+#[test]
+fn logs_tab_new_log_does_not_shift_scrolled_view_window() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    app.log_scroll_offset = 5;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-24"),
+        "{before}"
+    );
+
+    app.log(format!("inserted {}", "x".repeat(160)));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-24"),
+        "{after}"
+    );
+    assert!(
+        !top_log_line(&terminal, terminal_area).contains("inserted"),
+        "{after}"
+    );
+}
+
+#[test]
+fn logs_tab_new_log_does_not_shift_selected_view_window() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    super::clear_selection_state();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-29"),
+        "{before}"
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: log_message_start_column(),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: log_message_start_column().saturating_add(6),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    app.log("new selected-anchor log");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-29"),
+        "{after}"
+    );
+    assert!(
+        !top_log_line(&terminal, terminal_area).contains("new selected-anchor log"),
+        "{after}"
+    );
+
+    super::clear_selection_state();
+}
+
+#[test]
+fn logs_tab_overflow_renders_scrollbar_thumb_that_moves() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = log_scrollbar_thumb_row(&terminal, terminal_area)
+        .unwrap_or_else(|| panic!("{}", terminal_text(&terminal)));
+
+    for _ in 0..20 {
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            terminal_area,
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = log_scrollbar_thumb_row(&terminal, terminal_area)
+        .unwrap_or_else(|| panic!("{}", terminal_text(&terminal)));
+    assert!(after > before, "before={before} after={after}");
+}
+
+#[test]
+fn logs_tab_leaves_blank_margin_before_scrollbar() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02} {}", "x".repeat(90)))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+    let [_search_area, _search_border_area, list_area] =
+        super::searchable_main_layout(content_area);
+    let margin_x = list_area
+        .x
+        .saturating_add(list_area.width.saturating_sub(2));
+    let scrollbar_x = list_area
+        .x
+        .saturating_add(list_area.width.saturating_sub(1));
+    let first_log_row = list_area.y;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(margin_x, first_log_row)].symbol(), " ");
+    assert_eq!(
+        buffer[(scrollbar_x, first_log_row)].symbol(),
+        super::LOG_SCROLLBAR_THUMB
+    );
+}
+
+#[test]
+fn log_scrollbar_thumb_height_stays_constant_across_positions() {
+    let logs = (0..20)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let heights = (0..=4)
+        .map(|offset| {
+            app.log_scroll_offset = offset;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            log_scrollbar_thumb_height(&terminal, terminal_area)
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        heights.iter().all(|height| *height > 0)
+            && heights.windows(2).all(|pair| pair[0] == pair[1]),
+        "{heights:?}"
+    );
+}
+
+#[test]
+fn dragging_log_scrollbar_scrolls_to_pointer_position() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let Some((scrollbar_x, thumb_row, bottom_row)) =
+        log_scrollbar_drag_points(&terminal, terminal_area)
+    else {
+        panic!("{}", terminal_text(&terminal));
+    };
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: scrollbar_x,
+            row: thumb_row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: scrollbar_x,
+            row: bottom_row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("log-00"), "{text}");
+    assert!(!text.contains("log-29"), "{text}");
+}
+
+#[test]
+fn releasing_log_scrollbar_updates_to_release_position() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let Some((scrollbar_x, thumb_row, bottom_row)) =
+        log_scrollbar_drag_points(&terminal, terminal_area)
+    else {
+        panic!("{}", terminal_text(&terminal));
+    };
+    let middle_row = thumb_row.saturating_add((bottom_row.saturating_sub(thumb_row)) / 2);
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: scrollbar_x,
+            row: thumb_row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: scrollbar_x,
+            row: middle_row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: scrollbar_x,
+            row: bottom_row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("log-00"), "{text}");
+}
+
+#[test]
+fn long_log_line_wraps_in_log_viewer() {
+    let mut app = logs_tab_test_app(vec!["abcdefghijklmnopqrstuvwxyz"]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(24, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    let first_line = text
+        .lines()
+        .find(|line| line.contains("abcdefghijklm"))
+        .unwrap_or_else(|| panic!("{text}"));
+    let prefix = first_line
+        .split("abcdefghijklm")
+        .next()
+        .unwrap_or_default()
+        .trim_start();
+    assert_clock_timestamp_prefix(prefix, &text);
+    assert!(text.contains("nopqrstuvwxyz"), "{text}");
+}
+
+#[test]
+fn logs_tab_search_highlights_matching_text() {
+    let mut app = logs_tab_test_app(vec!["mqtt connected"]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['m', 'q', 't', 't'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(terminal_has_yellow_background_substring(&terminal, "mqtt"));
+}
+
+#[test]
+fn account_and_logs_search_bars_render_with_bottom_border() {
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    for mut app in [
+        accounts_tab_test_app(vec![test_account_with("1001", "Kitchen Account", "cn")]),
+        logs_tab_test_app(vec!["visible log line"]),
+    ] {
+        app.language = Language::English;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let text = terminal_text(&terminal);
+        let lines = text.lines().collect::<Vec<_>>();
+        let search_row = content_area.y as usize;
+        let border_row = content_area.y.saturating_add(1) as usize;
+        assert!(lines[search_row].contains("/ Search:"), "{text}");
+        assert!(!lines[search_row].starts_with("│"), "{text}");
+        assert!(lines[border_row].contains("─"), "{text}");
+        assert!(!lines[border_row].contains("Search"), "{text}");
+    }
+}
+
+#[test]
+fn search_query_ellipsizes_at_beginning_without_wrapping() {
+    let mut app = accounts_tab_test_app(vec![test_account_with("1001", "Kitchen Account", "cn")]);
+    app.language = Language::English;
+    app.input_mode = true;
+    app.input = "abcdefghijklmnopqrstuvwxyz0123456789".to_string();
+    app.device_search_cursor = app.input.chars().count();
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 32, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+    let mut terminal = Terminal::new(TestBackend::new(32, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    let lines = text.lines().collect::<Vec<_>>();
+    let search_row = content_area.y as usize;
+    let border_row = content_area.y.saturating_add(1) as usize;
+    let header_row = content_area.y.saturating_add(2) as usize;
+    assert!(
+        lines[search_row].contains("/ Search: ...rstuvwxyz0123456789"),
+        "{text}"
+    );
+    assert!(!lines[search_row].contains("abcdef"), "{text}");
+    assert!(lines[border_row].contains("─"), "{text}");
+    assert!(lines[header_row].contains("Region"), "{text}");
+}
+
+#[test]
+fn search_textarea_text_is_selectable() {
+    let mut app = accounts_tab_test_app(vec![test_account_with("1001", "Kitchen Account", "cn")]);
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['n', 'e', 'e', 'd', 'l', 'e'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    let _guard = env_guard();
+    let clip_file = make_temp_dir("tui-search-select-copy").join("clipboard.txt");
+    std::env::set_var("MIT_TEST_CLIPBOARD_FILE", &clip_file);
+    super::clear_selection_state();
+
+    let start_column = content_area.x;
+    let end_column = content_area
+        .x
+        .saturating_add("/ Search: needle".width() as u16);
+    for (kind, column) in [
+        (
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            start_column,
+        ),
+        (
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            end_column,
+        ),
+        (
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            end_column,
+        ),
+    ] {
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row: content_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            terminal_area,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(fs::read_to_string(&clip_file).unwrap(), "/ Search: needle");
+    assert_eq!(
+        super::selected_surface()
+            .expect("search selection should persist")
+            .snapshot
+            .surface,
+        super::SelectionSurface::SearchInput
+    );
+
+    std::env::remove_var("MIT_TEST_CLIPBOARD_FILE");
+    let _ = fs::remove_file(&clip_file);
+}
+
+#[test]
+fn search_tab_switch_blurs_and_click_away_restores_shortcuts() {
+    let mut app = accounts_tab_test_app(vec![
+        test_account_with("1001", "Kitchen Account", "cn"),
+        test_account_with("2002", "Bedroom Account", "sg"),
+    ]);
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app.input_mode);
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: content_area.x,
+            row: content_area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(!app.input_mode);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['b', 'e', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    let logs_column = tab_column_for_index(tabs_area, &super::tab_titles(app.language), 2);
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: logs_column,
+            row: tabs_area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    assert_eq!(app.active_tab, 2);
+    assert!(!app.input_mode);
+    assert_eq!(app.input, "");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 0);
+    assert!(!app.input_mode);
+    assert_eq!(app.input, "bed");
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("Bedroom Account"), "{text}");
+    assert!(!text.contains("Kitchen Account"), "{text}");
+}
+
+#[test]
+fn search_queries_are_persisted_per_tab_when_switching_tabs() {
+    let mut app = accounts_tab_test_app(vec![
+        test_account_with("1001", "CN Account", "cn"),
+        test_account_with("2002", "SG Account", "sg"),
+    ]);
+    app.language = Language::English;
+    app.devices = vec![
+        test_device("dev-fan", "fans", "Living", "A(1001)"),
+        test_device("dev-lamp", "lamp", "Bedroom", "A(1001)"),
+    ];
+    app.logs = VecDeque::from([
+        "mqtt connected".to_string(),
+        "bootstrap complete".to_string(),
+    ]);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['C', 'N'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 1);
+    assert_eq!(app.input, "");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['f', 'a', 'n', 's'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 2);
+    assert_eq!(app.input, "");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['m', 'q', 't', 't'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 0);
+    assert_eq!(app.input, "CN");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("CN Account"), "{text}");
+    assert!(!text.contains("SG Account"), "{text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 1);
+    assert_eq!(app.input, "fans");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("fans"), "{text}");
+    assert!(!text.contains("lamp"), "{text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(app.active_tab, 2);
+    assert_eq!(app.input, "mqtt");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("mqtt connected"), "{text}");
+    assert!(!text.contains("bootstrap complete"), "{text}");
 }
 
 #[test]
@@ -927,8 +2252,12 @@ fn draw_accounts_scrolls_to_keep_active_row_visible() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -952,6 +2281,7 @@ fn draw_accounts_scrolls_to_keep_active_row_visible() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
@@ -990,8 +2320,12 @@ fn draw_devices_scrolls_to_keep_active_row_visible() {
         device_index: 10,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1015,6 +2349,7 @@ fn draw_devices_scrolls_to_keep_active_row_visible() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
@@ -1053,8 +2388,12 @@ fn device_viewport_keeps_window_anchor_when_moving_up_from_bottom_item() {
         device_index: 7,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1078,12 +2417,13 @@ fn device_viewport_keeps_window_anchor_when_moving_up_from_bottom_item() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 7)).unwrap();
 
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    assert_eq!(app.device_list_state.offset(), 2);
+    assert_eq!(app.device_list_state.offset(), 4);
 
     let quit = handle_key(
         &mut app,
@@ -1096,16 +2436,16 @@ fn device_viewport_keeps_window_anchor_when_moving_up_from_bottom_item() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
     let text = terminal_text(&terminal);
-    assert!(text.contains("acc2"), "{text}");
-    assert!(text.contains("acc3"), "{text}");
     assert!(text.contains("acc4"), "{text}");
     assert!(text.contains("acc5"), "{text}");
     assert!(text.contains("acc6"), "{text}");
     assert!(text.contains("acc7"), "{text}");
     assert!(!text.contains("acc0"), "{text}");
     assert!(!text.contains("acc1"), "{text}");
+    assert!(!text.contains("acc2"), "{text}");
+    assert!(!text.contains("acc3"), "{text}");
     assert!(!text.contains("account="), "{text}");
-    assert_eq!(app.device_list_state.offset(), 2);
+    assert_eq!(app.device_list_state.offset(), 4);
 }
 
 #[test]
@@ -1133,8 +2473,12 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1158,6 +2502,7 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1204,8 +2549,12 @@ fn account_action_menu_mouse_wheel_changes_selected_item() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
@@ -1229,6 +2578,7 @@ fn account_action_menu_mouse_wheel_changes_selected_item() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let area = ratatui::layout::Rect::new(0, 0, 80, 24);
@@ -1292,8 +2642,12 @@ fn clicking_selected_account_action_executes_it() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
@@ -1317,6 +2671,7 @@ fn clicking_selected_account_action_executes_it() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let area = ratatui::layout::Rect::new(0, 0, 80, 24);
@@ -1365,8 +2720,12 @@ fn push_message_action_opens_input_dialog() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
@@ -1390,6 +2749,7 @@ fn push_message_action_opens_input_dialog() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1424,8 +2784,12 @@ fn push_message_dialog_shows_cursor_and_moves_with_left_right() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::PushMessage {
             uid: "1001".to_string(),
@@ -1454,6 +2818,7 @@ fn push_message_dialog_shows_cursor_and_moves_with_left_right() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1504,8 +2869,12 @@ fn push_message_cursor_row_stays_stable_when_typing_first_char() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::PushMessage {
             uid: "1001".to_string(),
@@ -1534,6 +2903,7 @@ fn push_message_cursor_row_stays_stable_when_typing_first_char() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1577,8 +2947,12 @@ fn push_message_dialog_submits_text_for_selected_account_uid() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::PushMessage {
             uid: "1001".to_string(),
@@ -1607,6 +2981,7 @@ fn push_message_dialog_submits_text_for_selected_account_uid() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1657,8 +3032,12 @@ fn escaping_push_message_dialog_restores_previous_menu_selection() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
@@ -1682,6 +3061,7 @@ fn escaping_push_message_dialog_restores_previous_menu_selection() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1733,8 +3113,12 @@ fn add_account_port_conflict_shows_error_dialog_without_quitting_tui() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1758,6 +3142,7 @@ fn add_account_port_conflict_shows_error_dialog_without_quitting_tui() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1790,8 +3175,12 @@ fn draw_does_not_render_command_bar() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1815,6 +3204,7 @@ fn draw_does_not_render_command_bar() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -1978,8 +3368,12 @@ fn draw_devices_tab_uses_local_cache_when_device_list_is_empty() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2003,6 +3397,7 @@ fn draw_devices_tab_uses_local_cache_when_device_list_is_empty() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -2148,6 +3543,66 @@ fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
     text
 }
 
+fn test_device(did: &str, name: &str, room: &str, account_label: &str) -> Device {
+    Device {
+        did: did.to_string(),
+        name: name.to_string(),
+        model: "xiaomi.wifispeaker.lx04".to_string(),
+        online: true,
+        home_id: "cache-account:1001".to_string(),
+        home_name: account_label.to_string(),
+        room_id: format!("room-{room}"),
+        room_name: room.to_string(),
+    }
+}
+
+fn devices_tab_test_app(devices: Vec<Device>) -> TuiApp {
+    let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
+    let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
+    let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
+    TuiApp {
+        home_dir: PathBuf::from("."),
+        auth_state: default_auth(),
+        accounts: vec![test_account()],
+        account_index: 0,
+        devices,
+        device_index: 0,
+        logs: VecDeque::new(),
+        active_tab: 1,
+        log_scroll_offset: 0,
+        input_mode: false,
+        input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
+        prop_dialog: None,
+        account_action_dialog: None,
+        account_list_state: ListState::default(),
+        device_list_state: ListState::default(),
+        last_bool_refresh: Instant::now(),
+        local_transport_fetching: false,
+        local_transport_refresh_generation: 0,
+        local_transport_refresh_device_id: None,
+        local_transport_force_refresh_pending: false,
+        local_transport_tx,
+        local_transport_rx,
+        auth_flow_generation: 0,
+        auth_flow_tx,
+        auth_flow_rx,
+        offline_account_uids: HashSet::new(),
+        boot_state: BootState::Ready,
+        boot_spinner_index: 0,
+        bootstrap_generation: 0,
+        bootstrap_pending: None,
+        bootstrap_tx,
+        bootstrap_rx,
+        property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        auto_subscribe_device_status: true,
+        settings_selected: 0,
+    }
+}
+
 fn app_with_single_readonly_prop_dialog() -> TuiApp {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -2161,8 +3616,12 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -2219,6 +3678,7 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     }
 }
@@ -2269,6 +3729,124 @@ fn terminal_has_green_substring(terminal: &Terminal<TestBackend>, needle: &str) 
         }
     }
     false
+}
+
+fn terminal_has_yellow_background_substring(
+    terminal: &Terminal<TestBackend>,
+    needle: &str,
+) -> bool {
+    let buffer = terminal.backend().buffer();
+    let symbols = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            if x as usize + symbols.len() > buffer.area.width as usize {
+                break;
+            }
+            let mut matches = true;
+            for (offset, symbol) in symbols.iter().enumerate() {
+                let cell = &buffer[(x + offset as u16, y)];
+                if cell.symbol() != symbol || cell.bg != Color::Yellow {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn assert_clock_timestamp_prefix(prefix: &str, text: &str) {
+    let bytes = prefix.as_bytes();
+    assert_eq!(bytes.len(), "[00:00:00] ".len(), "{text}");
+    assert_eq!(bytes[0], b'[', "{text}");
+    assert_eq!(bytes[3], b':', "{text}");
+    assert_eq!(bytes[6], b':', "{text}");
+    assert_eq!(bytes[9], b']', "{text}");
+    assert_eq!(bytes[10], b' ', "{text}");
+    for index in [1usize, 2, 4, 5, 7, 8] {
+        assert!(bytes[index].is_ascii_digit(), "{text}");
+    }
+}
+
+fn assert_timestamped_log_lines(copied: &str, messages: &[&str]) {
+    let lines = copied.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), messages.len(), "{copied}");
+    for (line, message) in lines.iter().zip(messages) {
+        let Some(prefix) = line.strip_suffix(message) else {
+            panic!("{copied}");
+        };
+        assert_clock_timestamp_prefix(prefix, copied);
+    }
+}
+
+fn log_message_start_column() -> u16 {
+    super::display_width("[00:00:00] ")
+}
+
+fn log_first_row(terminal_area: ratatui::layout::Rect) -> u16 {
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+    let [_search_area, _search_border_area, list_area] =
+        super::searchable_main_layout(content_area);
+    list_area.y
+}
+
+fn top_log_line(terminal: &Terminal<TestBackend>, terminal_area: ratatui::layout::Rect) -> String {
+    terminal_text(terminal)
+        .lines()
+        .nth(log_first_row(terminal_area) as usize)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn log_scrollbar_thumb_row(
+    terminal: &Terminal<TestBackend>,
+    terminal_area: ratatui::layout::Rect,
+) -> Option<u16> {
+    log_scrollbar_drag_points(terminal, terminal_area).map(|(_, thumb_row, _)| thumb_row)
+}
+
+fn log_scrollbar_thumb_height(
+    terminal: &Terminal<TestBackend>,
+    terminal_area: ratatui::layout::Rect,
+) -> usize {
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+    let [_search_area, _search_border_area, list_area] =
+        super::searchable_main_layout(content_area);
+    let x = list_area
+        .x
+        .saturating_add(list_area.width.saturating_sub(1));
+    let buffer = terminal.backend().buffer();
+    (list_area.y..list_area.y.saturating_add(list_area.height))
+        .filter(|row| buffer[(x, *row)].symbol() == super::LOG_SCROLLBAR_THUMB)
+        .count()
+}
+
+fn log_scrollbar_drag_points(
+    terminal: &Terminal<TestBackend>,
+    terminal_area: ratatui::layout::Rect,
+) -> Option<(u16, u16, u16)> {
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+    let [_search_area, _search_border_area, list_area] =
+        super::searchable_main_layout(content_area);
+    let x = list_area
+        .x
+        .saturating_add(list_area.width.saturating_sub(1));
+    let buffer = terminal.backend().buffer();
+    let thumb_row = (list_area.y..list_area.y.saturating_add(list_area.height))
+        .find(|row| buffer[(x, *row)].symbol() == super::LOG_SCROLLBAR_THUMB)?;
+    Some((
+        x,
+        thumb_row,
+        list_area
+            .y
+            .saturating_add(list_area.height.saturating_sub(1)),
+    ))
 }
 
 fn terminal_find_substring_position(
@@ -2332,6 +3910,119 @@ fn test_account() -> crate::storage::AuthAccount {
     }))
 }
 
+fn test_account_with(uid: &str, nickname: &str, region: &str) -> crate::storage::AuthAccount {
+    normalize_account(json!({
+        "region": region,
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": format!("uuid-{uid}"),
+        "deviceId": format!("device-{uid}"),
+        "state": format!("state-{uid}"),
+        "accessToken": format!("token-{uid}"),
+        "refreshToken": format!("refresh-{uid}"),
+        "expiresTs": 32503680000_u64,
+        "user": {
+            "uid": uid,
+            "nickname": nickname,
+            "icon": "",
+            "unionId": format!("union-{uid}")
+        }
+    }))
+}
+
+fn accounts_tab_test_app(accounts: Vec<crate::storage::AuthAccount>) -> TuiApp {
+    let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
+    let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
+    let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
+    TuiApp {
+        home_dir: PathBuf::from("."),
+        auth_state: default_auth(),
+        accounts,
+        account_index: 0,
+        devices: Vec::new(),
+        device_index: 0,
+        logs: VecDeque::new(),
+        active_tab: 0,
+        log_scroll_offset: 0,
+        input_mode: false,
+        input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
+        prop_dialog: None,
+        account_action_dialog: None,
+        account_list_state: ListState::default(),
+        device_list_state: ListState::default(),
+        last_bool_refresh: Instant::now(),
+        local_transport_fetching: false,
+        local_transport_refresh_generation: 0,
+        local_transport_refresh_device_id: None,
+        local_transport_force_refresh_pending: false,
+        local_transport_tx,
+        local_transport_rx,
+        auth_flow_generation: 0,
+        auth_flow_tx,
+        auth_flow_rx,
+        offline_account_uids: HashSet::new(),
+        boot_state: BootState::Ready,
+        boot_spinner_index: 0,
+        bootstrap_generation: 0,
+        bootstrap_pending: None,
+        bootstrap_tx,
+        bootstrap_rx,
+        property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        auto_subscribe_device_status: true,
+        settings_selected: 0,
+    }
+}
+
+fn logs_tab_test_app(logs: Vec<&str>) -> TuiApp {
+    let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
+    let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
+    let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
+    TuiApp {
+        home_dir: PathBuf::from("."),
+        auth_state: default_auth(),
+        accounts: vec![test_account()],
+        account_index: 0,
+        devices: Vec::new(),
+        device_index: 0,
+        logs: logs.into_iter().map(ToString::to_string).collect(),
+        active_tab: 2,
+        log_scroll_offset: 0,
+        input_mode: false,
+        input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
+        prop_dialog: None,
+        account_action_dialog: None,
+        account_list_state: ListState::default(),
+        device_list_state: ListState::default(),
+        last_bool_refresh: Instant::now(),
+        local_transport_fetching: false,
+        local_transport_refresh_generation: 0,
+        local_transport_refresh_device_id: None,
+        local_transport_force_refresh_pending: false,
+        local_transport_tx,
+        local_transport_rx,
+        auth_flow_generation: 0,
+        auth_flow_tx,
+        auth_flow_rx,
+        offline_account_uids: HashSet::new(),
+        boot_state: BootState::Ready,
+        boot_spinner_index: 0,
+        bootstrap_generation: 0,
+        bootstrap_pending: None,
+        bootstrap_tx,
+        bootstrap_rx,
+        property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        auto_subscribe_device_status: true,
+        settings_selected: 0,
+    }
+}
+
 fn test_app_with_prop_dialog(dialog: BoolDialog) -> TuiApp {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -2345,8 +4036,12 @@ fn test_app_with_prop_dialog(dialog: BoolDialog) -> TuiApp {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(dialog),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2370,6 +4065,7 @@ fn test_app_with_prop_dialog(dialog: BoolDialog) -> TuiApp {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     }
 }
@@ -2423,8 +4119,12 @@ fn draw_shows_loading_splash_while_boot_loading() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2448,6 +4148,7 @@ fn draw_shows_loading_splash_while_boot_loading() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2473,8 +4174,12 @@ fn handle_key_blocks_normal_actions_until_boot_ready() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2498,6 +4203,7 @@ fn handle_key_blocks_normal_actions_until_boot_ready() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -2576,8 +4282,12 @@ fn opening_prop_dialog_failure_shows_offline_instead_of_quitting() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2601,6 +4311,7 @@ fn opening_prop_dialog_failure_shows_offline_instead_of_quitting() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -2690,8 +4401,12 @@ fn opening_prop_dialog_uses_device_account_instead_of_selected_account() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2715,6 +4430,7 @@ fn opening_prop_dialog_uses_device_account_instead_of_selected_account() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -2772,8 +4488,12 @@ fn pressing_j_does_not_move_selection_anymore() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2797,6 +4517,7 @@ fn pressing_j_does_not_move_selection_anymore() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -2867,8 +4588,12 @@ fn devices_tab_enter_opens_prop_dialog_and_p_does_not() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2892,6 +4617,7 @@ fn devices_tab_enter_opens_prop_dialog_and_p_does_not() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -2975,8 +4701,12 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3000,6 +4730,7 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3095,8 +4826,12 @@ fn clicking_devices_row_only_changes_active_index() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3120,16 +4855,18 @@ fn clicking_devices_row_only_changes_active_index() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
-    // Device tab has a 1-line header. Clicking the header row should not select a device.
+    // Device tab has a search row, an empty spacer row, and a 1-line header. Clicking the
+    // header row should not select a device.
     handle_mouse(
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 2,
-            row: 3,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -3138,13 +4875,13 @@ fn clicking_devices_row_only_changes_active_index() {
     assert_eq!(app.device_index, 0);
     assert!(app.prop_dialog.is_none());
 
-    // Click second device row (first data row starts at y=4 for default 80x24 layout).
+    // Click second device row (first data row starts at y=6 for default 80x24 layout).
     handle_mouse(
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 2,
-            row: 5,
+            row: 7,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -3227,8 +4964,12 @@ fn clicking_selected_device_row_opens_dialog() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3252,6 +4993,7 @@ fn clicking_selected_device_row_opens_dialog() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3260,7 +5002,7 @@ fn clicking_selected_device_row_opens_dialog() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 2,
-            row: 5,
+            row: 7,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -3274,7 +5016,7 @@ fn clicking_selected_device_row_opens_dialog() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 2,
-            row: 5,
+            row: 7,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -3356,8 +5098,12 @@ fn device_row_mouse_up_does_not_open_dialog() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3381,6 +5127,7 @@ fn device_row_mouse_up_does_not_open_dialog() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3389,7 +5136,7 @@ fn device_row_mouse_up_does_not_open_dialog() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 2,
-            row: 5,
+            row: 7,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -3403,7 +5150,7 @@ fn device_row_mouse_up_does_not_open_dialog() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             column: 2,
-            row: 5,
+            row: 7,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -3451,8 +5198,12 @@ fn clicking_accounts_row_selects_account() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3476,6 +5227,7 @@ fn clicking_accounts_row_selects_account() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     handle_mouse(
@@ -3483,7 +5235,7 @@ fn clicking_accounts_row_selects_account() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 2,
-            row: 5,
+            row: 7,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -3530,8 +5282,12 @@ fn mouse_wheel_scroll_changes_active_item() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3555,6 +5311,7 @@ fn mouse_wheel_scroll_changes_active_item() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3609,8 +5366,12 @@ fn mouse_click_is_ignored_while_prop_editing() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -3680,6 +5441,7 @@ fn mouse_click_is_ignored_while_prop_editing() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3712,8 +5474,12 @@ fn number_shortcuts_switch_tabs() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3737,6 +5503,7 @@ fn number_shortcuts_switch_tabs() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3794,8 +5561,12 @@ fn devices_tab_r_starts_background_sync() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3819,6 +5590,7 @@ fn devices_tab_r_starts_background_sync() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3856,8 +5628,12 @@ fn devices_tab_s_no_longer_starts_background_sync() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3881,6 +5657,7 @@ fn devices_tab_s_no_longer_starts_background_sync() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -3907,8 +5684,12 @@ fn clicking_top_bar_tabs_switches_active_tab() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -3932,6 +5713,7 @@ fn clicking_top_bar_tabs_switches_active_tab() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -4019,8 +5801,12 @@ fn settings_tab_enter_purges_devices_cache_after_single_confirm() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 3,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4044,7 +5830,8 @@ fn settings_tab_enter_purges_devices_cache_after_single_confirm() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
-        settings_selected: 1,
+        auto_subscribe_device_status: true,
+        settings_selected: 2,
     };
     app.property_cache.set_device_properties(
         "dev-1".to_string(),
@@ -4114,8 +5901,12 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 3,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4139,7 +5930,8 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
-        settings_selected: 2,
+        auto_subscribe_device_status: true,
+        settings_selected: 3,
     };
 
     let quit = handle_key(
@@ -4171,7 +5963,7 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
 }
 
 #[test]
-fn settings_tab_shows_only_cache_clear_and_reset_actions() {
+fn settings_tab_shows_auto_subscribe_cache_clear_and_reset_actions() {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
     let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
@@ -4184,8 +5976,12 @@ fn settings_tab_shows_only_cache_clear_and_reset_actions() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 3,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4209,6 +6005,7 @@ fn settings_tab_shows_only_cache_clear_and_reset_actions() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -4216,10 +6013,47 @@ fn settings_tab_shows_only_cache_clear_and_reset_actions() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let text = terminal_text(&terminal);
     let compact = text.replace(' ', "");
+    assert!(
+        compact.contains("自动订阅设备状态(关闭后始终需要手动刷新)：开启"),
+        "{text}"
+    );
     assert!(compact.contains("重置设备缓存"), "{text}");
     assert!(compact.contains("重置全部设置"), "{text}");
     assert!(!compact.contains("规格缓存时间"), "{text}");
     assert!(!compact.contains("语言偏好"), "{text}");
+}
+
+#[test]
+fn settings_tab_enter_toggles_auto_subscribe_and_persists() {
+    let _guard = env_guard();
+    let home = make_temp_dir("tui-settings-auto-subscribe");
+    std::env::set_var("MIT_HOME", &home);
+    std::env::set_var("MIT_PROFILE_DIR", &home);
+    let mut app = devices_tab_test_app(Vec::new());
+    app.home_dir = home.clone();
+    app.active_tab = 3;
+    app.settings_selected = 1;
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert!(app.account_action_dialog.is_none());
+    let settings_text = fs::read_to_string(home.join(".mit").join("settings.json")).unwrap();
+    assert!(settings_text.contains("\"autoSubscribeDeviceStatus\": false"));
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    let compact = text.replace(' ', "");
+    assert!(
+        compact.contains("自动订阅设备状态(关闭后始终需要手动刷新)：关闭"),
+        "{text}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -4256,8 +6090,12 @@ fn clicking_footer_does_not_copy_status_line() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4281,6 +6119,7 @@ fn clicking_footer_does_not_copy_status_line() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -4336,8 +6175,12 @@ fn mouse_selection_state_is_thread_local() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::PushMessage {
             uid: "1001".to_string(),
@@ -4366,6 +6209,7 @@ fn mouse_selection_state_is_thread_local() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     assert!(!super::selection_start(
@@ -4395,8 +6239,12 @@ fn mouse_selection_state_is_thread_local() {
             device_index: 0,
             logs: VecDeque::from([String::from("log line")]),
             active_tab: 2,
+            log_scroll_offset: 0,
             input_mode: false,
             input: String::new(),
+            device_search_cursor: 0,
+            search_inputs: Default::default(),
+            search_cursors: [0; 3],
             prop_dialog: None,
             account_action_dialog: None,
             account_list_state: ListState::default(),
@@ -4420,10 +6268,13 @@ fn mouse_selection_state_is_thread_local() {
             bootstrap_rx,
             property_cache: Arc::new(PropertyCache::new()),
             language: Language::Chinese,
+            auto_subscribe_device_status: true,
             settings_selected: 0,
         };
-        let [_tabs_area, list_area, _status_gap_area, _status_bar_area] =
+        let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
             super::split_main_layout(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let [_search_area, _search_border_area, list_area] =
+            super::searchable_main_layout(content_area);
         super::clear_selection_state();
         assert!(super::selection_start(
             &logs_app,
@@ -4469,8 +6320,12 @@ fn selected_push_message_textarea_text_uses_selection_background() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::PushMessage {
             uid: "1001".to_string(),
@@ -4499,6 +6354,7 @@ fn selected_push_message_textarea_text_uses_selection_background() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -4570,8 +6426,12 @@ fn footer_leaves_blank_rows_above_and_below_status_text() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4595,6 +6455,7 @@ fn footer_leaves_blank_rows_above_and_below_status_text() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -4623,8 +6484,12 @@ fn dragging_logs_text_autocopies_selection() {
         device_index: 0,
         logs: VecDeque::from(["alpha".to_string(), "beta".to_string()]),
         active_tab: 2,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4648,19 +6513,21 @@ fn dragging_logs_text_autocopies_selection() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
     let _guard = env_guard();
     let clip_file = make_temp_dir("tui-log-drag-copy").join("clipboard.txt");
     std::env::set_var("MIT_TEST_CLIPBOARD_FILE", &clip_file);
+    let message_column = log_message_start_column();
 
     handle_mouse(
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 0,
-            row: 3,
+            column: message_column,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4670,8 +6537,8 @@ fn dragging_logs_text_autocopies_selection() {
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: 5,
-            row: 3,
+            column: message_column + 5,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4681,8 +6548,8 @@ fn dragging_logs_text_autocopies_selection() {
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-            column: 5,
-            row: 3,
+            column: message_column + 5,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4694,6 +6561,105 @@ fn dragging_logs_text_autocopies_selection() {
 
     std::env::remove_var("MIT_TEST_CLIPBOARD_FILE");
     let _ = fs::remove_file(&clip_file);
+}
+
+#[test]
+fn log_selection_survives_scroll_when_visible_content_does_not_change() {
+    let mut app = logs_tab_test_app(vec!["alpha", "beta", "gamma"]);
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    super::clear_selection_state();
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: log_message_start_column(),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: log_message_start_column().saturating_add(5),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(super::selected_surface().is_some());
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 2,
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    assert!(super::selected_surface().is_some());
+}
+
+#[test]
+fn log_selection_clears_when_search_changes_visible_content() {
+    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    super::clear_selection_state();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: log_message_start_column(),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: log_message_start_column().saturating_add(4),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(super::selected_surface().is_some());
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in "sync".chars() {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+
+    assert!(text.contains("beta sync done"), "{text}");
+    assert!(!text.contains("alpha boot complete"), "{text}");
+    assert!(super::selected_surface().is_none());
 }
 
 #[test]
@@ -4710,8 +6676,12 @@ fn dragging_beyond_last_log_still_copies_all_logs() {
         device_index: 0,
         logs: VecDeque::from(["alpha".to_string(), "beta".to_string()]),
         active_tab: 2,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4735,6 +6705,7 @@ fn dragging_beyond_last_log_still_copies_all_logs() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -4747,7 +6718,7 @@ fn dragging_beyond_last_log_still_copies_all_logs() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 0,
-            row: 3,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4777,7 +6748,7 @@ fn dragging_beyond_last_log_still_copies_all_logs() {
     .unwrap();
 
     let copied = fs::read_to_string(&clip_file).unwrap();
-    assert_eq!(copied, "beta\nalpha");
+    assert_timestamped_log_lines(&copied, &["beta", "alpha"]);
 
     std::env::remove_var("MIT_TEST_CLIPBOARD_FILE");
     let _ = fs::remove_file(&clip_file);
@@ -4797,8 +6768,12 @@ fn shift_c_recopies_last_mouse_selection() {
         device_index: 0,
         logs: VecDeque::from(["gamma".to_string()]),
         active_tab: 2,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4822,19 +6797,21 @@ fn shift_c_recopies_last_mouse_selection() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
     let _guard = env_guard();
     let clip_file = make_temp_dir("tui-shift-c-copy").join("clipboard.txt");
     std::env::set_var("MIT_TEST_CLIPBOARD_FILE", &clip_file);
+    let message_column = log_message_start_column();
 
     handle_mouse(
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 0,
-            row: 3,
+            column: message_column,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4844,8 +6821,8 @@ fn shift_c_recopies_last_mouse_selection() {
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: 5,
-            row: 3,
+            column: message_column + 5,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4855,8 +6832,8 @@ fn shift_c_recopies_last_mouse_selection() {
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-            column: 5,
-            row: 3,
+            column: message_column + 5,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4890,8 +6867,12 @@ fn plain_click_outside_selected_text_clears_selection() {
         device_index: 0,
         logs: VecDeque::from(["gamma".to_string()]),
         active_tab: 2,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -4915,6 +6896,7 @@ fn plain_click_outside_selected_text_clears_selection() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -4927,7 +6909,7 @@ fn plain_click_outside_selected_text_clears_selection() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 0,
-            row: 3,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4938,7 +6920,7 @@ fn plain_click_outside_selected_text_clears_selection() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
             column: 5,
-            row: 3,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4949,7 +6931,7 @@ fn plain_click_outside_selected_text_clears_selection() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             column: 5,
-            row: 3,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -4996,8 +6978,12 @@ fn copy_status_badge_uses_chinese_text_and_expires_in_one_second() {
         device_index: 0,
         logs,
         active_tab: 2,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5021,6 +7007,7 @@ fn copy_status_badge_uses_chinese_text_and_expires_in_one_second() {
         bootstrap_rx: mpsc::channel::<BootstrapMessage>().1,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5045,8 +7032,12 @@ fn copy_status_badge_uses_blue_style() {
         device_index: 0,
         logs,
         active_tab: 2,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5070,6 +7061,7 @@ fn copy_status_badge_uses_blue_style() {
         bootstrap_rx: mpsc::channel::<BootstrapMessage>().1,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let line = super::footer_line(&app, 10_999);
@@ -5100,8 +7092,12 @@ fn selected_footer_keeps_dim_style() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5125,6 +7121,7 @@ fn selected_footer_keeps_dim_style() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -5175,8 +7172,12 @@ fn footer_copied_badge_is_bold_and_expires_after_one_second() {
         device_index: 0,
         logs,
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5200,6 +7201,7 @@ fn footer_copied_badge_is_bold_and_expires_after_one_second() {
         bootstrap_rx: mpsc::channel::<BootstrapMessage>().1,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5248,8 +7250,12 @@ fn footer_text_matches_requested_status_copy() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5273,15 +7279,19 @@ fn footer_text_matches_requested_status_copy() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
-    assert_eq!(super::footer_text(&app), "A: 新增账户 Enter: 账户操作");
+    assert_eq!(
+        super::footer_text(&app),
+        "A: 新增账户, /: 搜索, Enter: 账户操作"
+    );
 
     app.active_tab = 1;
     assert_eq!(
         super::footer_text(&app),
-        "R: 刷新, Enter: 查看设备, 设备总数: 1 当前设备: dev-1"
+        "R: 刷新, /: 搜索, Enter: 查看设备, 设备总数: 1 当前设备: dev-1"
     );
 
     app.prop_dialog = Some(BoolDialog {
@@ -5378,8 +7388,12 @@ fn clicking_refresh_operation_in_footer_triggers_sync() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5403,6 +7417,7 @@ fn clicking_refresh_operation_in_footer_triggers_sync() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5481,6 +7496,37 @@ fn clicking_esc_operation_in_footer_matches_escape_behavior() {
 }
 
 #[test]
+fn clicking_search_operation_in_footer_focuses_device_search() {
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+    app.language = Language::English;
+    app.input = "stale".to_string();
+    app.device_search_cursor = app.input.chars().count();
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 100, 24);
+    let (column, row) = footer_click_point(&app, terminal_area, "/: Search");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    assert!(app.input_mode);
+    assert_eq!(app.input, "stale");
+    assert_eq!(app.device_search_cursor, 5);
+}
+
+#[test]
 fn clicking_non_operation_footer_text_has_no_effect() {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -5503,8 +7549,12 @@ fn clicking_non_operation_footer_text_has_no_effect() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5528,6 +7578,7 @@ fn clicking_non_operation_footer_text_has_no_effect() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5570,8 +7621,12 @@ fn start_bootstrap_without_current_account_enters_ready_state() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5595,6 +7650,7 @@ fn start_bootstrap_without_current_account_enters_ready_state() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5679,8 +7735,12 @@ fn start_bootstrap_uses_cached_devices_immediately_while_syncing_in_background()
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5704,6 +7764,7 @@ fn start_bootstrap_uses_cached_devices_immediately_while_syncing_in_background()
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5750,8 +7811,12 @@ fn process_bootstrap_message_marks_app_ready_after_success() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5779,6 +7844,7 @@ fn process_bootstrap_message_marks_app_ready_after_success() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5869,8 +7935,12 @@ fn process_bootstrap_message_preserves_selected_device_did_when_present() {
         device_index: 1,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5898,6 +7968,7 @@ fn process_bootstrap_message_preserves_selected_device_did_when_present() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -5945,8 +8016,12 @@ fn request_local_transport_refresh_skips_account_after_session_warm() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -5970,6 +8045,7 @@ fn request_local_transport_refresh_skips_account_after_session_warm() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6007,8 +8083,12 @@ fn request_local_transport_refresh_force_rewarms_same_account() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -6032,6 +8112,7 @@ fn request_local_transport_refresh_force_rewarms_same_account() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6069,8 +8150,12 @@ fn request_local_transport_refresh_force_queues_when_fetching() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -6094,6 +8179,7 @@ fn request_local_transport_refresh_force_queues_when_fetching() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6151,8 +8237,12 @@ fn request_local_transport_refresh_queues_on_account_switch_while_fetching() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -6176,6 +8266,7 @@ fn request_local_transport_refresh_queues_on_account_switch_while_fetching() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6214,8 +8305,12 @@ fn process_background_messages_logs_local_transport_refresh_errors() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -6239,6 +8334,7 @@ fn process_background_messages_logs_local_transport_refresh_errors() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6283,8 +8379,12 @@ fn process_background_messages_clears_local_transport_refresh_device_id_on_error
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -6308,6 +8408,7 @@ fn process_background_messages_clears_local_transport_refresh_device_id_on_error
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6342,8 +8443,12 @@ fn process_auth_flow_completion_closes_reauth_dialog() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::Reauth {
             status: "Waiting browser callback".to_string(),
@@ -6370,6 +8475,7 @@ fn process_auth_flow_completion_closes_reauth_dialog() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6400,8 +8506,12 @@ fn failed_auth_flow_shows_port_8000_hint_in_reauth_dialog() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: Some(AccountActionDialog::Reauth {
             status: "Waiting browser callback".to_string(),
@@ -6428,6 +8538,7 @@ fn failed_auth_flow_shows_port_8000_hint_in_reauth_dialog() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6479,8 +8590,12 @@ fn prop_dialog_does_not_force_black_popup_background() {
         device_index: 0,
         logs: VecDeque::from(vec!["visible beneath".to_string()]),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -6537,6 +8652,7 @@ fn prop_dialog_does_not_force_black_popup_background() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -6572,8 +8688,12 @@ fn prop_dialog_refresh_starts_background_worker() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -6630,6 +8750,7 @@ fn prop_dialog_refresh_starts_background_worker() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6665,8 +8786,12 @@ fn prop_dialog_r_key_starts_background_refresh() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -6723,6 +8848,7 @@ fn prop_dialog_r_key_starts_background_refresh() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6762,8 +8888,12 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -6840,6 +8970,7 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -6910,8 +9041,12 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -6968,6 +9103,7 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -7037,8 +9173,12 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -7108,6 +9248,7 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -7143,8 +9284,12 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -7214,6 +9359,7 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -7251,8 +9397,12 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "客厅音箱".to_string(),
             device_name: "客厅音箱".to_string(),
@@ -7309,6 +9459,7 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -7353,8 +9504,12 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -7411,6 +9566,7 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -7512,8 +9668,12 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -7583,6 +9743,7 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -7627,8 +9788,12 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -7709,6 +9874,7 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -8200,6 +10366,34 @@ fn refresh_cloud_mips_listeners_logs_when_no_eligible_device_groups() {
 }
 
 #[test]
+fn refresh_cloud_mips_listeners_skips_when_auto_subscribe_setting_off() {
+    let _guard = env_guard();
+    std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
+    std::env::remove_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS");
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+    app.active_tab = 3;
+    app.settings_selected = 1;
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+    app.refresh_cloud_mips_listeners();
+
+    let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(logs.contains("cloud MIPS not started: auto subscribe disabled"));
+
+    let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+    *runtime = None;
+}
+
+#[test]
 fn prop_dialog_keyboard_tab_cycles_over_visible_tabs_when_middle_hidden() {
     let mut app = test_app_with_prop_dialog(BoolDialog {
         device_did: "dev-1".to_string(),
@@ -8341,8 +10535,12 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
@@ -8412,6 +10610,7 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -8503,8 +10702,12 @@ fn clicking_active_prop_dialog_item_executes_it() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -8561,6 +10764,7 @@ fn clicking_active_prop_dialog_item_executes_it() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -8621,8 +10825,12 @@ fn prop_dialog_actions_tab_renders_action_items() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -8686,6 +10894,7 @@ fn prop_dialog_actions_tab_renders_action_items() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -8744,8 +10953,12 @@ fn action_param_edit_supports_tab_and_click_focus_switch() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -8799,6 +11012,7 @@ fn action_param_edit_supports_tab_and_click_focus_switch() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -8860,8 +11074,12 @@ fn action_param_textarea_row_focus_updates_cursor_and_input() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -8915,6 +11133,7 @@ fn action_param_textarea_row_focus_updates_cursor_and_input() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -8966,8 +11185,12 @@ fn clicking_action_param_textarea_moves_cursor_to_clicked_character() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -9028,6 +11251,7 @@ fn clicking_action_param_textarea_moves_cursor_to_clicked_character() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -9074,8 +11298,12 @@ fn draw_edit_mode_shows_visible_input_cursor() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
@@ -9132,6 +11360,7 @@ fn draw_edit_mode_shows_visible_input_cursor() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -9167,8 +11396,12 @@ fn clicking_prop_edit_textarea_moves_cursor_to_clicked_character() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
@@ -9225,6 +11458,7 @@ fn clicking_prop_edit_textarea_moves_cursor_to_clicked_character() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -9271,8 +11505,12 @@ fn action_param_edit_mode_shows_action_title_not_property_title() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -9336,6 +11574,7 @@ fn action_param_edit_mode_shows_action_title_not_property_title() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -9382,8 +11621,12 @@ fn action_bool_param_uses_selector_editor() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -9447,6 +11690,7 @@ fn action_bool_param_uses_selector_editor() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -9640,8 +11884,12 @@ fn action_enum_param_uses_selector_editor() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -9718,6 +11966,7 @@ fn action_enum_param_uses_selector_editor() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -9783,8 +12032,12 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -9831,6 +12084,7 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -9992,8 +12246,12 @@ fn action_enum_param_without_readable_prop_still_uses_selector_editor() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10040,6 +12298,7 @@ fn action_enum_param_without_readable_prop_still_uses_selector_editor() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10082,8 +12341,12 @@ fn writable_bool_prop_enters_selector_editor_before_execution() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10140,6 +12403,7 @@ fn writable_bool_prop_enters_selector_editor_before_execution() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10190,8 +12454,12 @@ fn writable_bool_prop_selector_highlights_current_option_in_green() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10248,6 +12516,7 @@ fn writable_bool_prop_selector_highlights_current_option_in_green() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10286,8 +12555,12 @@ fn writable_enum_prop_enters_selector_editor_before_execution() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10357,6 +12630,7 @@ fn writable_enum_prop_enters_selector_editor_before_execution() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10408,8 +12682,12 @@ fn action_enum_param_selector_highlights_current_option_in_green() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10486,6 +12764,7 @@ fn action_enum_param_selector_highlights_current_option_in_green() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10524,8 +12803,12 @@ fn clicking_writable_bool_prop_selector_option_updates_selection() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10582,6 +12865,7 @@ fn clicking_writable_bool_prop_selector_option_updates_selection() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10638,8 +12922,12 @@ fn clicking_action_enum_param_selector_option_updates_selection() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10716,6 +13004,7 @@ fn clicking_action_enum_param_selector_option_updates_selection() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10776,8 +13065,12 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10858,6 +13151,7 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -10913,8 +13207,12 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -10985,6 +13283,7 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11013,8 +13312,12 @@ fn dragging_selected_text_shows_footer_copied_badge() {
         device_index: 0,
         logs: VecDeque::from(["alpha".to_string(), "beta".to_string(), "gamma".to_string()]),
         active_tab: 2,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -11038,19 +13341,21 @@ fn dragging_selected_text_shows_footer_copied_badge() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
     let _guard = env_guard();
     let clip_file = make_temp_dir("tui-selection-copy-badge").join("clipboard.txt");
     std::env::set_var("MIT_TEST_CLIPBOARD_FILE", &clip_file);
+    let message_column = log_message_start_column();
 
     handle_mouse(
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 0,
-            row: 3,
+            column: message_column,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -11060,8 +13365,8 @@ fn dragging_selected_text_shows_footer_copied_badge() {
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: 5,
-            row: 3,
+            column: message_column + 5,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -11071,8 +13376,8 @@ fn dragging_selected_text_shows_footer_copied_badge() {
         &mut app,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-            column: 5,
-            row: 3,
+            column: message_column + 5,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         },
         ratatui::layout::Rect::new(0, 0, 80, 24),
@@ -11124,8 +13429,12 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -11206,6 +13515,7 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11291,8 +13601,12 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
@@ -11349,6 +13663,7 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11397,8 +13712,12 @@ fn action_param_textarea_grows_height_when_value_wraps() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
@@ -11459,6 +13778,7 @@ fn action_param_textarea_grows_height_when_value_wraps() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11506,8 +13826,12 @@ fn prop_edit_mode_moves_cursor_with_left_right() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: Some(BoolDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
@@ -11564,6 +13888,7 @@ fn prop_edit_mode_moves_cursor_with_left_right() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11616,8 +13941,12 @@ fn process_bootstrap_message_ignores_stale_results_when_not_pending() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -11641,6 +13970,7 @@ fn process_bootstrap_message_ignores_stale_results_when_not_pending() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11687,8 +14017,12 @@ fn process_bootstrap_message_ignores_stale_results_for_wrong_generation() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -11716,6 +14050,7 @@ fn process_bootstrap_message_ignores_stale_results_for_wrong_generation() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11779,8 +14114,12 @@ fn process_bootstrap_message_applies_refreshed_auth_state() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -11808,6 +14147,7 @@ fn process_bootstrap_message_applies_refreshed_auth_state() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11860,8 +14200,12 @@ fn process_bootstrap_message_rewarms_local_transport_when_snapshot_missing() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -11889,6 +14233,7 @@ fn process_bootstrap_message_rewarms_local_transport_when_snapshot_missing() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -11935,8 +14280,12 @@ fn process_bootstrap_failure_logs_error_and_keeps_tui_ready() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -11964,6 +14313,7 @@ fn process_bootstrap_failure_logs_error_and_keeps_tui_ready() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -12027,8 +14377,12 @@ fn process_bootstrap_failure_applies_refreshed_auth_state() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 0,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -12056,6 +14410,7 @@ fn process_bootstrap_failure_applies_refreshed_auth_state() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
@@ -12150,8 +14505,12 @@ fn sync_failure_uses_cached_devices_without_quitting() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -12175,11 +14534,11 @@ fn sync_failure_uses_cached_devices_without_quitting() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
-    let result = app.exec_command("sync");
-    assert!(result.is_ok());
+    app.start_manual_sync();
     assert!(matches!(app.boot_state, BootState::Ready));
     assert!(app.bootstrap_pending.is_some());
 
@@ -12230,8 +14589,12 @@ fn sync_command_keeps_ui_ready_while_background_sync_runs() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -12255,10 +14618,11 @@ fn sync_command_keeps_ui_ready_while_background_sync_runs() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
-    app.exec_command("sync").unwrap();
+    app.start_manual_sync();
     assert!(
         matches!(app.boot_state, BootState::Ready),
         "sync should keep UI interactive while background sync runs"
@@ -12308,8 +14672,12 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -12333,10 +14701,11 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
-    app.exec_command("sync").unwrap();
+    app.start_manual_sync();
 
     let devices_path = home
         .join(".mit")
@@ -12347,15 +14716,18 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
     let cached_payload = loop {
         app.process_background_messages();
         if devices_path.exists() {
-            let text = fs::read_to_string(&devices_path).unwrap();
-            let payload: Value = serde_json::from_str(&text).unwrap();
-            if payload
-                .get("categories")
-                .and_then(|categories| categories.get("xiaomi.wifispeaker.lx04"))
-                .and_then(Value::as_str)
-                == Some("音箱")
+            if let Some(payload) = fs::read_to_string(&devices_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             {
-                break payload;
+                if payload
+                    .get("categories")
+                    .and_then(|categories| categories.get("xiaomi.wifispeaker.lx04"))
+                    .and_then(Value::as_str)
+                    == Some("音箱")
+                {
+                    break payload;
+                }
             }
         }
         assert!(
@@ -12366,6 +14738,28 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
         );
         thread::sleep(Duration::from_millis(10));
     };
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        app.process_background_messages();
+        if app.bootstrap_pending.is_none()
+            && app
+                .devices
+                .iter()
+                .any(|device| device.model == "xiaomi.wifispeaker.lx04")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "logs={:?} requests={:?} pending={:?} devices={:?}",
+            app.logs,
+            server.requests(),
+            app.bootstrap_pending,
+            app.devices
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 
     assert_eq!(
         cached_payload
@@ -12437,8 +14831,12 @@ fn start_bootstrap_creates_local_credentials_snapshot_without_restart() {
         device_index: 0,
         logs: VecDeque::new(),
         active_tab: 1,
+        log_scroll_offset: 0,
         input_mode: false,
         input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
         prop_dialog: None,
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -12462,6 +14860,7 @@ fn start_bootstrap_creates_local_credentials_snapshot_without_restart() {
         bootstrap_rx,
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
+        auto_subscribe_device_status: true,
         settings_selected: 0,
     };
 
