@@ -17,11 +17,26 @@ pub enum Language {
     English,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserSettings {
     #[serde(default)]
     pub language: Language,
+    #[serde(default = "default_auto_subscribe_device_status")]
+    pub auto_subscribe_device_status: bool,
+}
+
+fn default_auto_subscribe_device_status() -> bool {
+    true
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            language: Language::default(),
+            auto_subscribe_device_status: default_auto_subscribe_device_status(),
+        }
+    }
 }
 
 pub fn get_settings_path() -> PathBuf {

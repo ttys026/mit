@@ -7,13 +7,14 @@ use std::cell::RefCell;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    action_param_row_layouts, action_param_rows_for_dialog, copy_text_to_clipboard,
-    footer_display_text, footer_render_area, format_prop_dialog_list_item_line,
-    fullscreen_dialog_inner_area, logs_lines_for_display, note_copy_success, now_epoch_millis,
+    action_param_row_layouts, action_param_rows_for_dialog, active_tab_has_search,
+    copy_text_to_clipboard, footer_display_text, footer_render_area,
+    format_prop_dialog_list_item_line, fullscreen_dialog_inner_area, log_viewer_text_area,
+    logs_visible_lines_for_display, note_copy_success, now_epoch_millis,
     prop_dialog_indices_for_tab, prop_edit_textarea_area, prop_editor_bottom_lines,
     prop_editor_layout, push_message_cli_preview_line, push_message_command_area,
-    push_message_textarea_area, rendered_textarea_lines, split_main_layout, tab_titles,
-    AccountActionDialog, BoolDialogTab, TuiApp,
+    push_message_textarea_area, rendered_textarea_lines, search_plain_line, searchable_main_layout,
+    split_main_layout, tab_titles, AccountActionDialog, BoolDialogTab, TuiApp,
 };
 use crate::storage::Language;
 
@@ -28,6 +29,7 @@ pub(crate) enum SelectionSurface {
     PropEditorFooter,
     PushMessageInput,
     PushMessageCommand,
+    SearchInput,
 }
 
 #[derive(Clone, Debug)]
@@ -405,10 +407,10 @@ pub(crate) fn selection_snapshot_for_mouse(
                         surface: SelectionSurface::PushMessageCommand,
                         area: command_area,
                         lines: vec![push_message_cli_preview_line(
-                        uid.as_str(),
-                        input.as_str(),
-                        app.language,
-                    )],
+                            uid.as_str(),
+                            input.as_str(),
+                            app.language,
+                        )],
                     });
                 }
             }
@@ -567,16 +569,35 @@ pub(crate) fn selection_snapshot_for_mouse(
         });
     }
 
-    if app.active_tab == 2
-        && mouse.row >= list_area.y
-        && mouse.row < list_area.y.saturating_add(list_area.height)
-        && mouse.column >= list_area.x
-        && mouse.column < list_area.x.saturating_add(list_area.width)
-    {
+    if active_tab_has_search(app.active_tab) {
+        let [search_area, _search_border_area, _rest_area] = searchable_main_layout(list_area);
+        if mouse.row >= search_area.y
+            && mouse.row < search_area.y.saturating_add(search_area.height)
+            && mouse.column >= search_area.x
+            && mouse.column < search_area.x.saturating_add(search_area.width)
+        {
+            return Some(SelectionSnapshot {
+                surface: SelectionSurface::SearchInput,
+                area: search_area,
+                lines: vec![search_plain_line(app, search_area.width)],
+            });
+        }
+    }
+
+    if app.active_tab == 2 && {
+        let [_search_area, _search_border_area, logs_area] = searchable_main_layout(list_area);
+        let text_area = log_viewer_text_area(app, logs_area);
+        mouse.row >= text_area.y
+            && mouse.row < text_area.y.saturating_add(text_area.height)
+            && mouse.column >= text_area.x
+            && mouse.column < text_area.x.saturating_add(text_area.width)
+    } {
+        let [_search_area, _search_border_area, logs_area] = searchable_main_layout(list_area);
+        let text_area = log_viewer_text_area(app, logs_area);
         return Some(SelectionSnapshot {
             surface: SelectionSurface::Logs,
-            area: list_area,
-            lines: logs_lines_for_display(app),
+            area: text_area,
+            lines: logs_visible_lines_for_display(app, text_area),
         });
     }
 
@@ -595,6 +616,7 @@ pub(crate) fn selection_start(app: &TuiApp, mouse: MouseEvent, terminal_area: Re
                     | SelectionSurface::PropEditorFooter
                     | SelectionSurface::PushMessageInput
                     | SelectionSurface::PushMessageCommand
+                    | SelectionSurface::SearchInput
             );
             let active = ActiveSelection {
                 snapshot,

@@ -602,7 +602,9 @@ mod tests {
 
     #[test]
     fn mqtt_recv_timeout_allows_connection_timeout_to_complete() {
-        assert!(MIPS_RECV_TIMEOUT_SECS > MIPS_CONNECTION_TIMEOUT_SECS);
+        let recv_timeout_secs = MIPS_RECV_TIMEOUT_SECS;
+        let connection_timeout_secs = MIPS_CONNECTION_TIMEOUT_SECS;
+        assert!(recv_timeout_secs > connection_timeout_secs);
     }
 
     #[test]

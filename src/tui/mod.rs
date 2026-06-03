@@ -7,7 +7,6 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -15,6 +14,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Tabs,
 use ratatui::Terminal;
 use ratatui_core::style::Style as TextAreaStyle;
 use ratatui_core::widgets::Widget as TextAreaWidget;
+use ratatui_crossterm::CrosstermBackend;
 use ratatui_textarea::{
     CursorMove, Input as TextAreaInput, Key as TextAreaKey, TextArea, WrapMode,
 };
@@ -25,6 +25,8 @@ use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
+use unicode_width::UnicodeWidthChar;
 
 #[cfg(not(test))]
 use std::process::Command;
@@ -38,8 +40,9 @@ use crate::property_cache::PropertyCache;
 use crate::spec_cache::{load_spec, specs_dir, sync_model_spec};
 use crate::storage::{
     default_auth, get_auth_accounts, get_home_dir, load_auth, load_settings, normalize_auth,
-    save_settings, AuthAccount, AuthState, Language, UserSettings,
+    save_settings, write_private_text_file, AuthAccount, AuthState, Language, UserSettings,
 };
+use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -51,11 +54,45 @@ use self::pages::bootstrap as bootstrap_page;
 use self::pages::device::*;
 use self::pages::prop as prop_page;
 use shared::*;
+use tui_logger::TuiLoggerWidget;
 
-const LOG_MAX: usize = 120;
+const LOG_MAX: usize = 1000;
+const LOG_SCROLL_PAGE: usize = 10;
+const LOG_ENTRY_PREFIX: &str = "__log_at=";
+const LOG_SCROLLBAR_MARGIN_WIDTH: u16 = 3;
+const LOG_SCROLLBAR_THUMB: &str = "█";
+const LOG_SCROLLBAR_TRACK: &str = "║";
+const LOG_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
+    format_description!("[hour]:[minute]:[second]");
 const FOOTER_COPY_LOG_PREFIX: &str = "__footer_copied_at=";
 const FOOTER_COPY_BADGE_TEXT: &str = " [已复制]";
 const CACHE_ACCOUNT_PREFIX: &str = "cache-account:";
+const DEVICE_SEARCH_HEIGHT: u16 = 2;
+
+fn active_tab_has_search(tab: usize) -> bool {
+    matches!(tab, 0..=2)
+}
+
+fn search_tab_slot(tab: usize) -> Option<usize> {
+    match tab {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        _ => None,
+    }
+}
+
+fn searchable_main_layout(content_area: Rect) -> [Rect; 3] {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(DEVICE_SEARCH_HEIGHT.saturating_sub(1)),
+            Constraint::Min(0),
+        ])
+        .areas(content_area)
+}
+
 pub(crate) fn tab_titles(lang: Language) -> [&'static str; 4] {
     match lang {
         Language::Chinese => ["1:账号", "2:设备", "3:日志", "4:设置"],
@@ -75,13 +112,14 @@ pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 4] {
     }
 }
 const STATUS_BAR_MARGIN_TOP: u16 = 1;
-const SETTINGS_ITEM_COUNT: usize = 3;
+const SETTINGS_ITEM_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsAction {
+    ToggleLanguage,
+    ToggleAutoSubscribeDeviceStatus,
     ClearCacheKeepAuth,
     ResetAll,
-    ToggleLanguage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +136,10 @@ struct CloudMipsRuntime {
 
 static CLOUD_MIPS_RUNTIME: OnceLock<Mutex<Option<CloudMipsRuntime>>> = OnceLock::new();
 
+thread_local! {
+    static LAST_LOG_TEXT_WIDTH: RefCell<Option<u16>> = const { RefCell::new(None) };
+}
+
 fn cloud_mips_runtime() -> &'static Mutex<Option<CloudMipsRuntime>> {
     CLOUD_MIPS_RUNTIME.get_or_init(|| Mutex::new(None))
 }
@@ -109,7 +151,7 @@ pub(in crate::tui) fn lang_str(lang: Language, zh: &'static str, en: &'static st
     }
 }
 
-fn spec_node_label<'a>(node: &'a Value, lang: Language) -> Option<&'a str> {
+fn spec_node_label(node: &Value, lang: Language) -> Option<&str> {
     match lang {
         Language::Chinese => node
             .get("description_trans")
@@ -448,51 +490,52 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
         return Ok(false);
     }
 
-    if app.input_mode {
+    if app.search_is_active() {
         match key.code {
-            KeyCode::Esc => {
-                app.input_mode = false;
-                app.input.clear();
-            }
-            KeyCode::Enter => {
-                let command = app.input.trim().to_string();
-                app.input_mode = false;
-                app.input.clear();
-                if !command.is_empty() {
-                    app.exec_command(&command)?;
-                }
-            }
+            KeyCode::Esc => app.blur_search(),
+            KeyCode::Tab => app.next_tab(),
+            KeyCode::BackTab => app.prev_tab(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.prev_tab(),
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.next_tab(),
+            KeyCode::Enter => match app.active_tab {
+                0 => app.open_selected_visible_account()?,
+                1 => app.open_selected_visible_device(),
+                _ => {}
+            },
             KeyCode::Backspace => {
-                app.input.pop();
+                app.search_backspace();
             }
-            KeyCode::Char(c) => {
-                app.input.push(c);
-            }
+            KeyCode::Left => app.search_move_cursor_left(),
+            KeyCode::Right => app.search_move_cursor_right(),
+            KeyCode::Up => app.prev_item(),
+            KeyCode::Down => app.next_item(),
+            KeyCode::PageUp if app.active_tab == 2 => app.scroll_logs_up(LOG_SCROLL_PAGE),
+            KeyCode::PageDown if app.active_tab == 2 => app.scroll_logs_down(LOG_SCROLL_PAGE),
+            KeyCode::Char(c) => app.search_insert(c),
             _ => {}
         }
         return Ok(false);
     }
 
     match key.code {
+        KeyCode::Char('/') if active_tab_has_search(app.active_tab) => app.focus_search(),
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
-        KeyCode::Char('1') => app.active_tab = 0,
-        KeyCode::Char('2') => app.active_tab = 1,
-        KeyCode::Char('3') => app.active_tab = 2,
-        KeyCode::Char('4') => app.active_tab = 3,
+        KeyCode::Char('1') => app.set_active_tab(0),
+        KeyCode::Char('2') => app.set_active_tab(1),
+        KeyCode::Char('3') => app.set_active_tab(2),
+        KeyCode::Char('4') => app.set_active_tab(3),
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Enter => match app.active_tab {
-            0 => account_page::open_account_action_dialog(app)?,
+            0 => app.open_selected_visible_account()?,
             1 => {
-                if let Err(error) = app.open_prop_dialog() {
-                    account_page::open_offline_prop_dialog_for_current(app, &error);
-                }
+                app.open_selected_visible_device();
             }
             3 => app.execute_selected_settings_action()?,
             _ => {}
         },
         KeyCode::Char('r') | KeyCode::Char('R') => {
-            app.exec_command("sync")?;
+            app.start_manual_sync();
         }
         KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
             copy_last_selection(app);
@@ -500,6 +543,8 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
         KeyCode::Char('A') | KeyCode::Char('a') => account_page::start_add_account_auth_flow(app)?,
         KeyCode::Up => app.prev_item(),
         KeyCode::Down => app.next_item(),
+        KeyCode::PageUp if app.active_tab == 2 => app.scroll_logs_up(LOG_SCROLL_PAGE),
+        KeyCode::PageDown if app.active_tab == 2 => app.scroll_logs_down(LOG_SCROLL_PAGE),
         KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.prev_tab(),
         KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.next_tab(),
         _ => {}
@@ -512,8 +557,25 @@ fn settings_action_label(action: SettingsAction, lang: Language) -> &'static str
     match action {
         SettingsAction::ClearCacheKeepAuth => lang_str(lang, "重置设备缓存", "Reset Device Cache"),
         SettingsAction::ResetAll => lang_str(lang, "重置全部设置", "Reset All Settings"),
-        SettingsAction::ToggleLanguage => unreachable!("ToggleLanguage has no confirm dialog"),
+        SettingsAction::ToggleLanguage | SettingsAction::ToggleAutoSubscribeDeviceStatus => {
+            unreachable!("Toggle settings have no confirm dialog")
+        }
     }
+}
+
+fn auto_subscribe_device_status_label(lang: Language, enabled: bool) -> String {
+    let label = lang_str(
+        lang,
+        "自动订阅设备状态(关闭后始终需要手动刷新)",
+        "Auto Subscribe Device Status (off always requires manual refresh)",
+    );
+    let separator = lang_str(lang, "：", ": ");
+    let state = if enabled {
+        lang_str(lang, "开启", "On")
+    } else {
+        lang_str(lang, "关闭", "Off")
+    };
+    format!("{label}{separator}{state}")
 }
 
 fn settings_confirm_lines(action: SettingsAction, lang: Language) -> Vec<String> {
@@ -536,7 +598,9 @@ fn settings_confirm_lines(action: SettingsAction, lang: Language) -> Vec<String>
             .to_string(),
             true,
         ),
-        SettingsAction::ToggleLanguage => unreachable!("ToggleLanguage has no confirm dialog"),
+        SettingsAction::ToggleLanguage | SettingsAction::ToggleAutoSubscribeDeviceStatus => {
+            unreachable!("Toggle settings have no confirm dialog")
+        }
     };
     let mut lines = vec![
         format!(
@@ -564,9 +628,6 @@ fn handle_mouse(
     if !matches!(app.boot_state, BootState::Ready) {
         return Ok(());
     }
-    if app.input_mode {
-        return Ok(());
-    }
     let left_down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
     let left_drag = matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left));
     let left_up = matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left));
@@ -575,9 +636,26 @@ fn handle_mouse(
     if !left_down && !left_drag && !left_up && !scroll_up && !scroll_down {
         return Ok(());
     }
+    if left_down && app.search_is_active() {
+        let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+            split_main_layout(terminal_area);
+        let [search_area, _search_border_area, _rest_area] = searchable_main_layout(content_area);
+        let on_search_row = mouse.row == content_area.y
+            && mouse.column >= search_area.x
+            && mouse.column < search_area.x.saturating_add(search_area.width);
+        if !on_search_row {
+            app.blur_search();
+        }
+    }
 
     if left_down && click_outside_selected_range(mouse) {
         clear_selection_state();
+    }
+    if app.active_tab == 2
+        && (left_down || left_drag || left_up)
+        && handle_log_scrollbar_mouse(app, mouse, terminal_area)
+    {
+        return Ok(());
     }
     if left_down && selection_start(app, mouse, terminal_area) {
         return Ok(());
@@ -930,7 +1008,7 @@ fn handle_mouse(
         return Ok(());
     }
 
-    let [tabs_area, list_area, _status_gap_area, _status_bar_area] =
+    let [tabs_area, content_area, _status_gap_area, _status_bar_area] =
         split_main_layout(terminal_area);
     if left_click {
         let tab_inner_top = tabs_area.y.saturating_add(1);
@@ -939,19 +1017,41 @@ fn handle_mouse(
             .saturating_add(tabs_area.height.saturating_sub(1));
         if mouse.row >= tab_inner_top && mouse.row < tab_inner_bottom_exclusive {
             if let Some(index) = tab_index_for_column(mouse.column, tabs_area, app.language) {
-                app.active_tab = index;
+                app.set_active_tab(index);
                 return Ok(());
             }
         }
     }
 
-    if app.active_tab == 0 || app.active_tab == 1 || app.active_tab == 3 {
-        if mouse.row < list_area.y
-            || mouse.row >= list_area.y.saturating_add(list_area.height)
-            || mouse.column < list_area.x
-            || mouse.column >= list_area.x.saturating_add(list_area.width)
+    if app.active_tab == 0 || app.active_tab == 1 || app.active_tab == 2 || app.active_tab == 3 {
+        if mouse.row < content_area.y
+            || mouse.row >= content_area.y.saturating_add(content_area.height)
+            || mouse.column < content_area.x
+            || mouse.column >= content_area.x.saturating_add(content_area.width)
         {
             return Ok(());
+        }
+
+        if active_tab_has_search(app.active_tab) && left_down {
+            let [search_area, _search_border_area, _rest_area] =
+                searchable_main_layout(content_area);
+            if mouse.row == search_area.y {
+                if app.search_is_active() {
+                    app.device_search_cursor = search_cursor_for_mouse(
+                        app.input.as_str(),
+                        app.language,
+                        search_area,
+                        mouse.column,
+                    );
+                    app.save_active_search_state();
+                } else {
+                    app.focus_search();
+                }
+                return Ok(());
+            }
+            if app.search_is_active() {
+                app.blur_search();
+            }
         }
 
         if scroll_up {
@@ -963,35 +1063,39 @@ fn handle_mouse(
             return Ok(());
         }
 
-        let clicked_row = (mouse.row - list_area.y) as usize;
-        if clicked_row == 0 {
+        let header_rows = if app.active_tab == 0 || app.active_tab == 1 {
+            DEVICE_SEARCH_HEIGHT as usize + 1
+        } else {
+            1
+        };
+        let clicked_row = (mouse.row - content_area.y) as usize;
+        if clicked_row < header_rows {
             return Ok(());
         }
-        let clicked_row = clicked_row - 1;
+        let clicked_row = clicked_row - header_rows;
         match app.active_tab {
             0 => {
-                let idx = app.account_list_state.offset().saturating_add(clicked_row);
-                if idx >= app.accounts.len() {
+                let position = app.account_list_state.offset().saturating_add(clicked_row);
+                let Some(idx) = app.filtered_account_indices().get(position).copied() else {
                     return Ok(());
-                }
+                };
                 if idx == app.account_index {
-                    account_page::open_account_action_dialog(app)?;
+                    app.open_selected_visible_account()?;
                 } else {
                     app.account_index = idx;
+                    app.request_local_transport_refresh(false);
                 }
             }
             1 => {
                 if !left_click {
                     return Ok(());
                 }
-                let idx = app.device_list_state.offset().saturating_add(clicked_row);
-                if idx >= app.devices.len() {
+                let position = app.device_list_state.offset().saturating_add(clicked_row);
+                let Some(idx) = app.filtered_device_indices().get(position).copied() else {
                     return Ok(());
-                }
+                };
                 if idx == app.device_index {
-                    if let Err(error) = app.open_prop_dialog() {
-                        account_page::open_offline_prop_dialog_for_current(app, &error);
-                    }
+                    app.open_selected_visible_device();
                 } else {
                     app.device_index = idx;
                 }
@@ -1017,18 +1121,351 @@ fn handle_mouse(
     Ok(())
 }
 
+fn handle_log_scrollbar_mouse(
+    app: &mut TuiApp,
+    mouse: MouseEvent,
+    terminal_area: ratatui::layout::Rect,
+) -> bool {
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        split_main_layout(terminal_area);
+    let [_search_area, _search_border_area, logs_area] = searchable_main_layout(content_area);
+    let (visual_lines, _log_text_area, scrollbar_area) = log_visual_lines_and_areas(app, logs_area);
+    let Some(scrollbar_area) = scrollbar_area else {
+        return false;
+    };
+    if !rect_contains(scrollbar_area, mouse.column, mouse.row) {
+        return false;
+    }
+    app.log_scroll_offset =
+        log_scroll_offset_for_scrollbar_row(mouse.row, scrollbar_area, visual_lines.len());
+    true
+}
+
+fn encode_log_entry(message: String) -> String {
+    if message.starts_with(FOOTER_COPY_LOG_PREFIX) || message.starts_with(LOG_ENTRY_PREFIX) {
+        message
+    } else {
+        format!("{LOG_ENTRY_PREFIX}{}\t{message}", now_epoch_millis())
+    }
+}
+
+fn split_log_entry(line: &str) -> (Option<u128>, &str) {
+    let Some(rest) = line.strip_prefix(LOG_ENTRY_PREFIX) else {
+        return (None, line);
+    };
+    let Some((timestamp, message)) = rest.split_once('\t') else {
+        return (None, line);
+    };
+    match timestamp.parse::<u128>() {
+        Ok(timestamp) => (Some(timestamp), message),
+        Err(_) => (None, line),
+    }
+}
+
+fn log_entry_message(line: &str) -> &str {
+    split_log_entry(line).1
+}
+
+fn format_log_timestamp(timestamp_ms: u128) -> String {
+    let Ok(seconds) = i64::try_from(timestamp_ms / 1000) else {
+        return "--:--:--".to_string();
+    };
+    let Ok(timestamp) = OffsetDateTime::from_unix_timestamp(seconds) else {
+        return "--:--:--".to_string();
+    };
+    let timestamp = match UtcOffset::current_local_offset() {
+        Ok(offset) => timestamp.to_offset(offset),
+        Err(_) => timestamp,
+    };
+    timestamp
+        .format(LOG_TIMESTAMP_FORMAT)
+        .unwrap_or_else(|_| "--:--:--".to_string())
+}
+
+fn format_log_entry_for_display(line: &str) -> String {
+    let (timestamp, message) = split_log_entry(line);
+    let timestamp = format_log_timestamp(timestamp.unwrap_or_else(now_epoch_millis));
+    format!("[{timestamp}] {message}")
+}
+
+fn remember_log_text_width(width: u16) {
+    LAST_LOG_TEXT_WIDTH.with(|state| *state.borrow_mut() = Some(width));
+}
+
+fn last_log_text_width() -> Option<u16> {
+    LAST_LOG_TEXT_WIDTH.with(|state| *state.borrow())
+}
+
+fn log_entry_visual_row_count_for_anchor(entry: &str) -> usize {
+    if entry.starts_with(FOOTER_COPY_LOG_PREFIX) {
+        return 0;
+    }
+    let width = last_log_text_width()
+        .filter(|width| *width > 0)
+        .unwrap_or(u16::MAX);
+    wrap_log_line(format_log_entry_for_display(entry).as_str(), width).len()
+}
+
+fn log_selection_is_active() -> bool {
+    selected_surface()
+        .map(|active| active.snapshot.surface == SelectionSurface::Logs)
+        .unwrap_or(false)
+}
+
+fn log_selection_is_stale(active: &ActiveSelection, area: Rect, visible_lines: &[String]) -> bool {
+    active.snapshot.surface == SelectionSurface::Logs
+        && (active.snapshot.area != area || active.snapshot.lines.as_slice() != visible_lines)
+}
+
 fn logs_lines_for_display(app: &TuiApp) -> Vec<String> {
+    let query = if app.active_tab == 2 {
+        app.search_query().to_lowercase()
+    } else {
+        String::new()
+    };
     app.logs
         .iter()
         .rev()
         .filter(|line| !line.starts_with(FOOTER_COPY_LOG_PREFIX))
-        .cloned()
+        .filter(|line| {
+            let message = log_entry_message(line);
+            query.is_empty() || message.to_lowercase().contains(query.as_str())
+        })
+        .map(|line| format_log_entry_for_display(line))
         .collect::<Vec<_>>()
+}
+
+fn log_scroll_offset_for_view(app: &TuiApp, line_count: usize, viewport_height: u16) -> usize {
+    let visible_rows = viewport_height as usize;
+    app.log_scroll_offset
+        .min(line_count.saturating_sub(visible_rows))
+}
+
+fn wrap_log_line(line: &str, width: u16) -> Vec<String> {
+    if width == 0 || line.is_empty() {
+        return vec![line.to_string()];
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0u16;
+    for ch in line.chars() {
+        let char_width = ch.width().unwrap_or(0) as u16;
+        if !row.is_empty() && row_width.saturating_add(char_width) > width {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0;
+        }
+        row.push(ch);
+        row_width = row_width.saturating_add(char_width);
+    }
+    rows.push(row);
+    rows
+}
+
+fn log_visual_lines_for_width(app: &TuiApp, width: u16) -> Vec<String> {
+    logs_lines_for_display(app)
+        .into_iter()
+        .flat_map(|line| wrap_log_line(line.as_str(), width))
+        .collect()
+}
+
+fn logs_visible_lines_for_display(app: &TuiApp, viewport_area: Rect) -> Vec<String> {
+    let lines = log_visual_lines_for_width(app, viewport_area.width);
+    let offset = log_scroll_offset_for_view(app, lines.len(), viewport_area.height);
+    lines
+        .into_iter()
+        .skip(offset)
+        .take(viewport_area.height as usize)
+        .collect()
+}
+
+fn log_viewer_areas_for_line_count(
+    list_area: Rect,
+    visual_line_count: usize,
+) -> (Rect, Option<Rect>) {
+    if list_area.width <= LOG_SCROLLBAR_MARGIN_WIDTH.saturating_add(1)
+        || list_area.height == 0
+        || visual_line_count <= list_area.height as usize
+    {
+        return (list_area, None);
+    }
+    let [text_area, _margin_area, scrollbar_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(LOG_SCROLLBAR_MARGIN_WIDTH),
+            Constraint::Length(1),
+        ])
+        .areas(list_area);
+    (text_area, Some(scrollbar_area))
+}
+
+fn log_viewer_text_area(app: &TuiApp, list_area: Rect) -> Rect {
+    let visual_line_count = log_visual_lines_for_width(app, list_area.width).len();
+    log_viewer_areas_for_line_count(list_area, visual_line_count).0
+}
+
+fn log_visual_lines_and_areas(app: &TuiApp, list_area: Rect) -> (Vec<String>, Rect, Option<Rect>) {
+    let full_width_lines = log_visual_lines_for_width(app, list_area.width);
+    let (text_area, scrollbar_area) =
+        log_viewer_areas_for_line_count(list_area, full_width_lines.len());
+    if scrollbar_area.is_some() {
+        let visual_lines = log_visual_lines_for_width(app, text_area.width);
+        (visual_lines, text_area, scrollbar_area)
+    } else {
+        (full_width_lines, text_area, scrollbar_area)
+    }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    row >= area.y
+        && row < area.y.saturating_add(area.height)
+        && column >= area.x
+        && column < area.x.saturating_add(area.width)
+}
+
+fn log_scroll_offset_for_scrollbar_row(row: u16, scrollbar_area: Rect, line_count: usize) -> usize {
+    let Some(geometry) = log_scrollbar_geometry(line_count, scrollbar_area.height, 0) else {
+        return 0;
+    };
+    if geometry.max_offset == 0 || geometry.track_movement == 0 {
+        return 0;
+    }
+    let row_index = row
+        .saturating_sub(scrollbar_area.y)
+        .min(scrollbar_area.height.saturating_sub(1)) as usize;
+    let thumb_start = row_index.min(geometry.track_movement);
+    thumb_start
+        .saturating_mul(geometry.max_offset)
+        .saturating_add(geometry.track_movement / 2)
+        / geometry.track_movement
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LogScrollbarGeometry {
+    max_offset: usize,
+    track_movement: usize,
+    thumb_start: usize,
+    thumb_height: usize,
+}
+
+fn log_scrollbar_geometry(
+    visual_line_count: usize,
+    viewport_height: u16,
+    offset: usize,
+) -> Option<LogScrollbarGeometry> {
+    let viewport_height = viewport_height as usize;
+    if viewport_height == 0 || visual_line_count <= viewport_height {
+        return None;
+    }
+    let max_offset = visual_line_count.saturating_sub(viewport_height);
+    let thumb_height = viewport_height
+        .saturating_mul(viewport_height)
+        .saturating_add(visual_line_count.saturating_sub(1))
+        / visual_line_count;
+    let thumb_height = thumb_height.clamp(1, viewport_height);
+    let track_movement = viewport_height.saturating_sub(thumb_height);
+    let thumb_start = if max_offset == 0 || track_movement == 0 {
+        0
+    } else {
+        offset
+            .min(max_offset)
+            .saturating_mul(track_movement)
+            .saturating_add(max_offset / 2)
+            / max_offset
+    };
+    Some(LogScrollbarGeometry {
+        max_offset,
+        track_movement,
+        thumb_start,
+        thumb_height,
+    })
+}
+
+fn log_scrollbar_lines(geometry: LogScrollbarGeometry, height: u16) -> Vec<Line<'static>> {
+    (0..height as usize)
+        .map(|row| {
+            let symbol = if row >= geometry.thumb_start
+                && row < geometry.thumb_start.saturating_add(geometry.thumb_height)
+            {
+                LOG_SCROLLBAR_THUMB
+            } else {
+                LOG_SCROLLBAR_TRACK
+            };
+            Line::from(symbol)
+        })
+        .collect()
+}
+
+fn log_search_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn next_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn highlight_log_search_matches(line: &str, query: &str) -> Line<'static> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Line::from(line.to_string());
+    }
+    let haystack = line.to_lowercase();
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return Line::from(line.to_string());
+    }
+
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < line.len() {
+        let Some(search_from) = haystack.get(cursor..) else {
+            break;
+        };
+        let Some(relative_start) = search_from.find(needle.as_str()) else {
+            break;
+        };
+        let start = cursor.saturating_add(relative_start);
+        if !line.is_char_boundary(start) {
+            cursor = next_char_boundary(line, start.saturating_add(1));
+            continue;
+        }
+        let mut end = start.saturating_add(needle.len()).min(line.len());
+        while end < line.len() && !line.is_char_boundary(end) {
+            end = end.saturating_add(1);
+        }
+        if end <= start {
+            break;
+        }
+        if start > cursor {
+            spans.push(Span::raw(line[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(
+            line[start..end].to_string(),
+            log_search_highlight_style(),
+        ));
+        cursor = end;
+    }
+
+    if cursor == 0 {
+        return Line::from(line.to_string());
+    }
+    if cursor < line.len() {
+        spans.push(Span::raw(line[cursor..].to_string()));
+    }
+    Line::from(spans)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterOperation {
     Refresh,
+    Search,
     Enter,
     Back,
     AddAccount,
@@ -1207,21 +1644,82 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
         };
     }
 
+    if app.search_is_active() {
+        return match app.active_tab {
+            0 => {
+                let matched_label = lang_str(lang, "匹配账户", "Matched accounts");
+                build_footer_segments(
+                    &[
+                        (
+                            lang_str(lang, "Esc: 返回", "Esc: Back"),
+                            FooterOperation::Back,
+                        ),
+                        (
+                            lang_str(lang, "Enter: 账户操作", "Enter: Account Actions"),
+                            FooterOperation::Enter,
+                        ),
+                    ],
+                    Some(format!(
+                        "{matched_label}: {}",
+                        app.filtered_account_indices().len()
+                    )),
+                )
+            }
+            1 => {
+                let matched_label = lang_str(lang, "匹配设备", "Matched devices");
+                build_footer_segments(
+                    &[
+                        (
+                            lang_str(lang, "Esc: 返回", "Esc: Back"),
+                            FooterOperation::Back,
+                        ),
+                        (
+                            lang_str(lang, "Enter: 查看设备", "Enter: View Device"),
+                            FooterOperation::Enter,
+                        ),
+                    ],
+                    Some(format!(
+                        "{matched_label}: {} {current_device_label}: {}",
+                        app.filtered_device_indices().len(),
+                        app.selected_device_did().unwrap_or("-")
+                    )),
+                )
+            }
+            2 => {
+                let matched_label = lang_str(lang, "匹配日志", "Matched logs");
+                build_footer_segments(
+                    &[(
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    )],
+                    Some(format!(
+                        "{matched_label}: {}",
+                        logs_lines_for_display(app).len()
+                    )),
+                )
+            }
+            _ => Vec::new(),
+        };
+    }
+
     match app.active_tab {
-        0 => vec![
-            FooterSegment {
-                text: lang_str(lang, "A: 新增账户", "A: Add Account").to_string(),
-                operation: Some(FooterOperation::AddAccount),
-            },
-            FooterSegment {
-                text: " ".to_string(),
-                operation: None,
-            },
-            FooterSegment {
-                text: lang_str(lang, "Enter: 账户操作", "Enter: Account Actions").to_string(),
-                operation: Some(FooterOperation::Enter),
-            },
-        ],
+        0 => build_footer_segments(
+            &[
+                (
+                    lang_str(lang, "A: 新增账户", "A: Add Account"),
+                    FooterOperation::AddAccount,
+                ),
+                (
+                    lang_str(lang, "/: 搜索", "/: Search"),
+                    FooterOperation::Search,
+                ),
+                (
+                    lang_str(lang, "Enter: 账户操作", "Enter: Account Actions"),
+                    FooterOperation::Enter,
+                ),
+            ],
+            None,
+        ),
         1 => {
             let total_label = lang_str(lang, "设备总数", "Total Devices");
             build_footer_segments(
@@ -1229,6 +1727,10 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
                     (
                         lang_str(lang, "R: 刷新", "R: Refresh"),
                         FooterOperation::Refresh,
+                    ),
+                    (
+                        lang_str(lang, "/: 搜索", "/: Search"),
+                        FooterOperation::Search,
                     ),
                     (
                         lang_str(lang, "Enter: 查看设备", "Enter: View Device"),
@@ -1249,15 +1751,13 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
             )],
             Some("".to_string()),
         ),
-        _ => vec![FooterSegment {
-            text: format!(
-                "accounts={}  devices={}  selected_device={}",
-                app.accounts.len(),
-                app.devices.len(),
-                app.selected_device_did().unwrap_or("-")
-            ),
-            operation: None,
-        }],
+        _ => build_footer_segments(
+            &[(
+                lang_str(lang, "/: 搜索", "/: Search"),
+                FooterOperation::Search,
+            )],
+            Some("".to_string()),
+        ),
     }
 }
 
@@ -1280,6 +1780,13 @@ fn execute_footer_operation(app: &mut TuiApp, operation: FooterOperation) -> Res
             let _ = handle_key(
                 app,
                 crossterm::event::KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            )?;
+            Ok(())
+        }
+        FooterOperation::Search => {
+            let _ = handle_key(
+                app,
+                crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             )?;
             Ok(())
         }
@@ -1345,6 +1852,146 @@ fn copy_reauth_auth_url(app: &mut TuiApp) {
     }
 }
 
+fn char_cursor_byte_index(input: &str, cursor: usize) -> usize {
+    input
+        .char_indices()
+        .nth(cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len())
+}
+
+fn search_prefix(lang: Language) -> String {
+    let label = lang_str(lang, "搜索", "Search");
+    format!("/ {label}: ")
+}
+
+fn visible_search_input(input: &str, width: u16) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), input.chars().count());
+    }
+    if display_width(input) <= width {
+        return (input.to_string(), 0);
+    }
+    if width <= 3 {
+        return (".".repeat(width as usize), input.chars().count());
+    }
+
+    let tail_width = width.saturating_sub(3);
+    let mut start_byte = input.len();
+    let mut start_char = input.chars().count();
+    let mut seen_width = 0u16;
+    for (idx, ch) in input.char_indices().rev() {
+        let char_width = if ch.is_ascii() { 1 } else { 2 };
+        if seen_width.saturating_add(char_width) > tail_width {
+            break;
+        }
+        seen_width = seen_width.saturating_add(char_width);
+        start_byte = idx;
+        start_char = start_char.saturating_sub(1);
+    }
+
+    let mut visible = "...".to_string();
+    visible.push_str(&input[start_byte..]);
+    (visible, start_char)
+}
+
+fn search_plain_line(app: &TuiApp, area_width: u16) -> String {
+    let prefix = search_prefix(app.language);
+    let prefix_width = display_width(prefix.as_str());
+    let input_width = area_width.saturating_sub(prefix_width);
+    let (visible_input, _) = visible_search_input(app.input.as_str(), input_width);
+    format!("{prefix}{visible_input}")
+}
+
+fn search_cursor_for_mouse(input: &str, lang: Language, area: Rect, column: u16) -> usize {
+    if area.width == 0 {
+        return 0;
+    }
+    let target_col = column
+        .saturating_sub(area.x)
+        .min(area.width.saturating_sub(1));
+    let prefix_width = display_width(search_prefix(lang).as_str());
+    let input_width = area.width.saturating_sub(prefix_width);
+    let input_col = target_col.saturating_sub(prefix_width);
+    let (_, start_char) = visible_search_input(input, input_width);
+    let ellipsis_width = if start_char > 0 { 3 } else { 0 };
+    if start_char > 0 && input_col <= ellipsis_width {
+        return start_char;
+    }
+    let input_col = input_col.saturating_sub(ellipsis_width);
+    let mut cursor = 0usize;
+    let mut cursor_col = 0u16;
+    for ch in input.chars().skip(start_char) {
+        let char_width = if ch.is_ascii() { 1 } else { 2 };
+        let next_col = cursor_col.saturating_add(char_width);
+        if next_col > input_col {
+            break;
+        }
+        cursor = cursor.saturating_add(1);
+        cursor_col = next_col;
+    }
+    start_char.saturating_add(cursor).min(input.chars().count())
+}
+
+fn search_line(app: &TuiApp, area_width: u16) -> Line<'static> {
+    let focused = app.search_is_active();
+    let prefix_style = if focused {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Blue)
+    };
+    let prefix = search_prefix(app.language);
+    let prefix_width = display_width(prefix.as_str());
+    let input_width = area_width.saturating_sub(prefix_width);
+    let (visible_input, start_char) = visible_search_input(app.input.as_str(), input_width);
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    if focused {
+        let cursor = app.device_search_cursor.min(app.input.chars().count());
+        let ellipsis_chars = if start_char > 0 { 3 } else { 0 };
+        let visible_cursor = cursor
+            .saturating_sub(start_char)
+            .saturating_add(ellipsis_chars)
+            .min(visible_input.chars().count());
+        let cursor_byte = char_cursor_byte_index(visible_input.as_str(), visible_cursor);
+        let before = &visible_input[..cursor_byte];
+        spans.push(Span::raw(before.to_string()));
+        if let Some(ch) = visible_input[cursor_byte..].chars().next() {
+            let ch_len = ch.len_utf8();
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().bg(Color::Green).fg(Color::Black),
+            ));
+            spans.push(Span::raw(visible_input[cursor_byte + ch_len..].to_string()));
+        } else {
+            spans.push(Span::styled(
+                " ",
+                Style::default().bg(Color::Green).fg(Color::Black),
+            ));
+        }
+    } else {
+        spans.push(Span::raw(visible_input));
+    }
+    Line::from(spans)
+}
+
+fn render_search_bar(
+    frame: &mut ratatui::Frame<'_>,
+    app: &TuiApp,
+    search_area: Rect,
+    border_area: Rect,
+) {
+    frame.render_widget(
+        Paragraph::new(search_line(app, search_area.width)),
+        search_area,
+    );
+    frame.render_widget(
+        Block::default().borders(ratatui::widgets::Borders::BOTTOM),
+        border_area,
+    );
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
     match &app.boot_state {
         BootState::Loading => {
@@ -1363,7 +2010,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         .map(|name| Line::from(Span::styled(*name, Style::default().fg(Color::Blue))))
         .collect::<Vec<_>>();
     let tabs = Tabs::new(titles)
-        .block(Block::default().borders(all_borders()).title("MI Tui"))
+        .block(Block::default().borders(all_borders()))
         .highlight_style(
             Style::default()
                 .fg(Color::Green)
@@ -1396,19 +2043,20 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
 
     match app.active_tab {
         0 => {
-            let selected = if app.accounts.is_empty() {
-                None
-            } else {
-                Some(app.account_index.min(app.accounts.len().saturating_sub(1)))
-            };
+            app.ensure_account_selection_visible();
+            let filtered_indices = app.filtered_account_indices();
+            let selected = filtered_indices
+                .iter()
+                .position(|index| *index == app.account_index);
             app.account_list_state.select(selected);
+            let [search_area, search_border_area, rest_area] = searchable_main_layout(content_area);
             let [header_area, list_area] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
-                .areas(content_area);
-            let rows = app
-                .accounts
+                .areas(rest_area);
+            let rows = filtered_indices
                 .iter()
+                .filter_map(|index| app.accounts.get(*index))
                 .map(|account| {
                     account_page::account_list_row(
                         account,
@@ -1429,12 +2077,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                     let mut item = ListItem::new(
                         account_page::format_account_list_item_with_columns(row, columns),
                     );
-                    if idx == app.account_index {
+                    if selected == Some(idx) {
                         item = item.style(active_row_style());
                     }
                     item
                 })
                 .collect::<Vec<_>>();
+            render_search_bar(frame, app, search_area, search_border_area);
             frame.render_widget(
                 Paragraph::new(account_page::format_account_list_header_line_with_columns(
                     columns,
@@ -1446,20 +2095,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
         }
         1 => {
             app.hydrate_devices_from_cache_if_empty();
+            app.ensure_device_selection_visible();
             let device_categories = read_device_categories(app.home_dir.as_path(), app.language);
-            let selected = if app.devices.is_empty() {
-                None
-            } else {
-                Some(app.device_index.min(app.devices.len().saturating_sub(1)))
-            };
+            let filtered_indices = app.filtered_device_indices_with_categories(&device_categories);
+            let selected = filtered_indices
+                .iter()
+                .position(|index| *index == app.device_index);
             app.device_list_state.select(selected);
+            let [search_area, search_border_area, rest_area] = searchable_main_layout(content_area);
             let [header_area, list_area] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
-                .areas(content_area);
-            let rows = app
-                .devices
+                .areas(rest_area);
+            let rows = filtered_indices
                 .iter()
+                .filter_map(|index| app.devices.get(*index))
                 .map(|device| {
                     let account_label = app.device_account_label(device);
                     let category = device_categories
@@ -1482,12 +2132,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 .map(|(idx, row)| {
                     let mut item =
                         ListItem::new(format_device_list_item_with_columns(row, columns));
-                    if idx == app.device_index {
+                    if selected == Some(idx) {
                         item = item.style(active_row_style());
                     }
                     item
                 })
                 .collect::<Vec<_>>();
+            render_search_bar(frame, app, search_area, search_border_area);
             frame.render_widget(
                 Paragraph::new(format_device_list_header_line_with_columns(
                     columns,
@@ -1518,6 +2169,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             };
             let rows = [
                 lang_label.to_string(),
+                auto_subscribe_device_status_label(app.language, app.auto_subscribe_device_status),
                 lang_str(
                     app.language,
                     "重置设备缓存（重新同步设备）",
@@ -1546,28 +2198,73 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             frame.render_stateful_widget(List::new(items), list_area, &mut app.device_list_state);
         }
         _ => {
-            let lines = logs_lines_for_display(app)
+            let [search_area, search_border_area, list_area] = searchable_main_layout(content_area);
+            let (visual_lines, log_text_area, scrollbar_area) =
+                log_visual_lines_and_areas(app, list_area);
+            remember_log_text_width(log_text_area.width);
+            let line_count = visual_lines.len();
+            app.clamp_log_scroll_offset_for_view(line_count, log_text_area.height);
+            let offset = log_scroll_offset_for_view(app, line_count, log_text_area.height);
+            let visible_lines = visual_lines
                 .into_iter()
+                .skip(offset)
+                .take(log_text_area.height as usize)
+                .collect::<Vec<_>>();
+            let selected_text = selected_surface();
+            let selected_text = if selected_text
+                .as_ref()
+                .is_some_and(|active| log_selection_is_stale(active, log_text_area, &visible_lines))
+            {
+                clear_selection_state();
+                None
+            } else {
+                selected_text
+            };
+            let lines = visible_lines
+                .iter()
                 .enumerate()
                 .map(|(idx, line)| {
                     if let Some(active) = selected_text.as_ref() {
                         if active.snapshot.surface == SelectionSurface::Logs {
                             if let Some((mut start, mut end)) = selected_cols_for_line(active, idx)
                             {
-                                let width = display_width(&line);
+                                let width = display_width(line);
                                 if end == u16::MAX {
                                     end = width;
                                 }
                                 start = start.min(width);
                                 end = end.min(width);
-                                return ListItem::new(highlight_line_range(&line, start, end));
+                                return highlight_line_range(line, start, end);
                             }
                         }
                     }
-                    ListItem::new(line)
+                    highlight_log_search_matches(line, app.search_query())
                 })
                 .collect::<Vec<_>>();
-            frame.render_widget(List::new(lines).block(Block::default()), content_area);
+            render_search_bar(frame, app, search_area, search_border_area);
+            frame.render_widget(
+                TuiLoggerWidget::default()
+                    .output_timestamp(None)
+                    .output_level(None)
+                    .output_target(false)
+                    .output_file(false)
+                    .output_line(false),
+                list_area,
+            );
+            frame.render_widget(Paragraph::new(Text::from(lines)), log_text_area);
+            if let Some(scrollbar_area) = scrollbar_area {
+                if let Some(geometry) =
+                    log_scrollbar_geometry(line_count, scrollbar_area.height, app.log_scroll_offset)
+                {
+                    frame.render_widget(
+                        Paragraph::new(Text::from(log_scrollbar_lines(
+                            geometry,
+                            scrollbar_area.height,
+                        ))),
+                        scrollbar_area,
+                    );
+                }
+            }
         }
     }
 
@@ -1741,6 +2438,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             SelectionSurface::PropEditor
                 | SelectionSurface::PushMessageInput
                 | SelectionSurface::PushMessageCommand
+                | SelectionSurface::SearchInput
         ) {
             apply_selection_highlight_to_area(
                 frame.buffer_mut(),
@@ -1829,8 +2527,12 @@ struct TuiApp {
     device_index: usize,
     logs: VecDeque<String>,
     active_tab: usize,
+    log_scroll_offset: usize,
     input_mode: bool,
     input: String,
+    device_search_cursor: usize,
+    search_inputs: [String; 3],
+    search_cursors: [usize; 3],
     prop_dialog: Option<BoolDialog>,
     account_action_dialog: Option<AccountActionDialog>,
     account_list_state: ListState,
@@ -1854,6 +2556,7 @@ struct TuiApp {
     bootstrap_rx: Receiver<BootstrapMessage>,
     property_cache: Arc<PropertyCache>,
     language: Language,
+    auto_subscribe_device_status: bool,
     settings_selected: usize,
 }
 
@@ -1887,8 +2590,12 @@ impl TuiApp {
             device_index: 0,
             logs: VecDeque::new(),
             active_tab: 0,
+            log_scroll_offset: 0,
             input_mode: false,
             input: String::new(),
+            device_search_cursor: 0,
+            search_inputs: Default::default(),
+            search_cursors: [0; 3],
             prop_dialog: None,
             account_action_dialog: None,
             account_list_state: ListState::default(),
@@ -1912,6 +2619,7 @@ impl TuiApp {
             bootstrap_rx,
             property_cache,
             language: settings.language,
+            auto_subscribe_device_status: settings.auto_subscribe_device_status,
             settings_selected: 0,
         })
     }
@@ -1922,6 +2630,12 @@ impl TuiApp {
 
     fn start_background_sync(&mut self) {
         self.start_bootstrap_internal(false);
+    }
+
+    fn start_manual_sync(&mut self) {
+        self.log("> sync");
+        self.start_background_sync();
+        self.log("sync started in background");
     }
 
     fn start_bootstrap_internal(&mut self, show_loading_splash: bool) {
@@ -2167,9 +2881,41 @@ impl TuiApp {
     }
 
     fn log(&mut self, message: impl Into<String>) {
-        self.logs.push_back(message.into());
+        let entry = encode_log_entry(message.into());
+        let anchor_added_rows = if self.log_scroll_offset > 0 || log_selection_is_active() {
+            log_entry_visual_row_count_for_anchor(&entry)
+        } else {
+            0
+        };
+        self.logs.push_back(entry);
         while self.logs.len() > LOG_MAX {
             self.logs.pop_front();
+        }
+        if anchor_added_rows > 0 {
+            self.log_scroll_offset = self.log_scroll_offset.saturating_add(anchor_added_rows);
+        }
+        self.clamp_log_scroll_offset_to_content();
+    }
+
+    fn clamp_log_scroll_offset_to_content(&mut self) {
+        self.log_scroll_offset = self.log_scroll_offset.min(LOG_MAX.saturating_sub(1));
+    }
+
+    fn clamp_log_scroll_offset_for_view(&mut self, line_count: usize, viewport_height: u16) {
+        self.log_scroll_offset = log_scroll_offset_for_view(self, line_count, viewport_height);
+    }
+
+    fn scroll_logs_up(&mut self, amount: usize) {
+        self.log_scroll_offset = self.log_scroll_offset.saturating_sub(amount);
+    }
+
+    fn scroll_logs_down(&mut self, amount: usize) {
+        self.log_scroll_offset = self.log_scroll_offset.saturating_add(amount);
+    }
+
+    fn reset_log_scroll_if_active(&mut self) {
+        if self.active_tab == 2 {
+            self.log_scroll_offset = 0;
         }
     }
 
@@ -2178,6 +2924,14 @@ impl TuiApp {
     }
 
     fn refresh_cloud_mips_listeners(&mut self) {
+        if !self.auto_subscribe_device_status {
+            self.log("cloud MIPS not started: auto subscribe disabled");
+            if let Ok(mut runtime) = cloud_mips_runtime().lock() {
+                *runtime = None;
+            }
+            return;
+        }
+
         if cloud_mips_disabled() {
             if cloud_mips_disabled_by_user() {
                 self.log("cloud MIPS not started: disabled by MIT_DISABLE_CLOUD_MIPS");
@@ -2601,7 +3355,207 @@ impl TuiApp {
     }
 
     fn selected_device_did(&self) -> Option<&str> {
+        if self.active_tab == 1 && !self.selected_device_is_visible() {
+            return None;
+        }
         self.devices.get(self.device_index).map(|d| d.did.as_str())
+    }
+
+    fn search_is_active(&self) -> bool {
+        self.input_mode && active_tab_has_search(self.active_tab)
+    }
+
+    fn search_query(&self) -> &str {
+        self.input.trim()
+    }
+
+    fn save_active_search_state(&mut self) {
+        if let Some(slot) = search_tab_slot(self.active_tab) {
+            self.search_inputs[slot] = self.input.clone();
+            self.search_cursors[slot] = self.device_search_cursor.min(self.input.chars().count());
+        }
+    }
+
+    fn load_active_search_state(&mut self) {
+        if let Some(slot) = search_tab_slot(self.active_tab) {
+            self.input = self.search_inputs[slot].clone();
+            self.device_search_cursor = self.search_cursors[slot].min(self.input.chars().count());
+        } else {
+            self.input.clear();
+            self.device_search_cursor = 0;
+        }
+    }
+
+    fn focus_search(&mut self) {
+        self.input_mode = true;
+        self.device_search_cursor = self.device_search_cursor.min(self.input.chars().count());
+        self.save_active_search_state();
+        self.reset_log_scroll_if_active();
+        self.ensure_search_selection_visible();
+    }
+
+    fn blur_search(&mut self) {
+        self.save_active_search_state();
+        self.input_mode = false;
+    }
+
+    fn search_insert(&mut self, ch: char) {
+        let cursor = self.device_search_cursor.min(self.input.chars().count());
+        let index = char_cursor_byte_index(self.input.as_str(), cursor);
+        self.input.insert(index, ch);
+        self.device_search_cursor = cursor.saturating_add(1);
+        self.save_active_search_state();
+        self.reset_log_scroll_if_active();
+        self.ensure_search_selection_visible();
+    }
+
+    fn search_backspace(&mut self) {
+        let cursor = self.device_search_cursor.min(self.input.chars().count());
+        if cursor == 0 {
+            return;
+        }
+        let start = char_cursor_byte_index(self.input.as_str(), cursor - 1);
+        let end = char_cursor_byte_index(self.input.as_str(), cursor);
+        self.input.replace_range(start..end, "");
+        self.device_search_cursor = cursor - 1;
+        self.save_active_search_state();
+        self.reset_log_scroll_if_active();
+        self.ensure_search_selection_visible();
+    }
+
+    fn search_move_cursor_left(&mut self) {
+        self.device_search_cursor = self.device_search_cursor.saturating_sub(1);
+        self.save_active_search_state();
+    }
+
+    fn search_move_cursor_right(&mut self) {
+        self.device_search_cursor = (self.device_search_cursor + 1).min(self.input.chars().count());
+        self.save_active_search_state();
+    }
+
+    fn ensure_search_selection_visible(&mut self) {
+        match self.active_tab {
+            0 => self.ensure_account_selection_visible(),
+            1 => self.ensure_device_selection_visible(),
+            _ => {}
+        }
+    }
+
+    fn account_matches_search(&self, account: &AuthAccount, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let query = query.to_lowercase();
+        let row = account_page::account_list_row(
+            account,
+            self.offline_account_uids
+                .contains(account.user.uid.as_str()),
+            self.language,
+        );
+        let label = account_page::format_account_label(account);
+        [
+            row.region.as_str(),
+            row.nickname.as_str(),
+            row.uid.as_str(),
+            row.status.as_str(),
+            label.as_str(),
+        ]
+        .iter()
+        .any(|value| value.to_lowercase().contains(query.as_str()))
+    }
+
+    fn filtered_account_indices(&self) -> Vec<usize> {
+        let query = self.search_query();
+        self.accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                self.account_matches_search(account, query).then_some(index)
+            })
+            .collect()
+    }
+
+    fn selected_account_is_visible(&self) -> bool {
+        self.filtered_account_indices()
+            .contains(&self.account_index)
+    }
+
+    fn ensure_account_selection_visible(&mut self) {
+        let indices = self.filtered_account_indices();
+        if indices.is_empty() {
+            self.account_index = 0;
+            self.account_list_state.select(None);
+            return;
+        }
+        if !indices.contains(&self.account_index) {
+            self.account_index = indices[0];
+        }
+    }
+
+    fn open_selected_visible_account(&mut self) -> Result<()> {
+        if self.selected_account_is_visible() {
+            account_page::open_account_action_dialog(self)?;
+        }
+        Ok(())
+    }
+
+    fn open_selected_visible_device(&mut self) {
+        if !self.selected_device_is_visible() {
+            return;
+        }
+        if let Err(error) = self.open_prop_dialog() {
+            account_page::open_offline_prop_dialog_for_current(self, &error);
+        }
+    }
+
+    fn device_matches_search(&self, device: &Device, category: &str, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let query = query.to_lowercase();
+        [device.room_name.as_str(), device.name.as_str(), category]
+            .iter()
+            .any(|value| value.to_lowercase().contains(query.as_str()))
+    }
+
+    fn filtered_device_indices(&self) -> Vec<usize> {
+        let categories = read_device_categories(self.home_dir.as_path(), self.language);
+        self.filtered_device_indices_with_categories(&categories)
+    }
+
+    fn filtered_device_indices_with_categories(
+        &self,
+        categories: &HashMap<String, String>,
+    ) -> Vec<usize> {
+        let query = self.search_query();
+        self.devices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, device)| {
+                let category = categories
+                    .get(device.model.as_str())
+                    .map(String::as_str)
+                    .unwrap_or("-");
+                self.device_matches_search(device, category, query)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    fn selected_device_is_visible(&self) -> bool {
+        self.filtered_device_indices().contains(&self.device_index)
+    }
+
+    fn ensure_device_selection_visible(&mut self) {
+        let indices = self.filtered_device_indices();
+        if indices.is_empty() {
+            self.device_index = 0;
+            self.device_list_state.select(None);
+            return;
+        }
+        if !indices.contains(&self.device_index) {
+            self.device_index = indices[0];
+        }
     }
 
     fn device_account_label(&self, device: &Device) -> String {
@@ -2652,9 +3606,17 @@ impl TuiApp {
     fn selected_settings_action(&self) -> SettingsAction {
         match self.settings_selected_index() {
             0 => SettingsAction::ToggleLanguage,
-            1 => SettingsAction::ClearCacheKeepAuth,
+            1 => SettingsAction::ToggleAutoSubscribeDeviceStatus,
+            2 => SettingsAction::ClearCacheKeepAuth,
             _ => SettingsAction::ResetAll,
         }
+    }
+
+    fn save_user_settings(&self) -> Result<()> {
+        save_settings(&UserSettings {
+            language: self.language,
+            auto_subscribe_device_status: self.auto_subscribe_device_status,
+        })
     }
 
     fn execute_settings_action(&mut self, action: SettingsAction) -> Result<()> {
@@ -2666,9 +3628,13 @@ impl TuiApp {
                     Language::Chinese => Language::English,
                     Language::English => Language::Chinese,
                 };
-                let _ = save_settings(&UserSettings {
-                    language: self.language,
-                });
+                let _ = self.save_user_settings();
+                Ok(())
+            }
+            SettingsAction::ToggleAutoSubscribeDeviceStatus => {
+                self.auto_subscribe_device_status = !self.auto_subscribe_device_status;
+                let _ = self.save_user_settings();
+                self.refresh_cloud_mips_listeners();
                 Ok(())
             }
         }
@@ -2740,7 +3706,9 @@ impl TuiApp {
     fn execute_selected_settings_action(&mut self) -> Result<()> {
         let action = self.selected_settings_action();
         match action {
-            SettingsAction::ToggleLanguage => self.execute_settings_action(action),
+            SettingsAction::ToggleLanguage | SettingsAction::ToggleAutoSubscribeDeviceStatus => {
+                self.execute_settings_action(action)
+            }
             _ => {
                 self.account_action_dialog = Some(AccountActionDialog::SettingsConfirm { action });
                 Ok(())
@@ -2748,33 +3716,60 @@ impl TuiApp {
         }
     }
 
+    fn set_active_tab(&mut self, index: usize) {
+        let target = index.min(tab_titles(self.language).len().saturating_sub(1));
+        if target != self.active_tab {
+            self.blur_search();
+            self.active_tab = target;
+            self.load_active_search_state();
+            if target == 2 {
+                self.log_scroll_offset = 0;
+            }
+        } else {
+            self.active_tab = target;
+        }
+    }
+
     fn next_tab(&mut self) {
-        self.active_tab = (self.active_tab + 1) % tab_titles(self.language).len();
+        let next = (self.active_tab + 1) % tab_titles(self.language).len();
+        self.set_active_tab(next);
     }
 
     fn prev_tab(&mut self) {
-        self.active_tab = if self.active_tab == 0 {
+        let previous = if self.active_tab == 0 {
             tab_titles(self.language).len().saturating_sub(1)
         } else {
             self.active_tab - 1
         };
+        self.set_active_tab(previous);
     }
 
     fn next_item(&mut self) {
         match self.active_tab {
             0 => {
-                if !self.accounts.is_empty() {
+                let indices = self.filtered_account_indices();
+                if !indices.is_empty() {
                     // Account switches invalidate pending bootstrap results for the previous account.
                     self.bootstrap_pending = None;
-                    self.account_index = (self.account_index + 1) % self.accounts.len();
+                    let position = indices
+                        .iter()
+                        .position(|index| *index == self.account_index)
+                        .unwrap_or(0);
+                    self.account_index = indices[(position + 1) % indices.len()];
                     self.request_local_transport_refresh(false);
                 }
             }
             1 => {
-                if !self.devices.is_empty() {
-                    self.device_index = (self.device_index + 1) % self.devices.len();
+                let indices = self.filtered_device_indices();
+                if !indices.is_empty() {
+                    let position = indices
+                        .iter()
+                        .position(|index| *index == self.device_index)
+                        .unwrap_or(0);
+                    self.device_index = indices[(position + 1) % indices.len()];
                 }
             }
+            2 => self.scroll_logs_down(1),
             3 => {
                 if SETTINGS_ITEM_COUNT > 0 {
                     self.select_settings_item(
@@ -3761,26 +4756,37 @@ impl TuiApp {
     fn prev_item(&mut self) {
         match self.active_tab {
             0 => {
-                if !self.accounts.is_empty() {
+                let indices = self.filtered_account_indices();
+                if !indices.is_empty() {
                     // Account switches invalidate pending bootstrap results for the previous account.
                     self.bootstrap_pending = None;
-                    self.account_index = if self.account_index == 0 {
-                        self.accounts.len() - 1
+                    let position = indices
+                        .iter()
+                        .position(|index| *index == self.account_index)
+                        .unwrap_or(0);
+                    self.account_index = if position == 0 {
+                        indices[indices.len() - 1]
                     } else {
-                        self.account_index - 1
+                        indices[position - 1]
                     };
                     self.request_local_transport_refresh(false);
                 }
             }
             1 => {
-                if !self.devices.is_empty() {
-                    self.device_index = if self.device_index == 0 {
-                        self.devices.len() - 1
+                let indices = self.filtered_device_indices();
+                if !indices.is_empty() {
+                    let position = indices
+                        .iter()
+                        .position(|index| *index == self.device_index)
+                        .unwrap_or(0);
+                    self.device_index = if position == 0 {
+                        indices[indices.len() - 1]
                     } else {
-                        self.device_index - 1
+                        indices[position - 1]
                     };
                 }
             }
+            2 => self.scroll_logs_up(1),
             3 => {
                 if SETTINGS_ITEM_COUNT > 0 {
                     self.select_settings_item(if self.settings_selected_index() == 0 {
@@ -3792,17 +4798,6 @@ impl TuiApp {
             }
             _ => {}
         }
-    }
-
-    fn refresh_client_for_current_account(
-        &mut self,
-        refresh_local_transport: bool,
-    ) -> Result<crate::mico_api::MicoClient> {
-        let uid = self
-            .current_uid()
-            .ok_or_else(|| anyhow!("不存在可用账号"))?
-            .to_string();
-        self.refresh_client_for_account_uid(uid.as_str(), refresh_local_transport)
     }
 
     fn refresh_client_for_account_uid(
@@ -3838,82 +4833,6 @@ impl TuiApp {
             self.request_local_transport_refresh(false);
         }
         Ok(fresh.client)
-    }
-
-    fn exec_command(&mut self, command_line: &str) -> Result<()> {
-        self.log(format!("> {command_line}"));
-        let command = parse_command(command_line)?;
-        match command {
-            TuiCommand::Sync => {
-                self.start_background_sync();
-                self.log("sync started in background");
-            }
-            TuiCommand::SyncSpecs => {
-                // Foreground spec sync is newer state than any in-flight startup bootstrap.
-                self.bootstrap_pending = None;
-                self.sync_specs()?;
-            }
-            TuiCommand::Get { did, siid, piid } => {
-                let did = self.resolve_did(&did)?;
-                let client = self.refresh_client_for_current_account(true)?;
-                let value = client.get_prop(&did, siid, piid)?;
-                let display = extract_prop_value(&value)
-                    .map(|entry| format_prop_value_for_dialog(&entry))
-                    .unwrap_or_else(|| value.to_string());
-                self.log(format!("get {did} {siid}.{piid} => {display}"));
-            }
-            TuiCommand::Set {
-                did,
-                siid,
-                piid,
-                value,
-            } => {
-                let did = self.resolve_did(&did)?;
-                let client = self.refresh_client_for_current_account(true)?;
-                let result = client.set_prop(&did, siid, piid, value.clone())?;
-                self.log(format!(
-                    "set {did} {siid}.{piid} <= {} => {}",
-                    value, result
-                ));
-            }
-            TuiCommand::Act {
-                did,
-                siid,
-                aiid,
-                values,
-            } => {
-                let did = self.resolve_did(&did)?;
-                let client = self.refresh_client_for_current_account(true)?;
-                let value = client.action(&did, siid, aiid, &values)?;
-                self.log(format!("act {did} {siid}.{aiid} => {}", value));
-            }
-            TuiCommand::Help => {
-                self.log("sync | sync-specs | get <did|@> <siid> <piid> | set <did|@> <siid> <piid> <json> | act <did|@> <siid> <aiid> <json[]> | property dialog: press Enter on device");
-            }
-        }
-        Ok(())
-    }
-
-    fn resolve_did(&self, did: &str) -> Result<String> {
-        if did == "@" {
-            return self
-                .selected_device_did()
-                .map(ToString::to_string)
-                .ok_or_else(|| anyhow!("当前没有选中设备"));
-        }
-        Ok(did.to_string())
-    }
-
-    fn sync_specs(&mut self) -> Result<()> {
-        if self.devices.is_empty() {
-            self.log("no devices loaded, use sync first");
-            return Ok(());
-        }
-        let unique_models = unique_device_models(&self.devices);
-        for line in sync_specs_for_models(&self.home_dir, unique_models.as_slice()) {
-            self.log(line);
-        }
-        Ok(())
     }
 }
 
@@ -3987,95 +4906,6 @@ struct CachedDevicesPayload {
     devices: Vec<Device>,
     #[serde(default)]
     categories: HashMap<String, String>,
-}
-
-#[derive(Debug, PartialEq)]
-enum TuiCommand {
-    Sync,
-    SyncSpecs,
-    Get {
-        did: String,
-        siid: i64,
-        piid: i64,
-    },
-    Set {
-        did: String,
-        siid: i64,
-        piid: i64,
-        value: Value,
-    },
-    Act {
-        did: String,
-        siid: i64,
-        aiid: i64,
-        values: Vec<Value>,
-    },
-    Help,
-}
-
-fn parse_i64(text: &str, field: &str) -> Result<i64> {
-    text.parse::<i64>()
-        .map_err(|_| anyhow!("{field} 必须是整数: {text}"))
-}
-
-fn parse_command(line: &str) -> Result<TuiCommand> {
-    let mut parts = line.split_whitespace();
-    let command = parts.next().unwrap_or_default();
-
-    match command {
-        "sync" => Ok(TuiCommand::Sync),
-        "sync-specs" => Ok(TuiCommand::SyncSpecs),
-        "help" => Ok(TuiCommand::Help),
-        "get" => {
-            let did = parts
-                .next()
-                .ok_or_else(|| anyhow!("get 需要 did|@ siid piid"))?
-                .to_string();
-            let siid = parse_i64(parts.next().ok_or_else(|| anyhow!("缺少 siid"))?, "siid")?;
-            let piid = parse_i64(parts.next().ok_or_else(|| anyhow!("缺少 piid"))?, "piid")?;
-            Ok(TuiCommand::Get { did, siid, piid })
-        }
-        "set" => {
-            let did = parts
-                .next()
-                .ok_or_else(|| anyhow!("set 需要 did|@ siid piid value"))?
-                .to_string();
-            let siid = parse_i64(parts.next().ok_or_else(|| anyhow!("缺少 siid"))?, "siid")?;
-            let piid = parse_i64(parts.next().ok_or_else(|| anyhow!("缺少 piid"))?, "piid")?;
-            let raw = parts.collect::<Vec<_>>().join(" ");
-            if raw.trim().is_empty() {
-                bail!("缺少 value，示例：set @ 2 1 true");
-            }
-            let value = serde_json::from_str::<Value>(&raw)
-                .map_err(|error| anyhow!("set 的 value 必须是合法 JSON: {error}"))?;
-            Ok(TuiCommand::Set {
-                did,
-                siid,
-                piid,
-                value,
-            })
-        }
-        "act" => {
-            let did = parts
-                .next()
-                .ok_or_else(|| anyhow!("act 需要 did|@ siid aiid values"))?
-                .to_string();
-            let siid = parse_i64(parts.next().ok_or_else(|| anyhow!("缺少 siid"))?, "siid")?;
-            let aiid = parse_i64(parts.next().ok_or_else(|| anyhow!("缺少 aiid"))?, "aiid")?;
-            let raw = parts.collect::<Vec<_>>().join(" ");
-            let values = match serde_json::from_str::<Value>(&raw)? {
-                Value::Array(values) => values,
-                _ => bail!("act 的 values 必须是 JSON 数组"),
-            };
-            Ok(TuiCommand::Act {
-                did,
-                siid,
-                aiid,
-                values,
-            })
-        }
-        _ => bail!("未知命令: {command}"),
-    }
 }
 
 pub(crate) fn extract_auth_url_from_line(line: &str) -> Option<String> {
@@ -4264,7 +5094,7 @@ fn cache_devices_for_account(
         devices: devices_by_uid,
         categories: categories_by_uid,
     })?;
-    fs::write(&path, format!("{}\n", text))?;
+    write_private_text_file(&path, &format!("{}\n", text))?;
     Ok(())
 }
 

@@ -93,3 +93,24 @@ fn storage_normalization_matches_previous_js_behavior() {
     assert!(storage::get_accounts_dir().ends_with(".mit/accounts"));
     assert!(storage::get_account_dir("1001").ends_with(".mit/accounts/1001"));
 }
+
+#[test]
+fn user_settings_default_auto_subscribe_device_status_on() {
+    let defaults = storage::UserSettings::default();
+    assert!(defaults.auto_subscribe_device_status);
+
+    let migrated: storage::UserSettings = serde_json::from_value(json!({
+        "language": "english"
+    }))
+    .unwrap();
+    assert_eq!(migrated.language, storage::Language::English);
+    assert!(migrated.auto_subscribe_device_status);
+
+    let opted_out: storage::UserSettings = serde_json::from_value(json!({
+        "language": "chinese",
+        "autoSubscribeDeviceStatus": false
+    }))
+    .unwrap();
+    assert_eq!(opted_out.language, storage::Language::Chinese);
+    assert!(!opted_out.auto_subscribe_device_status);
+}
