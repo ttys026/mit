@@ -97,7 +97,7 @@ pub fn sync_model_spec(home: &Path, model: &str) -> Result<PathBuf> {
     let spec_type = resolve_spec_type_from_instances(model, &instances)?;
 
     // Prime template index cache; current sync path doesn't consume it directly yet.
-    let _template = load_or_fetch_cached_source(
+    load_or_fetch_cached_source(
         home,
         "template_list_device.json",
         &template_url,
