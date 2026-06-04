@@ -64,6 +64,7 @@ const LOG_SCROLLBAR_THUMB: &str = "█";
 const LOG_SCROLLBAR_TRACK: &str = "║";
 const LOG_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
     format_description!("[hour]:[minute]:[second]");
+const CLOUD_MIPS_RESPONSE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 const FOOTER_COPY_LOG_PREFIX: &str = "__footer_copied_at=";
 const FOOTER_COPY_BADGE_TEXT: &str = " [已复制]";
 const CACHE_ACCOUNT_PREFIX: &str = "cache-account:";
@@ -132,6 +133,9 @@ struct CloudMipsRuntime {
     key: String,
     _handles: Vec<CloudMipsHandle>,
     rx: Receiver<CloudMipsStatus>,
+    last_mqtt_response_at: Option<Instant>,
+    last_ping_req_at: Option<Instant>,
+    last_ping_resp_at: Option<Instant>,
 }
 
 static CLOUD_MIPS_RUNTIME: OnceLock<Mutex<Option<CloudMipsRuntime>>> = OnceLock::new();
@@ -142,6 +146,33 @@ thread_local! {
 
 fn cloud_mips_runtime() -> &'static Mutex<Option<CloudMipsRuntime>> {
     CLOUD_MIPS_RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+fn update_cloud_mips_runtime_liveness(
+    runtime: &mut CloudMipsRuntime,
+    status: &CloudMipsStatus,
+    now: Instant,
+) {
+    match status {
+        CloudMipsStatus::MessageReceived { .. } | CloudMipsStatus::PropertyApplied { .. } => {
+            runtime.last_mqtt_response_at = Some(now);
+        }
+        CloudMipsStatus::Started { .. } => {}
+        CloudMipsStatus::EventReceived { direction, summary } => {
+            if direction == "outgoing" && summary.contains("PingReq") {
+                runtime.last_ping_req_at = Some(now);
+            }
+            if direction == "incoming" {
+                runtime.last_mqtt_response_at = Some(now);
+                if summary.contains("PingResp") {
+                    runtime.last_ping_resp_at = Some(now);
+                }
+            }
+        }
+        CloudMipsStatus::IgnoredMessage { .. }
+        | CloudMipsStatus::Error { .. }
+        | CloudMipsStatus::Stopped => {}
+    }
 }
 
 pub(in crate::tui) fn lang_str(lang: Language, zh: &'static str, en: &'static str) -> &'static str {
@@ -366,6 +397,7 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
             _ => Ok(false),
         };
     }
+    app.check_cloud_mips_stale_after_operation();
 
     if app.prop_dialog.is_some() {
         app.normalize_prop_dialog_tab_state();
@@ -425,7 +457,6 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
             KeyCode::BackTab | KeyCode::Left => app.switch_prop_dialog_tab(false),
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 app.request_prop_dialog_refresh();
-                app.last_bool_refresh = Instant::now();
             }
             KeyCode::Enter | KeyCode::Char(' ') => app.activate_selected_prop(),
             KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -540,6 +571,9 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
         KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
             copy_last_selection(app);
         }
+        KeyCode::Char(ch) if app.active_tab == 2 && ch.eq_ignore_ascii_case(&'c') => {
+            app.clear_logs();
+        }
         KeyCode::Char('A') | KeyCode::Char('a') => account_page::start_add_account_auth_flow(app)?,
         KeyCode::Up => app.prev_item(),
         KeyCode::Down => app.next_item(),
@@ -635,6 +669,9 @@ fn handle_mouse(
     let scroll_down = matches!(mouse.kind, MouseEventKind::ScrollDown);
     if !left_down && !left_drag && !left_up && !scroll_up && !scroll_down {
         return Ok(());
+    }
+    if left_down || left_up || scroll_up || scroll_down {
+        app.check_cloud_mips_stale_after_operation();
     }
     if left_down && app.search_is_active() {
         let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
@@ -1470,6 +1507,7 @@ enum FooterOperation {
     Back,
     AddAccount,
     Copy,
+    ClearLogs,
 }
 
 #[derive(Clone, Debug)]
@@ -1752,10 +1790,16 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
             Some("".to_string()),
         ),
         _ => build_footer_segments(
-            &[(
-                lang_str(lang, "/: 搜索", "/: Search"),
-                FooterOperation::Search,
-            )],
+            &[
+                (
+                    lang_str(lang, "C: 清空", "C: Clear"),
+                    FooterOperation::ClearLogs,
+                ),
+                (
+                    lang_str(lang, "/: 搜索", "/: Search"),
+                    FooterOperation::Search,
+                ),
+            ],
             Some("".to_string()),
         ),
     }
@@ -1813,6 +1857,13 @@ fn execute_footer_operation(app: &mut TuiApp, operation: FooterOperation) -> Res
         }
         FooterOperation::Copy => {
             copy_reauth_auth_url(app);
+            Ok(())
+        }
+        FooterOperation::ClearLogs => {
+            let _ = handle_key(
+                app,
+                crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            )?;
             Ok(())
         }
     }
@@ -2537,7 +2588,6 @@ struct TuiApp {
     account_action_dialog: Option<AccountActionDialog>,
     account_list_state: ListState,
     device_list_state: ListState,
-    last_bool_refresh: Instant,
     local_transport_fetching: bool,
     local_transport_refresh_generation: u64,
     local_transport_refresh_device_id: Option<String>,
@@ -2600,7 +2650,6 @@ impl TuiApp {
             account_action_dialog: None,
             account_list_state: ListState::default(),
             device_list_state: ListState::default(),
-            last_bool_refresh: Instant::now(),
             local_transport_fetching: true,
             local_transport_refresh_generation: 0,
             local_transport_refresh_device_id: Some("device-a".to_string()),
@@ -2897,6 +2946,14 @@ impl TuiApp {
         self.clamp_log_scroll_offset_to_content();
     }
 
+    fn clear_logs(&mut self) {
+        self.logs.clear();
+        self.log_scroll_offset = 0;
+        if log_selection_is_active() {
+            clear_selection_state();
+        }
+    }
+
     fn clamp_log_scroll_offset_to_content(&mut self) {
         self.log_scroll_offset = self.log_scroll_offset.min(LOG_MAX.saturating_sub(1));
     }
@@ -2921,6 +2978,77 @@ impl TuiApp {
 
     fn current_account(&self) -> Option<&AuthAccount> {
         self.accounts.get(self.account_index)
+    }
+
+    fn check_cloud_mips_stale_after_operation(&mut self) {
+        if !self.auto_subscribe_device_status || cloud_mips_disabled() {
+            return;
+        }
+        let now = Instant::now();
+        let snapshot = {
+            let Ok(runtime) = cloud_mips_runtime().lock() else {
+                self.log("cloud MIPS runtime lock poisoned");
+                return;
+            };
+            runtime.as_ref().map(|runtime| {
+                (
+                    runtime.last_mqtt_response_at,
+                    runtime.last_ping_req_at,
+                    runtime.last_ping_resp_at,
+                )
+            })
+        };
+        let Some((last_mqtt_response_at, last_ping_req_at, last_ping_resp_at)) = snapshot else {
+            self.refresh_cloud_mips_listeners();
+            self.request_prop_dialog_refresh_allow_editing();
+            return;
+        };
+
+        let latest_response_at = match (last_mqtt_response_at, last_ping_resp_at) {
+            (Some(response_at), Some(ping_resp_at)) => Some(response_at.max(ping_resp_at)),
+            (Some(response_at), None) => Some(response_at),
+            (None, Some(ping_resp_at)) => Some(ping_resp_at),
+            (None, None) => None,
+        };
+        if let Some(latest_response_at) = latest_response_at {
+            let elapsed = now
+                .checked_duration_since(latest_response_at)
+                .unwrap_or_default();
+            if elapsed <= CLOUD_MIPS_RESPONSE_STALE_THRESHOLD {
+                return;
+            }
+            self.log(format!(
+                "cloud MIPS response stale: last response {}s ago; restarting listeners",
+                elapsed.as_secs()
+            ));
+            self.restart_cloud_mips_listeners();
+            self.request_prop_dialog_refresh_allow_editing();
+            return;
+        }
+
+        if let Some(last_ping_req_at) = last_ping_req_at {
+            let elapsed = now
+                .checked_duration_since(last_ping_req_at)
+                .unwrap_or_default();
+            self.log(format!(
+                "cloud MIPS waiting for PingResp: last PingReq {}s ago",
+                elapsed.as_secs()
+            ));
+            if elapsed > CLOUD_MIPS_RESPONSE_STALE_THRESHOLD {
+                self.restart_cloud_mips_listeners();
+                self.request_prop_dialog_refresh_allow_editing();
+            }
+        }
+    }
+
+    fn restart_cloud_mips_listeners(&mut self) {
+        let Ok(mut runtime) = cloud_mips_runtime().lock() else {
+            self.log("cloud MIPS runtime lock poisoned");
+            return;
+        };
+        *runtime = None;
+        drop(runtime);
+        self.refresh_cloud_mips_listeners();
     }
 
     fn refresh_cloud_mips_listeners(&mut self) {
@@ -3012,6 +3140,9 @@ impl TuiApp {
                 key,
                 _handles: handles,
                 rx,
+                last_mqtt_response_at: None,
+                last_ping_req_at: None,
+                last_ping_resp_at: None,
             });
         }
         drop(runtime);
@@ -3057,7 +3188,12 @@ impl TuiApp {
             let Some(runtime) = runtime.as_mut() else {
                 return;
             };
-            runtime.rx.try_iter().collect::<Vec<_>>()
+            let statuses = runtime.rx.try_iter().collect::<Vec<_>>();
+            let now = Instant::now();
+            for status in &statuses {
+                update_cloud_mips_runtime_liveness(runtime, status, now);
+            }
+            statuses
         };
 
         for status in statuses {
@@ -4573,7 +4709,6 @@ impl TuiApp {
             refreshing: false,
             refresh_rx: None,
         });
-        self.last_bool_refresh = Instant::now();
         self.log(format!(
             "opened property dialog for {} ({})",
             selected.name, selected.did
@@ -4582,12 +4717,20 @@ impl TuiApp {
     }
 
     fn request_prop_dialog_refresh(&mut self) {
+        self.request_prop_dialog_refresh_inner(false);
+    }
+
+    fn request_prop_dialog_refresh_allow_editing(&mut self) {
+        self.request_prop_dialog_refresh_inner(true);
+    }
+
+    fn request_prop_dialog_refresh_inner(&mut self, allow_editing: bool) {
         let (device_did, account, queries) = match &self.prop_dialog {
             Some(dialog)
                 if !dialog.loading
                     && dialog.status.is_none()
                     && !dialog.items.is_empty()
-                    && !dialog.editing
+                    && (allow_editing || !dialog.editing)
                     && !dialog.refreshing =>
             {
                 let Some(account) = self

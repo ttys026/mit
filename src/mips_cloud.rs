@@ -103,7 +103,7 @@ pub fn property_subscription_for(did: &str, property: Option<(i64, i64)>) -> Clo
 }
 
 pub fn parse_property_update(topic: &str, payload: &[u8]) -> Result<PropertyUpdate> {
-    let topic_did = did_from_property_topic(topic).unwrap_or_default();
+    let topic_parts = property_topic_parts(topic);
     let text = std::str::from_utf8(payload).map_err(|error| anyhow!("invalid utf8: {error}"))?;
     let body: Value = serde_json::from_str(text)?;
     let params = body
@@ -111,13 +111,17 @@ pub fn parse_property_update(topic: &str, payload: &[u8]) -> Result<PropertyUpda
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("property update missing params"))?;
 
-    let did = params
+    let payload_did = params
         .get("did")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or(topic_did);
+        .map(ToOwned::to_owned);
+    let did = topic_parts
+        .as_ref()
+        .map(|parts| parts.did.clone())
+        .or(payload_did)
+        .unwrap_or_default();
     if did.trim().is_empty() {
         bail!("property update missing did");
     }
@@ -125,10 +129,12 @@ pub fn parse_property_update(topic: &str, payload: &[u8]) -> Result<PropertyUpda
     let siid = params
         .get("siid")
         .and_then(Value::as_i64)
+        .or_else(|| topic_parts.as_ref().and_then(|parts| parts.siid))
         .ok_or_else(|| anyhow!("property update missing siid"))?;
     let piid = params
         .get("piid")
         .and_then(Value::as_i64)
+        .or_else(|| topic_parts.as_ref().and_then(|parts| parts.piid))
         .ok_or_else(|| anyhow!("property update missing piid"))?;
     let value = params
         .get("value")
@@ -506,16 +512,31 @@ fn sleep_before_reconnect(stop: &AtomicBool) {
     }
 }
 
-fn did_from_property_topic(topic: &str) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PropertyTopicParts {
+    did: String,
+    siid: Option<i64>,
+    piid: Option<i64>,
+}
+
+fn property_topic_parts(topic: &str) -> Option<PropertyTopicParts> {
     let mut parts = topic.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("device"), Some(did), Some("up"), Some("properties_changed"))
             if !did.trim().is_empty() =>
         {
-            Some(did.trim().to_string())
+            Some(PropertyTopicParts {
+                did: did.trim().to_string(),
+                siid: parts.next().and_then(|value| value.parse::<i64>().ok()),
+                piid: parts.next().and_then(|value| value.parse::<i64>().ok()),
+            })
         }
         _ => None,
     }
+}
+
+fn did_from_property_topic(topic: &str) -> Option<String> {
+    property_topic_parts(topic).map(|parts| parts.did)
 }
 
 fn normalized_dids(dids: Vec<String>) -> Vec<String> {

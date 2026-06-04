@@ -8,7 +8,6 @@ use std::io::BufRead;
 use std::io::Read;
 #[cfg(not(test))]
 use std::thread;
-use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 use crate::storage::{get_auth_accounts, save_auth, AuthAccount, Language};
@@ -243,7 +242,6 @@ impl TuiApp {
                 refreshing: false,
                 refresh_rx: None,
             });
-            self.last_bool_refresh = Instant::now();
             self.log(message);
         } else {
             self.log(format!("open property dialog failed: {error}"));

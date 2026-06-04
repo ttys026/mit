@@ -755,7 +755,6 @@ fn draw_accounts_selected_row_uses_reversed_style() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -831,7 +830,6 @@ fn draw_devices_selected_row_uses_reversed_style() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -1508,6 +1506,40 @@ fn logs_tab_slash_focuses_search_and_filters_visible_rows() {
     let text = terminal_text(&terminal);
     assert!(text.contains("beta sync done"), "{text}");
     assert!(!text.contains("alpha boot complete"), "{text}");
+}
+
+#[test]
+fn logs_tab_c_clears_log_buffer_and_scroll_offset() {
+    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
+    app.log_scroll_offset = 7;
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert!(app.logs.is_empty());
+    assert_eq!(app.log_scroll_offset, 0);
+}
+
+#[test]
+fn logs_tab_search_mode_c_keeps_typing_into_query() {
+    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert_eq!(app.search_query(), "c");
+    assert_eq!(app.logs.len(), 2);
 }
 
 #[test]
@@ -2262,7 +2294,6 @@ fn draw_accounts_scrolls_to_keep_active_row_visible() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2330,7 +2361,6 @@ fn draw_devices_scrolls_to_keep_active_row_visible() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2398,7 +2428,6 @@ fn device_viewport_keeps_window_anchor_when_moving_up_from_bottom_item() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2483,7 +2512,6 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2559,7 +2587,6 @@ fn account_action_menu_mouse_wheel_changes_selected_item() {
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2652,7 +2679,6 @@ fn clicking_selected_account_action_executes_it() {
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2730,7 +2756,6 @@ fn push_message_action_opens_input_dialog() {
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2799,7 +2824,6 @@ fn push_message_dialog_shows_cursor_and_moves_with_left_right() {
         }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2884,7 +2908,6 @@ fn push_message_cursor_row_stays_stable_when_typing_first_char() {
         }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -2962,7 +2985,6 @@ fn push_message_dialog_submits_text_for_selected_account_uid() {
         }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3042,7 +3064,6 @@ fn escaping_push_message_dialog_restores_previous_menu_selection() {
         account_action_dialog: Some(AccountActionDialog::Menu { selected: 0 }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3123,7 +3144,6 @@ fn add_account_port_conflict_shows_error_dialog_without_quitting_tui() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3185,7 +3205,6 @@ fn draw_does_not_render_command_bar() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3378,7 +3397,6 @@ fn draw_devices_tab_uses_local_cache_when_device_list_is_empty() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3579,7 +3597,6 @@ fn devices_tab_test_app(devices: Vec<Device>) -> TuiApp {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3659,7 +3676,6 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3952,7 +3968,6 @@ fn accounts_tab_test_app(accounts: Vec<crate::storage::AuthAccount>) -> TuiApp {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -3999,7 +4014,6 @@ fn logs_tab_test_app(logs: Vec<&str>) -> TuiApp {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4046,7 +4060,6 @@ fn test_app_with_prop_dialog(dialog: BoolDialog) -> TuiApp {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4129,7 +4142,6 @@ fn draw_shows_loading_splash_while_boot_loading() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4184,7 +4196,6 @@ fn handle_key_blocks_normal_actions_until_boot_ready() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4292,7 +4303,6 @@ fn opening_prop_dialog_failure_shows_offline_instead_of_quitting() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4411,7 +4421,6 @@ fn opening_prop_dialog_uses_device_account_instead_of_selected_account() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4498,7 +4507,6 @@ fn pressing_j_does_not_move_selection_anymore() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4598,7 +4606,6 @@ fn devices_tab_enter_opens_prop_dialog_and_p_does_not() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4711,7 +4718,6 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4836,7 +4842,6 @@ fn clicking_devices_row_only_changes_active_index() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -4974,7 +4979,6 @@ fn clicking_selected_device_row_opens_dialog() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5108,7 +5112,6 @@ fn device_row_mouse_up_does_not_open_dialog() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5208,7 +5211,6 @@ fn clicking_accounts_row_selects_account() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5292,7 +5294,6 @@ fn mouse_wheel_scroll_changes_active_item() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5422,7 +5423,6 @@ fn mouse_click_is_ignored_while_prop_editing() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5484,7 +5484,6 @@ fn number_shortcuts_switch_tabs() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5571,7 +5570,6 @@ fn devices_tab_r_starts_background_sync() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5638,7 +5636,6 @@ fn devices_tab_s_no_longer_starts_background_sync() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5694,7 +5691,6 @@ fn clicking_top_bar_tabs_switches_active_tab() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5811,7 +5807,6 @@ fn settings_tab_enter_purges_devices_cache_after_single_confirm() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5911,7 +5906,6 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -5986,7 +5980,6 @@ fn settings_tab_shows_auto_subscribe_cache_clear_and_reset_actions() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6100,7 +6093,6 @@ fn clicking_footer_does_not_copy_status_line() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6190,7 +6182,6 @@ fn mouse_selection_state_is_thread_local() {
         }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6249,7 +6240,6 @@ fn mouse_selection_state_is_thread_local() {
             account_action_dialog: None,
             account_list_state: ListState::default(),
             device_list_state: ListState::default(),
-            last_bool_refresh: Instant::now(),
             local_transport_fetching: false,
             local_transport_refresh_generation: 0,
             local_transport_refresh_device_id: None,
@@ -6335,7 +6325,6 @@ fn selected_push_message_textarea_text_uses_selection_background() {
         }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6436,7 +6425,6 @@ fn footer_leaves_blank_rows_above_and_below_status_text() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6494,7 +6482,6 @@ fn dragging_logs_text_autocopies_selection() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6686,7 +6673,6 @@ fn dragging_beyond_last_log_still_copies_all_logs() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6778,7 +6764,6 @@ fn shift_c_recopies_last_mouse_selection() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6877,7 +6862,6 @@ fn plain_click_outside_selected_text_clears_selection() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -6988,7 +6972,6 @@ fn copy_status_badge_uses_chinese_text_and_expires_in_one_second() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7042,7 +7025,6 @@ fn copy_status_badge_uses_blue_style() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7102,7 +7084,6 @@ fn selected_footer_keeps_dim_style() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7182,7 +7163,6 @@ fn footer_copied_badge_is_bold_and_expires_after_one_second() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7260,7 +7240,6 @@ fn footer_text_matches_requested_status_copy() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7363,6 +7342,10 @@ fn footer_text_matches_requested_status_copy() {
         auth_url: "http://127.0.0.1".to_string(),
     });
     assert_eq!(super::footer_text(&app), "C: 复制, Esc: 返回".to_string());
+
+    app.account_action_dialog = None;
+    app.active_tab = 2;
+    assert_eq!(super::footer_text(&app), "C: 清空, /: 搜索");
 }
 
 #[test]
@@ -7398,7 +7381,6 @@ fn clicking_refresh_operation_in_footer_triggers_sync() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7559,7 +7541,6 @@ fn clicking_non_operation_footer_text_has_no_effect() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7631,7 +7612,6 @@ fn start_bootstrap_without_current_account_enters_ready_state() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 5,
         local_transport_refresh_device_id: None,
@@ -7745,7 +7725,6 @@ fn start_bootstrap_uses_cached_devices_immediately_while_syncing_in_background()
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7821,7 +7800,6 @@ fn process_bootstrap_message_marks_app_ready_after_success() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -7945,7 +7923,6 @@ fn process_bootstrap_message_preserves_selected_device_did_when_present() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -8026,7 +8003,6 @@ fn request_local_transport_refresh_skips_account_after_session_warm() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: Some(account.device_id.clone()),
@@ -8093,7 +8069,6 @@ fn request_local_transport_refresh_force_rewarms_same_account() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: Some(account.device_id.clone()),
@@ -8160,7 +8135,6 @@ fn request_local_transport_refresh_force_queues_when_fetching() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: true,
         local_transport_refresh_generation: 7,
         local_transport_refresh_device_id: Some(account.device_id.clone()),
@@ -8247,7 +8221,6 @@ fn request_local_transport_refresh_queues_on_account_switch_while_fetching() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: true,
         local_transport_refresh_generation: 7,
         local_transport_refresh_device_id: Some(account_a.device_id.clone()),
@@ -8315,7 +8288,6 @@ fn process_background_messages_logs_local_transport_refresh_errors() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: true,
         local_transport_refresh_generation: 7,
         local_transport_refresh_device_id: None,
@@ -8389,7 +8361,6 @@ fn process_background_messages_clears_local_transport_refresh_device_id_on_error
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: true,
         local_transport_refresh_generation: 7,
         local_transport_refresh_device_id: Some(account.device_id.clone()),
@@ -8456,7 +8427,6 @@ fn process_auth_flow_completion_closes_reauth_dialog() {
         }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -8519,7 +8489,6 @@ fn failed_auth_flow_shows_port_8000_hint_in_reauth_dialog() {
         }),
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -8633,7 +8602,6 @@ fn prop_dialog_does_not_force_black_popup_background() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -8731,7 +8699,6 @@ fn prop_dialog_refresh_starts_background_worker() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -8829,7 +8796,6 @@ fn prop_dialog_r_key_starts_background_refresh() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -8951,7 +8917,6 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -9084,7 +9049,6 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -9229,7 +9193,6 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -9340,7 +9303,6 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -9440,7 +9402,6 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -9547,7 +9508,6 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -9724,7 +9684,6 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -9855,7 +9814,6 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -10283,6 +10241,16 @@ fn process_cloud_mips_messages_logs_messages_and_errors() {
         summary: "ConnAck".to_string(),
     })
     .unwrap();
+    tx.send(crate::mips_cloud::CloudMipsStatus::EventReceived {
+        direction: "outgoing".to_string(),
+        summary: "PingReq".to_string(),
+    })
+    .unwrap();
+    tx.send(crate::mips_cloud::CloudMipsStatus::EventReceived {
+        direction: "incoming".to_string(),
+        summary: "PingResp(PingResp)".to_string(),
+    })
+    .unwrap();
     tx.send(crate::mips_cloud::CloudMipsStatus::MessageReceived {
         topic: "device/dev-1/up/properties_changed/2/1".to_string(),
         payload_len: 42,
@@ -10305,6 +10273,9 @@ fn process_cloud_mips_messages_logs_messages_and_errors() {
             key: "test-runtime".to_string(),
             _handles: Vec::new(),
             rx,
+            last_mqtt_response_at: None,
+            last_ping_req_at: None,
+            last_ping_resp_at: None,
         });
     }
 
@@ -10316,6 +10287,13 @@ fn process_cloud_mips_messages_logs_messages_and_errors() {
     );
     assert!(logs.contains("cloud MIPS property update: did=dev-1 siid=2 piid=1"));
     assert!(logs.contains("cloud MIPS error: mqtt auth failed"));
+    {
+        let runtime = super::cloud_mips_runtime().lock().unwrap();
+        let runtime = runtime.as_ref().unwrap();
+        assert!(runtime.last_mqtt_response_at.is_some());
+        assert!(runtime.last_ping_req_at.is_some());
+        assert!(runtime.last_ping_resp_at.is_some());
+    }
 
     let mut runtime = super::cloud_mips_runtime().lock().unwrap();
     *runtime = None;
@@ -10389,6 +10367,190 @@ fn refresh_cloud_mips_listeners_skips_when_auto_subscribe_setting_off() {
     let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
     assert!(logs.contains("cloud MIPS not started: auto subscribe disabled"));
 
+    let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+    *runtime = None;
+}
+
+#[test]
+fn stale_keypress_uses_recent_pingresp_as_mqtt_response_timer() {
+    let _guard = env_guard();
+    std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
+    std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
+    let mut app = test_app_with_prop_dialog(BoolDialog {
+        device_did: "dev-1".to_string(),
+        device_name: "speaker".to_string(),
+        account_uid: "1001".to_string(),
+        items: vec![BoolToggleItem {
+            prop: BoolPropItem {
+                siid: 2,
+                piid: 1,
+                name: "Power".to_string(),
+                format: "bool".to_string(),
+                writable: true,
+                value_options: Vec::new(),
+            },
+            value: Value::Bool(true),
+        }],
+        selected: 0,
+        active_tab: BoolDialogTab::Writable,
+        writable_selected: 0,
+        readonly_selected: 0,
+        actions: Vec::new(),
+        actions_selected: 0,
+        writable_list_state: ListState::default(),
+        readonly_list_state: ListState::default(),
+        actions_list_state: ListState::default(),
+        loading: false,
+        loading_rx: None,
+        status: None,
+        editing: true,
+        edit_buffer: "true".to_string(),
+        edit_cursor: 4,
+        edit_error: None,
+        refreshing: false,
+        refresh_rx: None,
+    });
+    let (_tx, rx) = mpsc::channel();
+    let now = Instant::now();
+    {
+        let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+        *runtime = Some(super::CloudMipsRuntime {
+            key: "test-runtime".to_string(),
+            _handles: Vec::new(),
+            rx,
+            last_mqtt_response_at: Some(now - Duration::from_secs(8)),
+            last_ping_req_at: Some(now - Duration::from_secs(9)),
+            last_ping_resp_at: Some(now - Duration::from_secs(8)),
+        });
+    }
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(!logs.contains("cloud MIPS response stale"));
+    assert!(!logs.contains("cloud MIPS waiting for PingResp"));
+    assert!(!logs.contains("heartbeat queued"));
+    assert!(!logs.contains("subscribe probe"));
+    assert!(!app.prop_dialog.as_ref().unwrap().refreshing);
+
+    std::env::remove_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS");
+    let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+    *runtime = None;
+}
+
+#[test]
+fn stale_keypress_skips_heartbeat_when_mips_disabled() {
+    let _guard = env_guard();
+    std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
+    std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
+    let mut app = devices_tab_test_app(vec![test_device(
+        "dev-kitchen",
+        "kitchen plug",
+        "Kitchen",
+        "A(1001)",
+    )]);
+    app.auto_subscribe_device_status = false;
+    let (_tx, rx) = mpsc::channel();
+    let now = Instant::now();
+    {
+        let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+        *runtime = Some(super::CloudMipsRuntime {
+            key: "test-runtime".to_string(),
+            _handles: Vec::new(),
+            rx,
+            last_mqtt_response_at: Some(now - Duration::from_secs(301)),
+            last_ping_req_at: Some(now - Duration::from_secs(301)),
+            last_ping_resp_at: Some(now - Duration::from_secs(301)),
+        });
+    }
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(!logs.contains("cloud MIPS response stale"));
+    assert!(!logs.contains("cloud MIPS waiting for PingResp"));
+
+    std::env::remove_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS");
+    let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+    *runtime = None;
+}
+
+#[test]
+fn stale_keypress_refreshes_open_prop_editor() {
+    let _guard = env_guard();
+    std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
+    std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
+    let mut app = test_app_with_prop_dialog(BoolDialog {
+        device_did: "dev-1".to_string(),
+        device_name: "speaker".to_string(),
+        account_uid: "1001".to_string(),
+        items: vec![BoolToggleItem {
+            prop: BoolPropItem {
+                siid: 2,
+                piid: 1,
+                name: "Power".to_string(),
+                format: "bool".to_string(),
+                writable: true,
+                value_options: Vec::new(),
+            },
+            value: Value::Bool(true),
+        }],
+        selected: 0,
+        active_tab: BoolDialogTab::Writable,
+        writable_selected: 0,
+        readonly_selected: 0,
+        actions: Vec::new(),
+        actions_selected: 0,
+        writable_list_state: ListState::default(),
+        readonly_list_state: ListState::default(),
+        actions_list_state: ListState::default(),
+        loading: false,
+        loading_rx: None,
+        status: None,
+        editing: true,
+        edit_buffer: "true".to_string(),
+        edit_cursor: 4,
+        edit_error: None,
+        refreshing: false,
+        refresh_rx: None,
+    });
+    let (_tx, rx) = mpsc::channel();
+    let now = Instant::now();
+    {
+        let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+        *runtime = Some(super::CloudMipsRuntime {
+            key: "test-runtime".to_string(),
+            _handles: Vec::new(),
+            rx,
+            last_mqtt_response_at: Some(now - Duration::from_secs(301)),
+            last_ping_req_at: Some(now - Duration::from_secs(301)),
+            last_ping_resp_at: Some(now - Duration::from_secs(301)),
+        });
+    }
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert!(dialog.editing);
+    assert!(dialog.refreshing);
+    assert!(dialog.refresh_rx.is_some());
+    assert_eq!(dialog.edit_buffer, "true");
+    let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(logs.contains("cloud MIPS response stale"));
+
+    std::env::remove_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS");
     let mut runtime = super::cloud_mips_runtime().lock().unwrap();
     *runtime = None;
 }
@@ -10591,7 +10753,6 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -10745,7 +10906,6 @@ fn clicking_active_prop_dialog_item_executes_it() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -10875,7 +11035,6 @@ fn prop_dialog_actions_tab_renders_action_items() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -10993,7 +11152,6 @@ fn action_param_edit_supports_tab_and_click_focus_switch() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -11114,7 +11272,6 @@ fn action_param_textarea_row_focus_updates_cursor_and_input() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -11232,7 +11389,6 @@ fn clicking_action_param_textarea_moves_cursor_to_clicked_character() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -11341,7 +11497,6 @@ fn draw_edit_mode_shows_visible_input_cursor() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -11439,7 +11594,6 @@ fn clicking_prop_edit_textarea_moves_cursor_to_clicked_character() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -11555,7 +11709,6 @@ fn action_param_edit_mode_shows_action_title_not_property_title() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -11671,7 +11824,6 @@ fn action_bool_param_uses_selector_editor() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -11947,7 +12099,6 @@ fn action_enum_param_uses_selector_editor() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12065,7 +12216,6 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12279,7 +12429,6 @@ fn action_enum_param_without_readable_prop_still_uses_selector_editor() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12384,7 +12533,6 @@ fn writable_bool_prop_enters_selector_editor_before_execution() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12497,7 +12645,6 @@ fn writable_bool_prop_selector_highlights_current_option_in_green() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12611,7 +12758,6 @@ fn writable_enum_prop_enters_selector_editor_before_execution() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12745,7 +12891,6 @@ fn action_enum_param_selector_highlights_current_option_in_green() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12846,7 +12991,6 @@ fn clicking_writable_bool_prop_selector_option_updates_selection() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -12985,7 +13129,6 @@ fn clicking_action_enum_param_selector_option_updates_selection() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13132,7 +13275,6 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13264,7 +13406,6 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13322,7 +13463,6 @@ fn dragging_selected_text_shows_footer_copied_badge() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13496,7 +13636,6 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13644,7 +13783,6 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13759,7 +13897,6 @@ fn action_param_textarea_grows_height_when_value_wraps() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13869,7 +14006,6 @@ fn prop_edit_mode_moves_cursor_with_left_right() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -13951,7 +14087,6 @@ fn process_bootstrap_message_ignores_stale_results_when_not_pending() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14027,7 +14162,6 @@ fn process_bootstrap_message_ignores_stale_results_for_wrong_generation() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14124,7 +14258,6 @@ fn process_bootstrap_message_applies_refreshed_auth_state() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14210,7 +14343,6 @@ fn process_bootstrap_message_rewarms_local_transport_when_snapshot_missing() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 7,
         local_transport_refresh_device_id: Some(account.device_id.clone()),
@@ -14290,7 +14422,6 @@ fn process_bootstrap_failure_logs_error_and_keeps_tui_ready() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14387,7 +14518,6 @@ fn process_bootstrap_failure_applies_refreshed_auth_state() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14515,7 +14645,6 @@ fn sync_failure_uses_cached_devices_without_quitting() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14599,7 +14728,6 @@ fn sync_command_keeps_ui_ready_while_background_sync_runs() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14682,7 +14810,6 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
@@ -14841,7 +14968,6 @@ fn start_bootstrap_creates_local_credentials_snapshot_without_restart() {
         account_action_dialog: None,
         account_list_state: ListState::default(),
         device_list_state: ListState::default(),
-        last_bool_refresh: Instant::now(),
         local_transport_fetching: false,
         local_transport_refresh_generation: 0,
         local_transport_refresh_device_id: None,
