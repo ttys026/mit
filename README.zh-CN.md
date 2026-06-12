@@ -92,8 +92,10 @@ mit
 mit --help
 
 # ── 账号管理 ────────────────────────────────────────────────
-mit auth login                                   # 浏览器登录
-mit auth login --region cn                       # 指定区域登录
+mit auth login                                   # 先登录小米，再扫码登录米家
+mit auth login --region cn                       # 指定小米登录区域
+mit auth login xiaomi                            # 只登录小米 OAuth
+mit auth login mijia                             # 只登录米家二维码
 mit auth list                                    # 列出已保存的账号
 
 # ── TUI ────────────────────────────────────────────────────

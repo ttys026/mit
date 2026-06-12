@@ -11,10 +11,11 @@ use super::{
     copy_text_to_clipboard, footer_display_text, footer_render_area,
     format_prop_dialog_list_item_line, fullscreen_dialog_inner_area, log_viewer_text_area,
     logs_visible_lines_for_display, note_copy_success, now_epoch_millis,
-    prop_dialog_indices_for_tab, prop_edit_textarea_area, prop_editor_bottom_lines,
-    prop_editor_layout, push_message_cli_preview_line, push_message_command_area,
-    push_message_textarea_area, rendered_textarea_lines, search_plain_line, searchable_main_layout,
-    split_main_layout, tab_titles, AccountActionDialog, BoolDialogTab, TuiApp,
+    operation_records_display_text, prop_dialog_indices_for_tab, prop_edit_textarea_area,
+    prop_editor_bottom_lines, prop_editor_layout, push_message_cli_preview_line,
+    push_message_command_area, push_message_textarea_area, raw_device_tab_text,
+    rendered_textarea_lines, search_plain_line, searchable_main_layout, split_main_layout,
+    tab_titles, AccountActionDialog, PropDialogTab, TuiApp,
 };
 use crate::storage::Language;
 
@@ -425,7 +426,7 @@ pub(crate) fn selection_snapshot_for_mouse(
         if dialog.editing {
             let layout = prop_editor_layout(dialog, inner, app.language);
             let editor_area = layout.editor_area;
-            if dialog.active_tab == BoolDialogTab::Actions {
+            if dialog.active_tab == PropDialogTab::Actions {
                 let rows = action_param_rows_for_dialog(dialog);
                 for row_layout in action_param_row_layouts(dialog, editor_area) {
                     if mouse.row >= row_layout.value_area.y
@@ -518,15 +519,40 @@ pub(crate) fn selection_snapshot_for_mouse(
                 && mouse.column >= list_area.x
                 && mouse.column < list_area.x.saturating_add(list_area.width)
             {
+                if dialog.active_tab == PropDialogTab::Logs {
+                    return Some(SelectionSnapshot {
+                        surface: SelectionSurface::PropDialogList,
+                        area: list_area,
+                        lines: operation_records_display_text(
+                            dialog,
+                            app.language,
+                            app.accounts.as_slice(),
+                        )
+                        .lines()
+                        .map(|line| line.to_string())
+                        .collect(),
+                    });
+                }
+                if dialog.active_tab == PropDialogTab::Statistics {
+                    return Some(SelectionSnapshot {
+                        surface: SelectionSurface::PropDialogList,
+                        area: list_area,
+                        lines: raw_device_tab_text(dialog, dialog.active_tab)
+                            .lines()
+                            .map(|line| line.to_string())
+                            .collect(),
+                    });
+                }
                 let active_indices = prop_dialog_indices_for_tab(dialog, dialog.active_tab);
                 let selected_local = active_indices
                     .iter()
                     .position(|index| *index == dialog.selected)
                     .or_else(|| {
                         let preferred = match dialog.active_tab {
-                            BoolDialogTab::Writable => dialog.writable_selected,
-                            BoolDialogTab::ReadOnly => dialog.readonly_selected,
-                            BoolDialogTab::Actions => dialog.actions_selected,
+                            PropDialogTab::Writable => dialog.writable_selected,
+                            PropDialogTab::ReadOnly => dialog.readonly_selected,
+                            PropDialogTab::Actions => dialog.actions_selected,
+                            PropDialogTab::Logs | PropDialogTab::Statistics => dialog.selected,
                         };
                         active_indices.iter().position(|index| *index == preferred)
                     })

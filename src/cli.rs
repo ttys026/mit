@@ -5,19 +5,20 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command as ProcessCommand;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::mico_api::{is_auth_expired, parse_callback_input, MicoClient};
+use crate::mijia_api::{is_mijia_auth_present, mijia_qr_html, MijiaClient};
 use crate::mips_cloud::{
     config_from_account, property_subscription_for, start_stdout_subscription, CloudMipsHandle,
     CloudMipsSubscription,
 };
 use crate::storage::{
     clear_pending_auth, find_auth_account_by_uid, generate_uuid, get_auth_accounts,
-    get_pending_auth, load_auth, normalize_account, save_auth, set_pending_auth,
-    upsert_auth_account, AuthAccount, AuthState, DEFAULT_REGION,
+    get_pending_auth, load_auth, normalize_account, save_auth, set_pending_auth, sync_xiaomi_auth,
+    upsert_auth_account, AuthAccount, AuthState, MijiaAuth, UserProfile, DEFAULT_REGION,
 };
 #[cfg(not(test))]
 use crate::tui::open_url_in_browser;
@@ -57,7 +58,7 @@ pub struct AuthArgs {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum AuthCommand {
-    #[command(about = "通过浏览器登录小米账号")]
+    #[command(about = "通过浏览器登录小米账号和米家账号")]
     Login(AuthLoginArgs),
     #[command(about = "列出已保存的小米账号")]
     List,
@@ -65,6 +66,22 @@ pub enum AuthCommand {
 
 #[derive(Clone, Debug, Args, Default)]
 pub struct AuthLoginArgs {
+    #[arg(long, value_enum, ignore_case = true, help = "登录区域")]
+    pub region: Option<AuthRegion>,
+    #[command(subcommand)]
+    pub flow: Option<AuthLoginFlow>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum AuthLoginFlow {
+    #[command(about = "只登录小米 OAuth")]
+    Xiaomi(AuthLoginXiaomiArgs),
+    #[command(about = "只登录米家")]
+    Mijia,
+}
+
+#[derive(Clone, Debug, Args, Default)]
+pub struct AuthLoginXiaomiArgs {
     #[arg(long, value_enum, ignore_case = true, help = "登录区域")]
     pub region: Option<AuthRegion>,
 }
@@ -349,6 +366,22 @@ enum OutputMode {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthLoginMode {
+    Combined,
+    XiaomiOnly,
+    MijiaOnly,
+}
+
+const MIJIA_LOGIN_STATUS_PATH: &str = "/mijia_login_status";
+
+type MijiaLoginSharedResult = Arc<Mutex<Option<Result<(AuthState, AuthAccount), String>>>>;
+
+struct MijiaLoginPageState {
+    html: String,
+    result: MijiaLoginSharedResult,
+}
+
 impl OutputMode {
     fn from_json_flag(json: bool) -> Self {
         if json {
@@ -366,6 +399,8 @@ struct AuthAccountOutput {
     nickname: String,
     region: String,
     expires_ts: i64,
+    xiaomi_status: String,
+    mijia_status: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -507,13 +542,16 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 fn print_auth_list(output_mode: OutputMode, auth: &AuthState) -> Result<()> {
-    let accounts = format_auth_accounts(auth)?;
+    let (next_auth, accounts) = format_auth_accounts(auth)?;
+    if &next_auth != auth {
+        save_auth(&next_auth)?;
+    }
     match output_mode {
         OutputMode::Text => {
             println!("账号数：{}", accounts.len());
             for account in &accounts {
                 println!(
-                    "- {}（{}），区域 {}，过期时间 {}",
+                    "- {}（{}），区域 {}，小米 {}，米家 {}",
                     if account.nickname.is_empty() {
                         "-"
                     } else {
@@ -525,7 +563,8 @@ fn print_auth_list(output_mode: OutputMode, auth: &AuthState) -> Result<()> {
                         account.uid.as_str()
                     },
                     account.region,
-                    account.expires_ts
+                    text_login_status(account.xiaomi_status.as_str()),
+                    text_login_status(account.mijia_status.as_str())
                 );
             }
         }
@@ -538,16 +577,62 @@ fn print_auth_list(output_mode: OutputMode, auth: &AuthState) -> Result<()> {
     Ok(())
 }
 
-fn format_auth_accounts(auth: &AuthState) -> Result<Vec<AuthAccountOutput>> {
-    Ok(get_auth_accounts(auth)?
-        .into_iter()
-        .map(|account| AuthAccountOutput {
+fn format_auth_accounts(auth: &AuthState) -> Result<(AuthState, Vec<AuthAccountOutput>)> {
+    let mijia_client = MijiaClient::new()?;
+    let mut next_auth = auth.clone();
+    let mut outputs = Vec::new();
+    for mut account in get_auth_accounts(auth)? {
+        let xiaomi_status = xiaomi_login_status(&account).to_string();
+        let (mijia_status, renewed_mijia) = mijia_login_status(&mijia_client, &account);
+        if let Some(renewed_mijia) = renewed_mijia {
+            account.mijia = Some(renewed_mijia);
+            next_auth = upsert_auth_account(&next_auth, &account)?;
+        }
+        outputs.push(AuthAccountOutput {
             uid: account.user.uid.clone(),
             nickname: account.user.nickname.clone(),
             region: account.region,
             expires_ts: account.expires_ts,
-        })
-        .collect())
+            xiaomi_status,
+            mijia_status: mijia_status.to_string(),
+        });
+    }
+    Ok((next_auth, outputs))
+}
+
+fn xiaomi_login_status(account: &AuthAccount) -> &'static str {
+    if account.access_token.trim().is_empty() && account.refresh_token.trim().is_empty() {
+        "missing"
+    } else if is_auth_expired(account) && account.refresh_token.trim().is_empty() {
+        "expired"
+    } else {
+        "loggedIn"
+    }
+}
+
+fn mijia_login_status(
+    client: &MijiaClient,
+    account: &AuthAccount,
+) -> (&'static str, Option<MijiaAuth>) {
+    let Some(mijia) = account.mijia.as_ref() else {
+        return ("missing", None);
+    };
+    if !is_mijia_auth_present(Some(mijia)) {
+        return ("missing", None);
+    }
+    match client.check_new_msg_with_renewal(mijia) {
+        Ok(renewed) => ("loggedIn", renewed),
+        Err(_) => ("invalid", None),
+    }
+}
+
+fn text_login_status(status: &str) -> &'static str {
+    match status {
+        "loggedIn" => "已登录",
+        "expired" => "已过期",
+        "invalid" => "无效",
+        _ => "未登录",
+    }
 }
 
 fn emit_auth_login_start(
@@ -576,6 +661,30 @@ fn emit_auth_login_start(
                 kind: "authWaiting",
                 region: pending_auth.region.clone(),
                 redirect_uri: pending_auth.redirect_uri.clone(),
+            })?;
+            std::io::stdout().flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_mijia_login_start(auth_url: &str, output_mode: OutputMode) -> Result<()> {
+    match output_mode {
+        OutputMode::Text => {
+            println!("打开下面的米家登录链接：");
+            println!("{auth_url}");
+            println!();
+            println!("请在浏览器页面中使用米家 App 扫描二维码...");
+            std::io::stdout().flush()?;
+            #[cfg(not(test))]
+            if let Err(error) = open_url_in_browser(auth_url) {
+                eprintln!("无法自动打开浏览器: {error}");
+            }
+        }
+        OutputMode::Json => {
+            print_json(&AuthUrlPrintedEvent {
+                kind: "authUrlPrinted",
+                url: auth_url.to_string(),
             })?;
             std::io::stdout().flush()?;
         }
@@ -620,71 +729,126 @@ fn handle_auth(output_mode: OutputMode, args: AuthArgs) -> Result<()> {
         return show_subcommand_help(output_mode, "auth");
     };
     match command {
-        AuthCommand::Login(args) => {
-            let auth_state = load_auth()?;
-            let existing_pending = get_pending_auth(&auth_state)?;
-            let default_region = args
-                .region
-                .as_ref()
-                .map(AuthRegion::as_str)
-                .unwrap_or(DEFAULT_REGION);
-            let redirect_uri = resolve_redirect_uri();
-            let pending_uuid = existing_pending
-                .as_ref()
-                .map(|account| account.uuid.clone())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(generate_uuid);
-            let mut pending = normalize_account(json!({
-                "region": existing_pending
-                    .as_ref()
-                    .map(|account| account.region.as_str())
-                    .unwrap_or(default_region),
-                "redirectUri": redirect_uri,
-                "uuid": pending_uuid,
-                "deviceId": existing_pending
-                    .as_ref()
-                    .map(|account| account.device_id.as_str())
-                    .unwrap_or(""),
-                "state": existing_pending
-                    .as_ref()
-                    .map(|account| account.state.as_str())
-                    .unwrap_or(""),
-                "accessToken": "",
-                "refreshToken": "",
-                "expiresTs": 0,
-                "user": {
-                    "uid": "",
-                    "nickname": "",
-                    "icon": "",
-                    "unionId": "",
-                }
-            }));
-            let callback_server = CallbackServer::bind(&pending.redirect_uri)?;
-            let client = MicoClient::new(&pending)?;
-            pending.device_id = client.device_id.clone();
-            pending.state = client.state.clone();
-            let persisted = save_auth(&set_pending_auth(&auth_state, Some(&pending))?)?;
-            let pending_auth = get_pending_auth(&persisted)?.unwrap_or(pending.clone());
-            let oauth_auth_url =
-                callback_server.auth_url_with_short_redirect(&client.auth_url(false))?;
-            let auth_dialog_url = callback_server.short_redirect_uri();
-            emit_auth_login_start(&pending_auth, auth_dialog_url.as_str(), output_mode)?;
-            let (_auth_state, account) = callback_server
-                .wait_for_callback_and_finish_auth(persisted, pending_auth, oauth_auth_url.as_str())
-                .map_err(|error| {
-                    anyhow!(
-                        "{error}\n{}",
-                        callback_server_port_requirement_tip(callback_server.port)
-                    )
-                })?;
-            handle_successful_login(output_mode, &account)?;
-            Ok(())
-        }
+        AuthCommand::Login(args) => handle_auth_login(output_mode, args),
         AuthCommand::List => {
             print_auth_list(output_mode, &load_auth()?)?;
             Ok(())
         }
     }
+}
+
+fn handle_auth_login(output_mode: OutputMode, args: AuthLoginArgs) -> Result<()> {
+    let (mode, region) = match args.flow {
+        Some(AuthLoginFlow::Xiaomi(xiaomi_args)) => (
+            AuthLoginMode::XiaomiOnly,
+            xiaomi_args
+                .region
+                .as_ref()
+                .or(args.region.as_ref())
+                .map(AuthRegion::as_str)
+                .unwrap_or(DEFAULT_REGION)
+                .to_string(),
+        ),
+        Some(AuthLoginFlow::Mijia) => (AuthLoginMode::MijiaOnly, DEFAULT_REGION.to_string()),
+        None => (
+            AuthLoginMode::Combined,
+            args.region
+                .as_ref()
+                .map(AuthRegion::as_str)
+                .unwrap_or(DEFAULT_REGION)
+                .to_string(),
+        ),
+    };
+
+    match mode {
+        AuthLoginMode::Combined | AuthLoginMode::XiaomiOnly => {
+            run_xiaomi_login(output_mode, region.as_str(), mode)
+        }
+        AuthLoginMode::MijiaOnly => run_mijia_login(output_mode),
+    }
+}
+
+fn run_xiaomi_login(
+    output_mode: OutputMode,
+    default_region: &str,
+    mode: AuthLoginMode,
+) -> Result<()> {
+    let auth_state = load_auth()?;
+    let existing_pending = get_pending_auth(&auth_state)?;
+    let redirect_uri = resolve_redirect_uri();
+    let pending_uuid = existing_pending
+        .as_ref()
+        .map(|account| account.uuid.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(generate_uuid);
+    let mut pending = normalize_account(json!({
+        "region": existing_pending
+            .as_ref()
+            .map(|account| account.region.as_str())
+            .unwrap_or(default_region),
+        "redirectUri": redirect_uri,
+        "uuid": pending_uuid,
+        "deviceId": existing_pending
+            .as_ref()
+            .map(|account| account.device_id.as_str())
+            .unwrap_or(""),
+        "state": existing_pending
+            .as_ref()
+            .map(|account| account.state.as_str())
+            .unwrap_or(""),
+        "accessToken": "",
+        "refreshToken": "",
+        "expiresTs": 0,
+        "user": {
+            "uid": "",
+            "nickname": "",
+            "icon": "",
+            "unionId": "",
+        }
+    }));
+    let callback_server = CallbackServer::bind(&pending.redirect_uri)?;
+    let client = MicoClient::new(&pending)?;
+    pending.device_id = client.device_id.clone();
+    pending.state = client.state.clone();
+    sync_xiaomi_auth(&mut pending);
+    let persisted = save_auth(&set_pending_auth(&auth_state, Some(&pending))?)?;
+    let pending_auth = get_pending_auth(&persisted)?.unwrap_or(pending.clone());
+    let oauth_auth_url = callback_server.auth_url_with_short_redirect(&client.auth_url(false))?;
+    let auth_dialog_url = callback_server.short_redirect_uri();
+    emit_auth_login_start(&pending_auth, auth_dialog_url.as_str(), output_mode)?;
+    let (_auth_state, account) = callback_server
+        .wait_for_callback_and_finish_auth(
+            persisted,
+            pending_auth,
+            oauth_auth_url.as_str(),
+            mode == AuthLoginMode::Combined,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "{error}\n{}",
+                callback_server_port_requirement_tip(callback_server.port)
+            )
+        })?;
+    handle_successful_login(output_mode, &account)?;
+    Ok(())
+}
+
+fn run_mijia_login(output_mode: OutputMode) -> Result<()> {
+    let redirect_uri = resolve_redirect_uri();
+    let callback_server = CallbackServer::bind(&redirect_uri)?;
+    let auth_dialog_url = callback_server.short_redirect_uri();
+    emit_mijia_login_start(auth_dialog_url.as_str(), output_mode)?;
+    let (_auth_state, account) =
+        callback_server
+            .wait_for_mijia_login(load_auth()?)
+            .map_err(|error| {
+                anyhow!(
+                    "{error}\n{}",
+                    callback_server_port_requirement_tip(callback_server.port)
+                )
+            })?;
+    handle_successful_login(output_mode, &account)?;
+    Ok(())
 }
 
 struct CallbackServer {
@@ -776,6 +940,7 @@ impl CallbackServer {
         auth_state: AuthState,
         pending_auth: AuthAccount,
         oauth_auth_url: &str,
+        include_mijia: bool,
     ) -> Result<(AuthState, AuthAccount)> {
         let timeout_secs: u64 = std::env::var("MIT_LOGIN_TIMEOUT_SECS")
             .ok()
@@ -837,11 +1002,24 @@ impl CallbackServer {
                         } else {
                             format!("?{}", request_line.query)
                         };
-                        Some(finish_auth_callback(
-                            &auth_state,
-                            &pending_auth,
-                            &callback_input,
-                        ))
+                        if include_mijia {
+                            let xiaomi =
+                                finish_auth_callback(&auth_state, &pending_auth, &callback_input);
+                            Some(match xiaomi {
+                                Ok((next_auth_state, account)) => finish_mijia_login_response(
+                                    &mut stream,
+                                    next_auth_state,
+                                    Some(account),
+                                )
+                                .map(|outcome| (outcome, true)),
+                                Err(error) => Err(error),
+                            })
+                        } else {
+                            Some(
+                                finish_auth_callback(&auth_state, &pending_auth, &callback_input)
+                                    .map(|outcome| (outcome, false)),
+                            )
+                        }
                     }
                 }
                 Err(error) => {
@@ -859,23 +1037,114 @@ impl CallbackServer {
             };
 
             match outcome {
-                Ok(outcome) => {
-                    write_html_response(
-                        &mut stream,
-                        "200 OK",
-                        "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>授权成功，可以关闭此页面。</p>",
-                    )?;
+                Ok((outcome, response_written)) => {
+                    if !response_written {
+                        write_html_response(
+                            &mut stream,
+                            "200 OK",
+                            "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>授权成功，可以关闭此页面。</p>",
+                        )?;
+                    }
                     return Ok(outcome);
+                }
+                Err(error) => {
+                    let _ = write_html_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>授权失败，请查看终端输出。</p>",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn wait_for_mijia_login(&self, auth_state: AuthState) -> Result<(AuthState, AuthAccount)> {
+        let timeout_secs: u64 = std::env::var("MIT_LOGIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+        self.listener.set_nonblocking(true)?;
+
+        let mut login_page: Option<MijiaLoginPageState> = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "米家登录超时（超过 {timeout_secs} 秒未打开登录页面），请重新运行 `mit auth login mijia`"
+                );
+            }
+
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(100).min(remaining));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            stream.set_nonblocking(false)?;
+            let request = read_http_request(&mut stream)?;
+            let outcome = match parse_http_request_line(&request) {
+                Ok(request_line) => {
+                    if request_line.method != "GET" {
+                        write_html_response(
+                            &mut stream,
+                            "405 Method Not Allowed",
+                            "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>不支持的请求方法</p>",
+                        )?;
+                        None
+                    } else if request_line.path == self.login_entry_path {
+                        if let Some(page) = &login_page {
+                            write_html_response(&mut stream, "200 OK", page.html.as_str())?;
+                        } else {
+                            let page = start_mijia_qr_login(auth_state.clone(), None)?;
+                            write_html_response(&mut stream, "200 OK", page.html.as_str())?;
+                            login_page = Some(page);
+                        }
+                        None
+                    } else if request_line.path == MIJIA_LOGIN_STATUS_PATH {
+                        match &login_page {
+                            Some(page) => write_mijia_login_status_response(&mut stream, page)?,
+                            None => {
+                                write_json_response(
+                                    &mut stream,
+                                    "200 OK",
+                                    &json!({
+                                        "status": "pending",
+                                        "message": "等待打开米家登录页面"
+                                    }),
+                                )?;
+                                None
+                            }
+                        }
+                    } else {
+                        write_html_response(
+                            &mut stream,
+                            "404 Not Found",
+                            "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>页面不存在</p>",
+                        )?;
+                        None
+                    }
                 }
                 Err(error) => {
                     write_html_response(
                         &mut stream,
-                        "500 Internal Server Error",
-                        "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>授权失败，请查看终端输出。</p>",
+                        "400 Bad Request",
+                        "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>请求格式错误</p>",
                     )?;
                     return Err(error);
                 }
-            }
+            };
+
+            let Some(outcome) = outcome else {
+                continue;
+            };
+
+            return outcome;
         }
     }
 }
@@ -1008,14 +1277,211 @@ fn finish_auth_callback(
     account.refresh_token = token.refresh_token;
     account.expires_ts = token.expires_ts;
     account.user = user;
+    sync_xiaomi_auth(&mut account);
+    let auth_state = resolve_mijia_accounts_for_xiaomi_uid(auth_state, account.user.uid.as_str());
     let auth_state = save_auth(&clear_pending_auth(&upsert_auth_account(
-        auth_state, &account,
+        &auth_state,
+        &account,
     )?)?)?;
     let saved_account = get_auth_accounts(&auth_state)?
         .into_iter()
         .find(|item| item.user.uid == account.user.uid)
         .ok_or_else(|| anyhow!("授权成功后未找到账号 {}", account.user.uid))?;
     Ok((auth_state, saved_account))
+}
+
+fn resolve_mijia_accounts_for_xiaomi_uid(auth_state: &AuthState, xiaomi_uid: &str) -> AuthState {
+    let xiaomi_uid = xiaomi_uid.trim();
+    if xiaomi_uid.is_empty() {
+        return auth_state.clone();
+    }
+    let has_mijia_candidate = auth_state.accounts.iter().any(|account| {
+        account.xiaomi.is_none()
+            && account.mijia.as_ref().is_some_and(|mijia| {
+                mijia.user_id.trim().is_empty()
+                    || (mijia.user_id.trim() == xiaomi_uid && account.user.uid.trim() != xiaomi_uid)
+            })
+    });
+    if !has_mijia_candidate {
+        return auth_state.clone();
+    }
+
+    let Ok(client) = MijiaClient::new() else {
+        return auth_state.clone();
+    };
+    let mut next = auth_state.clone();
+    for account in &mut next.accounts {
+        if account.xiaomi.is_some() {
+            continue;
+        }
+        let Some(mijia) = account.mijia.as_mut() else {
+            continue;
+        };
+        if mijia.user_id.trim() == xiaomi_uid {
+            account.user.uid = xiaomi_uid.to_string();
+            continue;
+        }
+        if !mijia.user_id.trim().is_empty() {
+            continue;
+        }
+        if let Ok(profile) = client.resolve_user_profile(mijia) {
+            if profile.uid.trim() == xiaomi_uid {
+                mijia.user_id = profile.uid.clone();
+                account.user.uid = profile.uid.clone();
+                fill_empty_user_profile(&mut account.user, &profile);
+            }
+        }
+    }
+    next
+}
+
+fn finish_mijia_login_response(
+    stream: &mut TcpStream,
+    auth_state: AuthState,
+    existing_account: Option<AuthAccount>,
+) -> Result<(AuthState, AuthAccount)> {
+    let client = MijiaClient::new()?;
+    let existing_mijia = existing_account
+        .as_ref()
+        .and_then(|account| account.mijia.as_ref());
+    let session = client.prepare_qr_login(existing_mijia)?;
+    write_redirect_response(stream, "302 Found", session.login_url.as_str())?;
+    finish_mijia_login_session(client, session, auth_state, existing_account)
+}
+
+fn start_mijia_qr_login(
+    auth_state: AuthState,
+    existing_account: Option<AuthAccount>,
+) -> Result<MijiaLoginPageState> {
+    let client = MijiaClient::new()?;
+    let existing_mijia = existing_account
+        .as_ref()
+        .and_then(|account| account.mijia.as_ref());
+    let session = client.prepare_qr_login(existing_mijia)?;
+    let html = mijia_qr_html(&session, MIJIA_LOGIN_STATUS_PATH);
+    let result = Arc::new(Mutex::new(None));
+    let worker_result = Arc::clone(&result);
+    std::thread::spawn(move || {
+        let outcome = finish_mijia_login_session(client, session, auth_state, existing_account)
+            .map_err(|error| error.to_string());
+        if let Ok(mut result) = worker_result.lock() {
+            *result = Some(outcome);
+        }
+    });
+    Ok(MijiaLoginPageState { html, result })
+}
+
+fn finish_mijia_login_session(
+    client: MijiaClient,
+    session: crate::mijia_api::MijiaLoginSession,
+    auth_state: AuthState,
+    existing_account: Option<AuthAccount>,
+) -> Result<(AuthState, AuthAccount)> {
+    let mut mijia_auth = client.finish_qr_login(&session)?;
+    let mijia_profile = client.resolve_user_profile(&mijia_auth)?;
+    if mijia_auth.user_id.trim().is_empty() {
+        mijia_auth.user_id = mijia_profile.uid.clone();
+    }
+    save_mijia_auth(auth_state, existing_account, mijia_auth, mijia_profile)
+}
+
+fn write_mijia_login_status_response(
+    stream: &mut TcpStream,
+    page: &MijiaLoginPageState,
+) -> Result<Option<Result<(AuthState, AuthAccount)>>> {
+    let snapshot = page
+        .result
+        .lock()
+        .map_err(|_| anyhow!("米家登录状态锁已损坏"))?
+        .clone();
+    match snapshot {
+        Some(Ok(outcome)) => {
+            write_json_response(
+                stream,
+                "200 OK",
+                &json!({
+                    "status": "succeeded",
+                    "message": "授权成功，可以关闭此页面。"
+                }),
+            )?;
+            Ok(Some(Ok(outcome)))
+        }
+        Some(Err(message)) => {
+            write_json_response(
+                stream,
+                "200 OK",
+                &json!({
+                    "status": "failed",
+                    "message": format!("米家登录失败：{message}。请重新运行 `mit auth login mijia` 后重试。")
+                }),
+            )?;
+            Ok(Some(Err(anyhow!(message))))
+        }
+        None => {
+            write_json_response(
+                stream,
+                "200 OK",
+                &json!({
+                    "status": "pending",
+                    "message": "等待米家扫码确认"
+                }),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn save_mijia_auth(
+    auth_state: AuthState,
+    existing_account: Option<AuthAccount>,
+    mijia_auth: MijiaAuth,
+    mijia_profile: UserProfile,
+) -> Result<(AuthState, AuthAccount)> {
+    let profile_uid = mijia_profile.uid.trim();
+    if profile_uid.is_empty() {
+        bail!("米家登录成功但未能解析小米 UID");
+    }
+    let existing_account = existing_account.filter(|account| {
+        let uid = account.user.uid.trim();
+        uid.is_empty() || uid == profile_uid
+    });
+    let mut account = existing_account.unwrap_or_else(|| {
+        normalize_account(json!({
+            "xiaomi": null,
+            "mijia": serde_json::to_value(&mijia_auth).unwrap_or(Value::Null),
+            "user": &mijia_profile,
+        }))
+    });
+    if account.user.uid.trim().is_empty() {
+        account.user.uid = mijia_profile.uid.clone();
+    }
+    fill_empty_user_profile(&mut account.user, &mijia_profile);
+    account.mijia = Some(mijia_auth.clone());
+    let auth_state = save_auth(&clear_pending_auth(&upsert_auth_account(
+        &auth_state,
+        &account,
+    )?)?)?;
+    let saved_uid = account.user.uid.clone();
+    let saved_account = get_auth_accounts(&auth_state)?
+        .into_iter()
+        .find(|item| item.user.uid == saved_uid)
+        .ok_or_else(|| anyhow!("米家授权成功后未找到账号 {}", saved_uid))?;
+    Ok((auth_state, saved_account))
+}
+
+fn fill_empty_user_profile(user: &mut UserProfile, profile: &UserProfile) {
+    if user.uid.trim().is_empty() {
+        user.uid = profile.uid.clone();
+    }
+    if user.nickname.trim().is_empty() {
+        user.nickname = profile.nickname.clone();
+    }
+    if user.icon.trim().is_empty() {
+        user.icon = profile.icon.clone();
+    }
+    if user.union_id.trim().is_empty() {
+        user.union_id = profile.union_id.clone();
+    }
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<String> {
@@ -1074,6 +1540,19 @@ fn write_html_response(stream: &mut TcpStream, status: &str, body: &str) -> Resu
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn write_json_response(stream: &mut TcpStream, status: &str, body: &Value) -> Result<()> {
+    let body = serde_json::to_string(body)?;
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
 
@@ -1083,6 +1562,7 @@ fn write_redirect_response(stream: &mut TcpStream, status: &str, location: &str)
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
 
@@ -1599,6 +2079,7 @@ pub fn ensure_fresh_account(mut auth_state: AuthState, account: AuthAccount) -> 
     let mut client = MicoClient::new(&auth)?;
     auth.device_id = client.device_id.clone();
     auth.state = client.state.clone();
+    sync_xiaomi_auth(&mut auth);
 
     if is_auth_expired(&auth) && !auth.refresh_token.is_empty() {
         let refreshed = client.refresh_token(&auth.refresh_token)?;
@@ -1608,6 +2089,7 @@ pub fn ensure_fresh_account(mut auth_state: AuthState, account: AuthAccount) -> 
         updated.access_token = refreshed.access_token;
         updated.refresh_token = refreshed.refresh_token;
         updated.expires_ts = refreshed.expires_ts;
+        sync_xiaomi_auth(&mut updated);
         auth_state = save_auth(&upsert_auth_account(&auth_state, &updated)?)?;
         auth = find_auth_account_by_uid(&auth_state, &updated.user.uid)
             .ok_or_else(|| anyhow!("刷新后未找到账号 {}", updated.user.uid))?;

@@ -56,6 +56,7 @@ pub enum CloudMipsStatus {
     MessageReceived { topic: String, payload_len: usize },
     PropertyApplied { did: String, siid: i64, piid: i64 },
     IgnoredMessage { reason: String },
+    AuthRejected { message: String },
     Error { message: String },
     Stopped,
 }
@@ -64,6 +65,7 @@ pub enum CloudMipsStatus {
 enum ReceiveErrorAction {
     Continue,
     Reconnect,
+    Stop,
 }
 
 #[derive(Debug)]
@@ -328,18 +330,28 @@ fn run_property_cache_listener(
                     },
                 ),
                 Ok(Err(error)) => {
+                    let message = error.to_string();
+                    if receive_error_action(message.as_str()) == ReceiveErrorAction::Stop {
+                        send_status(&status_tx, CloudMipsStatus::AuthRejected { message });
+                        return Ok(());
+                    }
                     send_status(
                         &status_tx,
                         CloudMipsStatus::Error {
-                            message: format!("{error}; reconnecting"),
+                            message: format!("{message}; reconnecting"),
                         },
                     );
                     break;
                 }
                 Err(error) => {
                     let message = format!("{error:?}");
-                    if receive_error_action(message.as_str()) == ReceiveErrorAction::Continue {
-                        continue;
+                    match receive_error_action(message.as_str()) {
+                        ReceiveErrorAction::Continue => continue,
+                        ReceiveErrorAction::Stop => {
+                            send_status(&status_tx, CloudMipsStatus::AuthRejected { message });
+                            return Ok(());
+                        }
+                        ReceiveErrorAction::Reconnect => {}
                     }
                     send_status(
                         &status_tx,
@@ -444,13 +456,26 @@ fn run_stdout_subscription(
                     send_line(&line_tx, format!("cloud MIPS mqtt outgoing: {packet:?}"));
                 }
                 Ok(Err(error)) => {
-                    send_line(&line_tx, format!("cloud MIPS error: {error}; reconnecting"));
+                    let message = error.to_string();
+                    if receive_error_action(message.as_str()) == ReceiveErrorAction::Stop {
+                        send_line(&line_tx, format!("cloud MIPS auth rejected: {message}"));
+                        return Ok(());
+                    }
+                    send_line(
+                        &line_tx,
+                        format!("cloud MIPS error: {message}; reconnecting"),
+                    );
                     break;
                 }
                 Err(error) => {
                     let message = format!("{error:?}");
-                    if receive_error_action(message.as_str()) == ReceiveErrorAction::Continue {
-                        continue;
+                    match receive_error_action(message.as_str()) {
+                        ReceiveErrorAction::Continue => continue,
+                        ReceiveErrorAction::Stop => {
+                            send_line(&line_tx, format!("cloud MIPS auth rejected: {message}"));
+                            return Ok(());
+                        }
+                        ReceiveErrorAction::Reconnect => {}
                     }
                     send_line(
                         &line_tx,
@@ -498,6 +523,8 @@ fn open_mqtt_connection(
 fn receive_error_action(message: &str) -> ReceiveErrorAction {
     if message == "Timeout" {
         ReceiveErrorAction::Continue
+    } else if message.contains("NotAuthorized") {
+        ReceiveErrorAction::Stop
     } else {
         ReceiveErrorAction::Reconnect
     }
@@ -641,6 +668,14 @@ mod tests {
         assert_eq!(
             receive_error_action("Io(Custom { kind: UnexpectedEof })"),
             ReceiveErrorAction::Reconnect
+        );
+    }
+
+    #[test]
+    fn mqtt_not_authorized_errors_stop_reconnect_loop() {
+        assert_eq!(
+            receive_error_action("Connection refused, return code: `NotAuthorized`"),
+            ReceiveErrorAction::Stop
         );
     }
 
