@@ -38,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{Date, Duration as TimeDuration, Month};
 use unicode_width::UnicodeWidthStr;
 
+#[allow(clippy::too_many_arguments)]
 fn persisted_auth_account_json(
     uid: &str,
     nickname: &str,
@@ -160,7 +161,8 @@ fn account_list_row_shows_xiaomi_and_mijia_login_statuses() {
 
     assert_eq!(row.xiaomi_status, "已登录");
     assert_eq!(row.mijia_status, "已登录");
-    let columns = account_page::compute_account_list_columns(&[row.clone()], 80, Language::Chinese);
+    let columns =
+        account_page::compute_account_list_columns(std::slice::from_ref(&row), 80, Language::Chinese);
     let header = account_page::format_account_list_header_with_columns(columns, Language::Chinese);
     assert!(header.contains("小米"));
     assert!(header.contains("米家"));
@@ -4000,7 +4002,7 @@ fn footer_click_point(
         .split_once(label)
         .map(|(left, _)| left)
         .expect("footer label present");
-    let column = footer.x.saturating_add(super::display_width(prefix) as u16);
+    let column = footer.x.saturating_add(super::display_width(prefix));
     (column, footer.y)
 }
 
@@ -10298,7 +10300,7 @@ fn prop_dialog_statistics_zero_value_renders_baseline_marker() {
         terminal_find_substring_position_in_area(&terminal, "01-02", chart_area).unwrap();
     let zero_marker_column = zero_label_position
         .0
-        .saturating_add((super::display_width("01-02") / 2) as u16);
+        .saturating_add(super::display_width("01-02") / 2);
     let buffer = terminal.backend().buffer();
 
     assert_eq!(
