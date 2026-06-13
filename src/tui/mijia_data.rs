@@ -10,7 +10,11 @@ use super::{
     OPERATION_RECORD_PAGE_LIMIT,
 };
 
-pub(in crate::tui) fn load_mijia_device_logs_json(account: &AuthAccount, did: &str, keys: &[String]) -> Value {
+pub(in crate::tui) fn load_mijia_device_logs_json(
+    account: &AuthAccount,
+    did: &str,
+    keys: &[String],
+) -> Value {
     load_mijia_device_logs_json_with_query(account, did, keys, None)
 }
 
@@ -68,7 +72,11 @@ pub(in crate::tui) fn load_mijia_device_logs_json_with_query(
     })
 }
 
-pub(in crate::tui) fn load_mijia_device_statistics_json(account: &AuthAccount, did: &str, keys: &[String]) -> Value {
+pub(in crate::tui) fn load_mijia_device_statistics_json(
+    account: &AuthAccount,
+    did: &str,
+    keys: &[String],
+) -> Value {
     let period = StatisticsPeriod::Week;
     load_mijia_device_statistics_json_with_query(
         account,

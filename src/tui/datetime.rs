@@ -55,4 +55,3 @@ pub(in crate::tui) fn add_months_to_date(date: Date, delta: i32) -> Date {
     let day = date.day().min(month.length(year));
     Date::from_calendar_date(year, month, day).unwrap_or(date)
 }
-

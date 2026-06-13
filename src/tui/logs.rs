@@ -120,7 +120,11 @@ fn log_selection_is_active() -> bool {
         .unwrap_or(false)
 }
 
-pub(in crate::tui) fn log_selection_is_stale(active: &ActiveSelection, area: Rect, visible_lines: &[String]) -> bool {
+pub(in crate::tui) fn log_selection_is_stale(
+    active: &ActiveSelection,
+    area: Rect,
+    visible_lines: &[String],
+) -> bool {
     active.snapshot.surface == SelectionSurface::Logs
         && (active.snapshot.area != area || active.snapshot.lines.as_slice() != visible_lines)
 }
@@ -143,7 +147,11 @@ pub(in crate::tui) fn logs_lines_for_display(app: &TuiApp) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-pub(in crate::tui) fn log_scroll_offset_for_view(app: &TuiApp, line_count: usize, viewport_height: u16) -> usize {
+pub(in crate::tui) fn log_scroll_offset_for_view(
+    app: &TuiApp,
+    line_count: usize,
+    viewport_height: u16,
+) -> usize {
     let visible_rows = viewport_height as usize;
     app.log_scroll_offset
         .min(line_count.saturating_sub(visible_rows))
@@ -176,7 +184,10 @@ fn log_visual_lines_for_width(app: &TuiApp, width: u16) -> Vec<String> {
         .collect()
 }
 
-pub(in crate::tui) fn logs_visible_lines_for_display(app: &TuiApp, viewport_area: Rect) -> Vec<String> {
+pub(in crate::tui) fn logs_visible_lines_for_display(
+    app: &TuiApp,
+    viewport_area: Rect,
+) -> Vec<String> {
     let lines = log_visual_lines_for_width(app, viewport_area.width);
     let offset = log_scroll_offset_for_view(app, lines.len(), viewport_area.height);
     lines
@@ -212,7 +223,10 @@ pub(in crate::tui) fn log_viewer_text_area(app: &TuiApp, list_area: Rect) -> Rec
     log_viewer_areas_for_line_count(list_area, visual_line_count).0
 }
 
-pub(in crate::tui) fn log_visual_lines_and_areas(app: &TuiApp, list_area: Rect) -> (Vec<String>, Rect, Option<Rect>) {
+pub(in crate::tui) fn log_visual_lines_and_areas(
+    app: &TuiApp,
+    list_area: Rect,
+) -> (Vec<String>, Rect, Option<Rect>) {
     let full_width_lines = log_visual_lines_for_width(app, list_area.width);
     let (text_area, scrollbar_area) =
         log_viewer_areas_for_line_count(list_area, full_width_lines.len());
@@ -282,7 +296,10 @@ pub(in crate::tui) fn log_scrollbar_geometry(
     })
 }
 
-pub(in crate::tui) fn log_scrollbar_lines(geometry: LogScrollbarGeometry, height: u16) -> Vec<Line<'static>> {
+pub(in crate::tui) fn log_scrollbar_lines(
+    geometry: LogScrollbarGeometry,
+    height: u16,
+) -> Vec<Line<'static>> {
     (0..height as usize)
         .map(|row| {
             let symbol = if row >= geometry.thumb_start
@@ -363,7 +380,6 @@ pub(in crate::tui) fn highlight_log_search_matches(line: &str, query: &str) -> L
     Line::from(spans)
 }
 
-
 impl TuiApp {
     pub(in crate::tui) fn log(&mut self, message: impl Into<String>) {
         let entry = encode_log_entry(message.into());
@@ -394,7 +410,11 @@ impl TuiApp {
         self.log_scroll_offset = self.log_scroll_offset.min(LOG_MAX.saturating_sub(1));
     }
 
-    pub(in crate::tui) fn clamp_log_scroll_offset_for_view(&mut self, line_count: usize, viewport_height: u16) {
+    pub(in crate::tui) fn clamp_log_scroll_offset_for_view(
+        &mut self,
+        line_count: usize,
+        viewport_height: u16,
+    ) {
         self.log_scroll_offset = log_scroll_offset_for_view(self, line_count, viewport_height);
     }
 
