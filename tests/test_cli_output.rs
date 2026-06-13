@@ -648,6 +648,11 @@ fn source_tests_live_under_tests_folder() {
         "src/mico_api.rs",
     );
     assert_externalized_test_hook(
+        include_str!("../src/mijia_api.rs"),
+        "#[path = \"../tests/module_tests/mijia_api.rs\"]",
+        "src/mijia_api.rs",
+    );
+    assert_externalized_test_hook(
         include_str!("../src/tui/mod.rs"),
         "#[path = \"../../tests/module_tests/tui.rs\"]",
         "src/tui/mod.rs",
