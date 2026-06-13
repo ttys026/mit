@@ -258,7 +258,7 @@ pub fn upsert_auth_account(auth: &AuthState, account: &AuthAccount) -> Result<Au
         for index in &merge_indexes {
             merged = merge_accounts(&next_accounts[*index], &merged);
         }
-        let merge_index_set = merge_indexes.iter().copied().collect::<Vec<_>>();
+        let merge_index_set = merge_indexes.to_vec();
         next_accounts = next_accounts
             .into_iter()
             .enumerate()
@@ -663,7 +663,7 @@ fn push_account(accounts: &mut Vec<AuthAccount>, candidate: &Value) {
         for index in &merge_indexes {
             merged = merge_accounts(&accounts[*index], &merged);
         }
-        let merge_index_set = merge_indexes.iter().copied().collect::<Vec<_>>();
+        let merge_index_set = merge_indexes.to_vec();
         let next_accounts = accounts
             .drain(..)
             .enumerate()

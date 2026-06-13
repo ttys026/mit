@@ -707,11 +707,7 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
             },
             Some(AccountActionDialog::SettingsConfirm { .. }) => match key.code {
                 KeyCode::Esc => app.account_action_dialog = None,
-                KeyCode::Enter => {
-                    if app.confirm_settings_action()? {
-                        return Ok(true);
-                    }
-                }
+                KeyCode::Enter if app.confirm_settings_action()? => return Ok(true),
                 _ => {}
             },
             None => {}
@@ -3867,13 +3863,8 @@ impl TuiApp {
                 }
             }
             2 => self.scroll_logs_down(1),
-            3 => {
-                if SETTINGS_ITEM_COUNT > 0 {
-                    self.select_settings_item(
-                        (self.settings_selected_index() + 1) % SETTINGS_ITEM_COUNT,
-                    );
-                }
-            }
+            3 => self
+                .select_settings_item((self.settings_selected_index() + 1) % SETTINGS_ITEM_COUNT),
             _ => {}
         }
     }
@@ -5129,13 +5120,11 @@ impl TuiApp {
             }
             2 => self.scroll_logs_up(1),
             3 => {
-                if SETTINGS_ITEM_COUNT > 0 {
-                    self.select_settings_item(if self.settings_selected_index() == 0 {
-                        SETTINGS_ITEM_COUNT - 1
-                    } else {
-                        self.settings_selected_index() - 1
-                    });
-                }
+                self.select_settings_item(if self.settings_selected_index() == 0 {
+                    SETTINGS_ITEM_COUNT - 1
+                } else {
+                    self.settings_selected_index() - 1
+                });
             }
             _ => {}
         }
