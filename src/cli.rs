@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::mico_api::{is_auth_expired, parse_callback_input, MicoClient};
-use crate::mijia_api::{is_mijia_auth_present, mijia_qr_html, MijiaClient};
+use crate::mijia_api::{is_mijia_auth_present, mijia_qr_html, DeviceHistoryQuery, MijiaClient};
 use crate::mips_cloud::{
     config_from_account, property_subscription_for, start_stdout_subscription, CloudMipsHandle,
     CloudMipsSubscription,
 };
 use crate::storage::{
-    clear_pending_auth, find_auth_account_by_uid, generate_uuid, get_auth_accounts,
+    clear_pending_auth, find_auth_account_by_uid, generate_uuid, get_auth_accounts, get_mit_dir,
     get_pending_auth, load_auth, normalize_account, save_auth, set_pending_auth, sync_xiaomi_auth,
     upsert_auth_account, AuthAccount, AuthState, MijiaAuth, UserProfile, DEFAULT_REGION,
 };
@@ -46,6 +46,14 @@ pub enum RootCommand {
     Props(PropsArgs),
     #[command(about = "向已登录账号发送通知")]
     Push(PushArgs),
+    #[command(about = "查看设备操作记录（米家历史日志）")]
+    Logs(LogsArgs),
+    #[command(about = "查看设备统计数据（米家统计）")]
+    Stats(StatsArgs),
+    #[command(about = "清理缓存（保留登录）")]
+    Cache(CacheArgs),
+    #[command(about = "重置全部数据（删除 ~/.mit）")]
+    Reset(ResetArgs),
     #[command(about = "启动全屏 TUI 控制台")]
     Tui(TuiArgs),
 }
@@ -62,6 +70,14 @@ pub enum AuthCommand {
     Login(AuthLoginArgs),
     #[command(about = "列出已保存的小米账号")]
     List,
+    #[command(about = "登出账号并删除其本地缓存")]
+    Logout(AuthLogoutArgs),
+}
+
+#[derive(Clone, Debug, Args, Default)]
+pub struct AuthLogoutArgs {
+    #[arg(long = "uid", help = "要登出的账号 UID；仅有一个账号时可省略")]
+    pub uid: Option<String>,
 }
 
 #[derive(Clone, Debug, Args, Default)]
@@ -205,6 +221,67 @@ pub struct TuiArgs {
     pub uid: Option<String>,
 }
 
+#[derive(Clone, Debug, Args)]
+pub struct LogsArgs {
+    #[arg(help = "设备 DID")]
+    pub did: String,
+    #[arg(
+        required = true,
+        num_args = 1..,
+        help = "属性键，形如 <siid>.<piid>（例如 2.1）"
+    )]
+    pub keys: Vec<String>,
+    #[arg(long, default_value_t = 50, help = "每个键最多返回的记录条数")]
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct StatsArgs {
+    #[arg(help = "设备 DID")]
+    pub did: String,
+    #[arg(help = "统计键，形如 <siid>.<piid>（例如 3.1）")]
+    pub key: String,
+    #[arg(long, value_enum, ignore_case = true, default_value_t = StatsPeriod::Week, help = "统计周期")]
+    pub period: StatsPeriod,
+    #[arg(long, default_value_t = 31, help = "最多返回的数据点条数")]
+    pub limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum StatsPeriod {
+    Week,
+    Month,
+    Year,
+}
+
+impl StatsPeriod {
+    /// Mijia statistics data type for this period (mirrors the TUI's StatisticsPeriod).
+    fn data_type(self) -> &'static str {
+        match self {
+            Self::Week | Self::Month => "stat_day_v3",
+            Self::Year => "stat_month_v3",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct CacheArgs {
+    #[command(subcommand)]
+    pub command: Option<CacheCommand>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum CacheCommand {
+    #[command(about = "删除设备/规格缓存，保留登录信息")]
+    Clean,
+}
+
+#[derive(Clone, Debug, Args, Default)]
+pub struct ResetArgs {
+    #[arg(long, help = "确认删除 ~/.mit 下的全部数据（必填，避免误操作）")]
+    pub yes: bool,
+}
+
 fn parse_non_empty_text(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -335,6 +412,10 @@ pub fn run(args: Cli) -> Result<()> {
         Some(RootCommand::Devices(args)) => handle_devices(output_mode, args),
         Some(RootCommand::Props(args)) => handle_props(output_mode, args),
         Some(RootCommand::Push(args)) => handle_push(output_mode, args),
+        Some(RootCommand::Logs(args)) => handle_logs(output_mode, args),
+        Some(RootCommand::Stats(args)) => handle_stats(output_mode, args),
+        Some(RootCommand::Cache(args)) => handle_cache(output_mode, args),
+        Some(RootCommand::Reset(args)) => handle_reset(output_mode, args),
         Some(RootCommand::Tui(args)) => handle_tui(output_mode, args),
         None => show_help(output_mode),
     }
@@ -734,7 +815,130 @@ fn handle_auth(output_mode: OutputMode, args: AuthArgs) -> Result<()> {
             print_auth_list(output_mode, &load_auth()?)?;
             Ok(())
         }
+        AuthCommand::Logout(args) => handle_auth_logout(output_mode, args),
     }
+}
+
+fn handle_auth_logout(output_mode: OutputMode, args: AuthLogoutArgs) -> Result<()> {
+    let auth_state = load_auth()?;
+    let uids = get_auth_accounts(&auth_state)?
+        .into_iter()
+        .map(|account| account.user.uid)
+        .filter(|uid| !uid.trim().is_empty())
+        .collect::<Vec<_>>();
+    let uid = match args.uid {
+        Some(uid) => {
+            if !uids.iter().any(|known| known == &uid) {
+                bail!("未找到账号 {uid}");
+            }
+            uid
+        }
+        None => match uids.as_slice() {
+            [] => bail!("没有可登出的账号"),
+            [single] => single.clone(),
+            _ => bail!("存在多个账号，请用 --uid 指定要登出的账号"),
+        },
+    };
+    crate::actions::logout_account(&get_mit_dir(), auth_state, &uid)?;
+    match output_mode {
+        OutputMode::Text => println!("✅ 已登出账号 {uid}"),
+        OutputMode::Json => print_json(&LogoutOutput {
+            kind: "authLogout",
+            uid,
+        })?,
+    }
+    Ok(())
+}
+
+fn handle_logs(output_mode: OutputMode, args: LogsArgs) -> Result<()> {
+    let target = find_target_device(&args.did)?;
+    let did = target.device.did.as_str();
+    let mut entries = Vec::new();
+    for key in &args.keys {
+        let query = DeviceHistoryQuery::recent(args.limit);
+        let value = crate::actions::device_history(&target.fresh.auth, did, key, query)?;
+        match output_mode {
+            OutputMode::Text => println!(
+                "{}（{did}） {key} => {}",
+                target.device.name,
+                serde_json::to_string(&value)?
+            ),
+            OutputMode::Json => entries.push(DeviceDataEntry {
+                key: key.clone(),
+                value,
+            }),
+        }
+    }
+    if output_mode == OutputMode::Json {
+        print_json(&DeviceDataOutput {
+            kind: "deviceLogs",
+            device_did: target.device.did,
+            device_name: target.device.name,
+            entries,
+        })?;
+    }
+    Ok(())
+}
+
+fn handle_stats(output_mode: OutputMode, args: StatsArgs) -> Result<()> {
+    let target = find_target_device(&args.did)?;
+    let did = target.device.did.as_str();
+    let query = DeviceHistoryQuery::recent(args.limit);
+    let value = crate::actions::device_statistics(
+        &target.fresh.auth,
+        did,
+        &args.key,
+        args.period.data_type(),
+        query,
+    )?;
+    match output_mode {
+        OutputMode::Text => println!(
+            "{}（{did}） {} [{:?}] => {}",
+            target.device.name,
+            args.key,
+            args.period,
+            serde_json::to_string(&value)?
+        ),
+        OutputMode::Json => print_json(&DeviceDataOutput {
+            kind: "deviceStatistics",
+            device_did: target.device.did,
+            device_name: target.device.name,
+            entries: vec![DeviceDataEntry {
+                key: args.key,
+                value,
+            }],
+        })?,
+    }
+    Ok(())
+}
+
+fn handle_cache(output_mode: OutputMode, args: CacheArgs) -> Result<()> {
+    match args.command {
+        None => show_subcommand_help(output_mode, "cache"),
+        Some(CacheCommand::Clean) => {
+            let removed = crate::actions::clear_device_cache(&get_mit_dir())?;
+            match output_mode {
+                OutputMode::Text => println!("✅ 已清理缓存，删除 {removed} 项（保留登录）"),
+                OutputMode::Json => print_json(&CacheCleanOutput {
+                    kind: "cacheClean",
+                    removed,
+                })?,
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_reset(output_mode: OutputMode, args: ResetArgs) -> Result<()> {
+    if !args.yes {
+        bail!("此操作会删除 ~/.mit 下的全部数据；如确认请加 --yes");
+    }
+    crate::actions::reset_profile(&get_mit_dir())?;
+    match output_mode {
+        OutputMode::Text => println!("✅ 已重置全部数据（~/.mit 已删除）"),
+        OutputMode::Json => print_json(&ResetOutput { kind: "reset" })?,
+    }
+    Ok(())
 }
 
 fn handle_auth_login(output_mode: OutputMode, args: AuthLoginArgs) -> Result<()> {
@@ -1729,6 +1933,46 @@ struct PropActOutput {
 struct PropsSubscriptionGroup {
     account: AuthAccount,
     subscriptions: Vec<CloudMipsSubscription>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogoutOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    uid: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceDataEntry {
+    key: String,
+    value: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceDataOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    device_did: String,
+    device_name: String,
+    entries: Vec<DeviceDataEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheCleanOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    removed: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 fn handle_props(output_mode: OutputMode, args: PropsArgs) -> Result<()> {

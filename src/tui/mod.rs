@@ -3745,26 +3745,7 @@ impl TuiApp {
     }
 
     fn purge_devices_cache_keep_auth(&mut self) -> Result<()> {
-        let mit_dir = self.home_dir.join(".mit");
-        let mut removed_entries = 0usize;
-        if mit_dir.exists() {
-            for entry in fs::read_dir(&mit_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                let keep_auth = path
-                    .file_name()
-                    .is_some_and(|name| name == std::ffi::OsStr::new("auth.json"));
-                if keep_auth {
-                    continue;
-                }
-                if path.is_dir() {
-                    fs::remove_dir_all(path)?;
-                } else {
-                    fs::remove_file(path)?;
-                }
-                removed_entries += 1;
-            }
-        }
+        let removed_entries = crate::actions::clear_device_cache(&self.home_dir.join(".mit"))?;
 
         self.devices.clear();
         self.device_index = 0;
@@ -3778,10 +3759,7 @@ impl TuiApp {
     }
 
     fn reset_all_settings(&mut self) -> Result<()> {
-        let mit_dir = self.home_dir.join(".mit");
-        if mit_dir.exists() {
-            fs::remove_dir_all(&mit_dir)?;
-        }
+        crate::actions::reset_profile(&self.home_dir.join(".mit"))?;
         self.auth_state = default_auth();
         self.accounts.clear();
         self.account_index = 0;
