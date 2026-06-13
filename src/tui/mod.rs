@@ -50,10 +50,15 @@ use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+mod datetime;
 mod pages;
 mod shared;
 mod spec;
 
+pub(in crate::tui) use datetime::{
+    add_months_to_date, date_end_timestamp, date_start_timestamp, timestamp_to_local_date,
+    today_local_date,
+};
 pub(in crate::tui) use spec::{
     collect_readable_props, extract_actions_from_spec, extract_prop_value,
     format_prop_value_for_dialog, is_error_with_negative_code, parse_prop_input_value,
@@ -7206,31 +7211,6 @@ fn statistics_date_at_position(
     ))
 }
 
-fn local_utc_offset() -> UtcOffset {
-    UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
-}
-
-fn today_local_date() -> Date {
-    OffsetDateTime::now_local()
-        .unwrap_or_else(|_| OffsetDateTime::now_utc())
-        .date()
-}
-
-fn timestamp_to_local_date(timestamp: i64) -> Option<Date> {
-    OffsetDateTime::from_unix_timestamp(timestamp)
-        .ok()
-        .map(|timestamp| timestamp.to_offset(local_utc_offset()).date())
-}
-
-fn date_start_timestamp(date: Date) -> i64 {
-    date.midnight()
-        .assume_offset(local_utc_offset())
-        .unix_timestamp()
-}
-
-fn date_end_timestamp(date: Date) -> i64 {
-    date_start_timestamp(date.saturating_add(TimeDuration::DAY)).saturating_sub(1)
-}
 
 fn operation_record_date_filter(value: &Value) -> Option<(i64, i64)> {
     value.get("date_filter").and_then(|filter| {
@@ -7261,36 +7241,6 @@ fn clear_operation_record_date_filter_value(value: &mut Value) {
             ui.insert("active_row".to_string(), json!(0));
         }
     }
-}
-
-fn month_from_number(month: u8) -> Month {
-    match month {
-        1 => Month::January,
-        2 => Month::February,
-        3 => Month::March,
-        4 => Month::April,
-        5 => Month::May,
-        6 => Month::June,
-        7 => Month::July,
-        8 => Month::August,
-        9 => Month::September,
-        10 => Month::October,
-        11 => Month::November,
-        _ => Month::December,
-    }
-}
-
-fn add_months_to_date(date: Date, delta: i32) -> Date {
-    let month_number = i32::from(date.month() as u8);
-    let total = date
-        .year()
-        .saturating_mul(12)
-        .saturating_add(month_number - 1)
-        .saturating_add(delta);
-    let year = total.div_euclid(12);
-    let month = month_from_number((total.rem_euclid(12) + 1) as u8);
-    let day = date.day().min(month.length(year));
-    Date::from_calendar_date(year, month, day).unwrap_or(date)
 }
 
 fn raw_device_tab_text(dialog: &PropDialog, tab: PropDialogTab) -> String {
