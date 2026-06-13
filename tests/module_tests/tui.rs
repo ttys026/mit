@@ -161,8 +161,11 @@ fn account_list_row_shows_xiaomi_and_mijia_login_statuses() {
 
     assert_eq!(row.xiaomi_status, "已登录");
     assert_eq!(row.mijia_status, "已登录");
-    let columns =
-        account_page::compute_account_list_columns(std::slice::from_ref(&row), 80, Language::Chinese);
+    let columns = account_page::compute_account_list_columns(
+        std::slice::from_ref(&row),
+        80,
+        Language::Chinese,
+    );
     let header = account_page::format_account_list_header_with_columns(columns, Language::Chinese);
     assert!(header.contains("小米"));
     assert!(header.contains("米家"));
