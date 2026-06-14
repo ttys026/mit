@@ -92,8 +92,10 @@ mit
 mit --help
 
 # ── Auth ───────────────────────────────────────────────────
-mit auth login                                   # Log in (opens browser)
-mit auth login --region cn                       # Specify region
+mit auth login                                   # Log in to Xiaomi, then Mijia QR login
+mit auth login --region cn                       # Specify Xiaomi region for combined login
+mit auth login xiaomi                            # Log in to Xiaomi OAuth only
+mit auth login mijia                             # Log in to Mijia QR only
 mit auth list                                    # List saved accounts
 
 # ── TUI ────────────────────────────────────────────────────

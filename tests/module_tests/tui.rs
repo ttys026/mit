@@ -12,10 +12,11 @@ use super::{
     format_device_list_item_with_columns, format_preview_props_set_command,
     format_preview_push_command, format_prop_dialog_action_list_item_line,
     format_prop_value_for_dialog, handle_key, handle_mouse, load_cached_devices_from_home,
-    parse_bool_prop_value, read_device_categories_from_template, single_line_textarea,
-    tab_index_for_column_with_titles, AccountActionDialog, ActionItem, AuthFlowMessage, AuthState,
-    BoolDialog, BoolDialogTab, BoolPropItem, BoolToggleItem, BootState, BootstrapMessage,
-    BootstrapPending, ListState, LocalTransportRefreshMessage, TuiApp,
+    parse_bool_prop_value, raw_device_logs_item, raw_device_statistics_item,
+    read_device_categories_from_template, single_line_textarea, tab_index_for_column_with_titles,
+    AccountActionDialog, ActionItem, AuthFlowMessage, AuthState, BootState, BootstrapMessage,
+    BootstrapPending, ListState, LocalTransportRefreshMessage, PropDialog, PropDialogTab, PropItem,
+    ToggleItem, TuiApp,
 };
 use crate::mico_api::Device;
 use crate::property_cache::PropertyCache;
@@ -34,7 +35,36 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::{Date, Duration as TimeDuration, Month};
 use unicode_width::UnicodeWidthStr;
+
+fn persisted_auth_account_json(
+    uid: &str,
+    nickname: &str,
+    union_id: &str,
+    uuid: &str,
+    device_id: &str,
+    state: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_ts: i64,
+) -> Value {
+    json!({
+        "xiaomi": {
+            "region": "cn",
+            "redirectUri": "http://127.0.0.1:8000/login_redirect",
+            "uuid": uuid,
+            "deviceId": device_id,
+            "state": state,
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "expiresTs": expires_ts
+        },
+        "mijia": null,
+        "user": {"uid": uid, "nickname": nickname, "icon": "", "unionId": union_id},
+        "version": 1
+    })
+}
 
 #[test]
 fn render_text_input_line_uses_reversed_block_cursor() {
@@ -98,6 +128,61 @@ fn forward_auth_login_output_emits_first_url_from_buffer() {
         .unwrap()
         .unwrap();
     assert_eq!(auth_url, "https://example.com/oauth");
+}
+
+#[test]
+fn account_list_row_shows_xiaomi_and_mijia_login_statuses() {
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "tui-account-status",
+        "deviceId": "mico.tui-account-status",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 32503680000_u64,
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+        "mijia": {
+            "ua": "Android-15-test",
+            "deviceId": "mijia-device-a",
+            "passO": "pass-o-a",
+            "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+            "passToken": "pass-token-a",
+            "userId": "1001",
+            "cUserId": "c-1001",
+            "serviceToken": "service-token-a",
+            "expireTime": 222,
+            "saveTime": 123
+        }
+    }));
+
+    let row = account_page::account_list_row(&account, false, Language::Chinese);
+
+    assert_eq!(row.xiaomi_status, "已登录");
+    assert_eq!(row.mijia_status, "已登录");
+    let columns = account_page::compute_account_list_columns(&[row.clone()], 80, Language::Chinese);
+    let header = account_page::format_account_list_header_with_columns(columns, Language::Chinese);
+    assert!(header.contains("小米"));
+    assert!(header.contains("米家"));
+    let item = account_page::format_account_list_item_with_columns(&row, columns);
+    assert!(item.contains("已登录"));
+}
+
+#[test]
+fn account_list_row_marks_missing_tokens_independently() {
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "tui-account-status-missing",
+        "deviceId": "mico.tui-account-status-missing",
+        "state": "state-a",
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }));
+
+    let row = account_page::account_list_row(&account, false, Language::Chinese);
+
+    assert_eq!(row.xiaomi_status, "未登录");
+    assert_eq!(row.mijia_status, "未登录");
 }
 
 #[cfg(unix)]
@@ -2547,7 +2632,8 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
     let text = terminal_text(&terminal);
     let compact = text.replace(' ', "");
     assert!(compact.contains("推送消息"), "{text}");
-    assert!(compact.contains("重新登录"), "{text}");
+    assert!(compact.contains("重新登录(小米)"), "{text}");
+    assert!(compact.contains("重新登录(米家)"), "{text}");
     assert!(compact.contains("登出"), "{text}");
     assert!(!text.contains("view-device"));
 }
@@ -3243,28 +3329,8 @@ fn load_cached_devices_from_home_ignores_local_credentials_without_devices_cache
         mit_dir.join("auth.json"),
         serde_json::to_string_pretty(&json!({
             "accounts": [
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-a",
-                    "deviceId": "device-a",
-                    "state": "state-a",
-                    "accessToken": "token-a",
-                    "refreshToken": "refresh-a",
-                    "expiresTs": 1,
-                    "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-                },
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-b",
-                    "deviceId": "device-b",
-                    "state": "state-b",
-                    "accessToken": "token-b",
-                    "refreshToken": "refresh-b",
-                    "expiresTs": 1,
-                    "user": {"uid": "1002", "nickname": "账号B", "icon": "", "unionId": "union-b"}
-                }
+                persisted_auth_account_json("1001", "账号A", "union-a", "uuid-a", "device-a", "state-a", "token-a", "refresh-a", 1),
+                persisted_auth_account_json("1002", "账号B", "union-b", "uuid-b", "device-b", "state-b", "token-b", "refresh-b", 1)
             ]
         }))
         .unwrap(),
@@ -3324,17 +3390,7 @@ fn draw_devices_tab_uses_local_cache_when_device_list_is_empty() {
         mit_dir.join("auth.json"),
         serde_json::to_string_pretty(&json!({
             "accounts": [
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-a",
-                    "deviceId": "device-a",
-                    "state": "state-a",
-                    "accessToken": "token-a",
-                    "refreshToken": "refresh-a",
-                    "expiresTs": 1,
-                    "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-                }
+                persisted_auth_account_json("1001", "账号A", "union-a", "uuid-a", "device-a", "state-a", "token-a", "refresh-a", 1)
             ]
         }))
         .unwrap(),
@@ -3446,28 +3502,8 @@ fn load_cached_devices_from_home_ignores_local_credentials_for_all_accounts() {
         mit_dir.join("auth.json"),
         serde_json::to_string_pretty(&json!({
             "accounts": [
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-a",
-                    "deviceId": "device-a",
-                    "state": "state-a",
-                    "accessToken": "token-a",
-                    "refreshToken": "refresh-a",
-                    "expiresTs": 1,
-                    "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-                },
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-b",
-                    "deviceId": "device-b",
-                    "state": "state-b",
-                    "accessToken": "token-b",
-                    "refreshToken": "refresh-b",
-                    "expiresTs": 1,
-                    "user": {"uid": "1002", "nickname": "账号B", "icon": "", "unionId": "union-b"}
-                }
+                persisted_auth_account_json("1001", "账号A", "union-a", "uuid-a", "device-a", "state-a", "token-a", "refresh-a", 1),
+                persisted_auth_account_json("1002", "账号B", "union-b", "uuid-b", "device-b", "state-b", "token-b", "refresh-b", 1)
             ]
         }))
         .unwrap(),
@@ -3527,17 +3563,7 @@ fn load_cached_devices_from_home_does_not_fallback_to_config_json() {
         mit_dir.join("auth.json"),
         serde_json::to_string_pretty(&json!({
             "accounts": [
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-a",
-                    "deviceId": "device-a",
-                    "state": "state-a",
-                    "accessToken": "token-a",
-                    "refreshToken": "refresh-a",
-                    "expiresTs": 1,
-                    "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-                }
+                persisted_auth_account_json("1001", "账号A", "union-a", "uuid-a", "device-a", "state-a", "token-a", "refresh-a", 1)
             ]
         }))
         .unwrap(),
@@ -3639,12 +3665,12 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 2,
                     name: "ReadOnlyVolume".to_string(),
@@ -3655,7 +3681,7 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
                 value: json!(22),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::ReadOnly,
+            active_tab: PropDialogTab::ReadOnly,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -3766,6 +3792,26 @@ fn terminal_has_yellow_background_substring(
                     break;
                 }
             }
+            if matches {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn terminal_has_dim_substring(terminal: &Terminal<TestBackend>, needle: &str) -> bool {
+    let buffer = terminal.backend().buffer();
+    let symbols = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            if x as usize + symbols.len() > buffer.area.width as usize {
+                break;
+            }
+            let matches = symbols.iter().enumerate().all(|(offset, symbol)| {
+                let cell = &buffer[(x + offset as u16, y)];
+                cell.symbol() == symbol && cell.modifier.contains(Modifier::DIM)
+            });
             if matches {
                 return true;
             }
@@ -3886,6 +3932,52 @@ fn terminal_find_substring_position(
         }
     }
     None
+}
+
+fn terminal_find_substring_position_in_area(
+    terminal: &Terminal<TestBackend>,
+    needle: &str,
+    area: ratatui::layout::Rect,
+) -> Option<(u16, u16)> {
+    let buffer = terminal.backend().buffer();
+    let symbols = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+    for y in area.y..bottom {
+        for x in area.x..right {
+            if x as usize + symbols.len() > right as usize {
+                break;
+            }
+            let matches = symbols
+                .iter()
+                .enumerate()
+                .all(|(offset, symbol)| buffer[(x + offset as u16, y)].symbol() == symbol);
+            if matches {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+fn terminal_has_reversed_substring(terminal: &Terminal<TestBackend>, needle: &str) -> bool {
+    let buffer = terminal.backend().buffer();
+    let symbols = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            if x as usize + symbols.len() > buffer.area.width as usize {
+                break;
+            }
+            let matches = symbols.iter().enumerate().all(|(offset, symbol)| {
+                let cell = &buffer[(x + offset as u16, y)];
+                cell.symbol() == symbol && cell.modifier.contains(Modifier::REVERSED)
+            });
+            if matches {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn footer_click_point(
@@ -4037,7 +4129,7 @@ fn logs_tab_test_app(logs: Vec<&str>) -> TuiApp {
     }
 }
 
-fn test_app_with_prop_dialog(dialog: BoolDialog) -> TuiApp {
+fn test_app_with_prop_dialog(dialog: PropDialog) -> TuiApp {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
     let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
@@ -4749,7 +4841,15 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
     assert!(app.prop_dialog.is_some());
     let dialog = app.prop_dialog.as_ref().unwrap();
     assert!(dialog.loading);
-    assert_eq!(dialog.items.len(), 1);
+    assert_eq!(dialog.items.len(), 3);
+    assert_eq!(
+        super::visible_prop_dialog_tab_titles(dialog, Language::Chinese),
+        vec![
+            "1:修改参数".to_string(),
+            "2:操作记录".to_string(),
+            "3:统计".to_string(),
+        ]
+    );
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -5373,13 +5473,13 @@ fn mouse_click_is_ignored_while_prop_editing() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
             items: vec![
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 1,
                         name: "Power".to_string(),
@@ -5389,8 +5489,8 @@ fn mouse_click_is_ignored_while_prop_editing() {
                     },
                     value: Value::Bool(true),
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 2,
                         name: "Brightness".to_string(),
@@ -5402,7 +5502,7 @@ fn mouse_click_is_ignored_while_prop_editing() {
                 },
             ],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -7273,12 +7373,12 @@ fn footer_text_matches_requested_status_copy() {
         "R: 刷新, /: 搜索, Enter: 查看设备, 设备总数: 1 当前设备: dev-1"
     );
 
-    app.prop_dialog = Some(BoolDialog {
+    app.prop_dialog = Some(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "speaker".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "Power".to_string(),
@@ -7289,7 +7389,7 @@ fn footer_text_matches_requested_status_copy() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -7313,7 +7413,7 @@ fn footer_text_matches_requested_status_copy() {
     );
 
     if let Some(dialog) = app.prop_dialog.as_mut() {
-        dialog.active_tab = BoolDialogTab::ReadOnly;
+        dialog.active_tab = PropDialogTab::ReadOnly;
     }
     assert_eq!(
         super::footer_text(&app),
@@ -7423,12 +7523,12 @@ fn clicking_refresh_operation_in_footer_triggers_sync() {
 
 #[test]
 fn clicking_esc_operation_in_footer_matches_escape_behavior() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "living-room".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "电源".to_string(),
@@ -7439,7 +7539,7 @@ fn clicking_esc_operation_in_footer_matches_escape_behavior() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -7652,17 +7752,7 @@ fn start_bootstrap_uses_cached_devices_immediately_while_syncing_in_background()
         mit_dir.join("auth.json"),
         serde_json::to_string_pretty(&json!({
             "accounts": [
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-a",
-                    "deviceId": "device-a",
-                    "state": "state-a",
-                    "accessToken": "",
-                    "refreshToken": "",
-                    "expiresTs": 1,
-                    "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-                }
+                persisted_auth_account_json("1001", "账号A", "union-a", "uuid-a", "device-a", "state-a", "", "", 1)
             ]
         }))
         .unwrap(),
@@ -8565,12 +8655,12 @@ fn prop_dialog_does_not_force_black_popup_background() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "Power".to_string(),
@@ -8581,7 +8671,7 @@ fn prop_dialog_does_not_force_black_popup_background() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -8662,12 +8752,12 @@ fn prop_dialog_refresh_starts_background_worker() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "Power".to_string(),
@@ -8678,7 +8768,7 @@ fn prop_dialog_refresh_starts_background_worker() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -8759,12 +8849,12 @@ fn prop_dialog_r_key_starts_background_refresh() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "Power".to_string(),
@@ -8775,7 +8865,7 @@ fn prop_dialog_r_key_starts_background_refresh() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -8830,6 +8920,72 @@ fn prop_dialog_r_key_starts_background_refresh() {
 }
 
 #[test]
+fn prop_dialog_footer_refresh_shows_props_loading_effect() {
+    let mut app = test_app_with_prop_dialog(PropDialog {
+        device_did: "dev-1".to_string(),
+        device_name: "dev-1".to_string(),
+        account_uid: "1001".to_string(),
+        items: vec![ToggleItem {
+            prop: PropItem {
+                siid: 2,
+                piid: 1,
+                name: "Power".to_string(),
+                format: "bool".to_string(),
+                writable: true,
+                value_options: Vec::new(),
+            },
+            value: Value::Bool(true),
+        }],
+        selected: 0,
+        active_tab: PropDialogTab::Writable,
+        writable_selected: 0,
+        readonly_selected: 0,
+        actions: Vec::new(),
+        actions_selected: 0,
+        writable_list_state: ListState::default(),
+        readonly_list_state: ListState::default(),
+        actions_list_state: ListState::default(),
+        loading: false,
+        loading_rx: None,
+        status: None,
+        editing: false,
+        edit_buffer: String::new(),
+        edit_cursor: 0,
+        edit_error: None,
+        refreshing: false,
+        refresh_rx: None,
+    });
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 100, 24);
+    let (column, row) = footer_click_point(&app, terminal_area, "R: Refresh");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert!(dialog.refreshing);
+    assert!(dialog.refresh_rx.is_some());
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("dev-1 (Loading...)"), "{text}");
+    assert!(
+        terminal_has_dim_substring(&terminal, "Power"),
+        "props row should dim while props are refreshing:\n{text}"
+    );
+}
+
+#[test]
 fn prop_dialog_number_shortcuts_switch_tabs() {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -8860,13 +9016,13 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
             items: vec![
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 1,
                         name: "Power".to_string(),
@@ -8876,8 +9032,8 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
                     },
                     value: Value::Bool(true),
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 2,
                         name: "ReadOnlyVolume".to_string(),
@@ -8887,9 +9043,11 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
                     },
                     value: json!(22),
                 },
+                raw_device_logs_item(json!({"records": []})),
+                raw_device_statistics_item(json!({"statistics": []})),
             ],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 1,
             actions: vec![ActionItem {
@@ -8946,7 +9104,7 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
     .unwrap();
     assert!(matches!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::Actions)
+        Some(PropDialogTab::Actions)
     ));
 
     handle_key(
@@ -8956,7 +9114,7 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
     .unwrap();
     assert!(matches!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::Writable)
+        Some(PropDialogTab::Writable)
     ));
 
     handle_key(
@@ -8966,7 +9124,7 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
     .unwrap();
     assert!(matches!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::ReadOnly)
+        Some(PropDialogTab::ReadOnly)
     ));
 
     handle_key(
@@ -8976,7 +9134,17 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
     .unwrap();
     assert!(matches!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::ReadOnly)
+        Some(PropDialogTab::Logs)
+    ));
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(matches!(
+        app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
+        Some(PropDialogTab::Statistics)
     ));
 }
 
@@ -8985,7 +9153,7 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
     let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
-    let (_refresh_tx, refresh_rx) = mpsc::channel::<std::result::Result<Vec<Value>, String>>();
+    let (_refresh_tx, refresh_rx) = mpsc::channel::<super::PropDialogRefreshMessage>();
     let account = normalize_account(json!({
         "region": "cn",
         "redirectUri": "http://127.0.0.1:8000/login_redirect",
@@ -9012,23 +9180,26 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
-                    siid: 2,
-                    piid: 1,
-                    name: "Power".to_string(),
-                    format: "bool".to_string(),
-                    writable: true,
-                    value_options: Vec::new(),
+            items: vec![
+                ToggleItem {
+                    prop: PropItem {
+                        siid: 2,
+                        piid: 1,
+                        name: "Power".to_string(),
+                        format: "bool".to_string(),
+                        writable: true,
+                        value_options: Vec::new(),
+                    },
+                    value: Value::Bool(true),
                 },
-                value: Value::Bool(true),
-            }],
+                raw_device_logs_item(json!({"records": []})),
+            ],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -9072,8 +9243,18 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
     };
 
     // Replace channel with one that already has a completed refresh payload.
-    let (tx, rx) = mpsc::channel::<std::result::Result<Vec<Value>, String>>();
-    tx.send(Ok(vec![Value::Bool(false)])).unwrap();
+    let (tx, rx) = mpsc::channel::<super::PropDialogRefreshMessage>();
+    tx.send(super::PropDialogRefreshMessage::Props(vec![(
+        0,
+        Value::Bool(false),
+    )]))
+    .unwrap();
+    tx.send(super::PropDialogRefreshMessage::Raw(vec![(
+        1,
+        json!({"records": [{"event": "updated"}]}),
+    )]))
+    .unwrap();
+    tx.send(super::PropDialogRefreshMessage::Finished).unwrap();
     if let Some(dialog) = app.prop_dialog.as_mut() {
         dialog.refresh_rx = Some(rx);
     }
@@ -9084,6 +9265,104 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
     assert!(!dialog.refreshing);
     assert!(dialog.refresh_rx.is_none());
     assert_eq!(dialog.items[0].value, Value::Bool(false));
+    assert_eq!(dialog.items[1].value["records"][0]["event"], "updated");
+}
+
+#[test]
+fn process_prop_dialog_loading_clears_props_loading_while_records_remain_pending() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let (tx, rx) = mpsc::channel::<super::PropDialogRefreshMessage>();
+    tx.send(super::PropDialogRefreshMessage::Props(vec![(
+        0,
+        Value::Bool(false),
+    )]))
+    .unwrap();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop.writable = true;
+    dialog.items[0].prop.name = "Power".to_string();
+    dialog.items[0].value = Value::Bool(true);
+    dialog.active_tab = PropDialogTab::Writable;
+    dialog.selected = 0;
+    dialog.writable_selected = 0;
+    dialog.items.push(raw_device_logs_item(json!({
+        "status": "loading",
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 0, "value": "[true]", "uid": "1001"}]
+                }
+            }
+        ]
+    })));
+    dialog.refreshing = true;
+    dialog.refresh_rx = Some(rx);
+
+    app.process_prop_dialog_loading();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert!(!dialog.refreshing);
+    assert!(dialog.refresh_rx.is_some());
+    assert_eq!(dialog.items[0].value, Value::Bool(false));
+    assert!(super::operation_record_logs_are_loading(dialog));
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(!text.contains("Loading..."), "{text}");
+    assert!(
+        !terminal_has_dim_substring(&terminal, "Power"),
+        "props row should not dim while records are still loading:\n{text}"
+    );
+
+    drop(tx);
+}
+
+#[test]
+fn process_initial_prop_dialog_loading_leaves_props_ready_while_raw_tabs_continue() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let (loading_tx, loading_rx) = mpsc::channel::<std::result::Result<Vec<ToggleItem>, String>>();
+    loading_tx
+        .send(Ok(vec![
+            ToggleItem {
+                prop: PropItem {
+                    siid: 2,
+                    piid: 1,
+                    name: "Power".to_string(),
+                    format: "bool".to_string(),
+                    writable: true,
+                    value_options: Vec::new(),
+                },
+                value: Value::Bool(true),
+            },
+            raw_device_logs_item(json!({"status": "loading"})),
+            raw_device_statistics_item(json!({"status": "loading"})),
+        ]))
+        .unwrap();
+    let (_raw_tx, raw_rx) = mpsc::channel::<super::PropDialogRefreshMessage>();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.loading = true;
+    dialog.loading_rx = Some(loading_rx);
+    dialog.refreshing = true;
+    dialog.refresh_rx = Some(raw_rx);
+    dialog.active_tab = PropDialogTab::Writable;
+    dialog.selected = 0;
+    dialog.writable_selected = 0;
+
+    app.process_prop_dialog_loading();
+
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    assert!(!dialog.loading);
+    assert!(!dialog.refreshing);
+    assert!(dialog.refresh_rx.is_some());
+    assert!(!super::prop_dialog_active_tab_is_loading(dialog));
+    dialog.active_tab = PropDialogTab::Logs;
+    assert!(super::prop_dialog_active_tab_is_loading(dialog));
+    dialog.active_tab = PropDialogTab::Statistics;
+    assert!(super::prop_dialog_active_tab_is_loading(dialog));
 }
 
 #[test]
@@ -9091,10 +9370,10 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
     let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
-    let (tx, rx) = mpsc::channel::<std::result::Result<Vec<BoolToggleItem>, String>>();
+    let (tx, rx) = mpsc::channel::<std::result::Result<Vec<ToggleItem>, String>>();
     tx.send(Ok(vec![
-        BoolToggleItem {
-            prop: BoolPropItem {
+        ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "Power".to_string(),
@@ -9104,8 +9383,8 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
             },
             value: Value::Bool(true),
         },
-        BoolToggleItem {
-            prop: BoolPropItem {
+        ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 2,
                 name: "Switch".to_string(),
@@ -9143,13 +9422,13 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
             items: vec![
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 1,
                         name: "Power".to_string(),
@@ -9159,8 +9438,8 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
                     },
                     value: Value::Null,
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 2,
                         name: "Switch".to_string(),
@@ -9172,7 +9451,7 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
                 },
             ],
             selected: 1,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 1,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -9253,13 +9532,13 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
             items: vec![
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 1,
                         name: "扬声器服务 / 电源".to_string(),
@@ -9269,8 +9548,8 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
                     },
                     value: Value::Bool(true),
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 2,
                         name: "扬声器服务 / 只读音量".to_string(),
@@ -9282,7 +9561,7 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
                 },
             ],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 1,
             actions: Vec::new(),
@@ -9365,12 +9644,12 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "客厅音箱".to_string(),
             device_name: "客厅音箱".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "扬声器服务 / 电源".to_string(),
@@ -9381,7 +9660,7 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -9441,6 +9720,38 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
 }
 
 #[test]
+fn prop_dialog_action_tab_does_not_inherit_operation_record_loading_state() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog
+        .items
+        .push(raw_device_logs_item(json!({"status": "loading"})));
+    dialog.actions = vec![ActionItem {
+        siid: 2,
+        aiid: 1,
+        name: "Reboot".to_string(),
+        input_piids: Vec::new(),
+        input_labels: Vec::new(),
+        input_props: Vec::new(),
+    }];
+    dialog.active_tab = PropDialogTab::Actions;
+    dialog.selected = 0;
+    dialog.actions_selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    assert!(text.contains("Reboot"), "{text}");
+    assert!(!text.contains("Loading..."), "{text}");
+    assert!(
+        !terminal_has_dim_substring(&terminal, "Reboot"),
+        "action rows should not dim while only operation records are loading:\n{text}"
+    );
+}
+
+#[test]
 fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -9471,12 +9782,12 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 2,
                     name: "ReadOnlyVolume".to_string(),
@@ -9487,7 +9798,7 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
                 value: json!(22),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::ReadOnly,
+            active_tab: PropDialogTab::ReadOnly,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -9537,7 +9848,7 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
     .unwrap();
     assert!(matches!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::ReadOnly)
+        Some(PropDialogTab::ReadOnly)
     ));
 
     handle_key(
@@ -9547,7 +9858,7 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
     .unwrap();
     assert!(matches!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::ReadOnly)
+        Some(PropDialogTab::ReadOnly)
     ));
 }
 
@@ -9634,13 +9945,13 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
             items: vec![
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 1,
                         name: "writable-power".to_string(),
@@ -9650,8 +9961,8 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
                     },
                     value: Value::Bool(true),
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 2,
                         name: "readonly-volume".to_string(),
@@ -9663,7 +9974,7 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
                 },
             ],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 1,
             actions: Vec::new(),
@@ -9724,6 +10035,2023 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
 }
 
 #[test]
+fn prop_dialog_statistics_tab_renders_controls_and_bar_chart() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "功耗 / 总耗电".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 4,
+            piid: 1,
+            name: "功耗 / 峰值".to_string(),
+            format: "float".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(0),
+    });
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "data_type": "stat_day_v3",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 0, "value": 1.25},
+                        {"time": 86400, "value": "2.5"}
+                    ]
+                }
+            },
+            {
+                "key": "4.1",
+                "data_type": "stat_day_v3",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 0, "value": 9.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "week"},
+        "date_filter": {
+            "time_start": 0,
+            "time_end": 604799
+        }
+    })));
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    app.prop_dialog.as_mut().unwrap().active_tab = PropDialogTab::Statistics;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let stats_text = terminal_text(&terminal);
+    let compact = stats_text.replace(' ', "");
+    assert!(compact.contains("S:统计项"), "{stats_text}");
+    assert!(compact.contains("功耗/总耗电"), "{stats_text}");
+    assert!(compact.contains("周▾"), "{stats_text}");
+    assert!(
+        stats_text.contains("1970-01-01 - 1970-01-08"),
+        "{stats_text}"
+    );
+    assert!(compact.contains("值↑时间→"), "{stats_text}");
+    assert!(stats_text.contains("01-01"), "{stats_text}");
+    assert!(stats_text.contains("2.5"), "{stats_text}");
+    let chart_title_position =
+        terminal_find_substring_position(&terminal, "值").expect("chart title rendered");
+    let first_value_position =
+        terminal_find_substring_position(&terminal, "1.25").expect("bar value label rendered");
+    let first_bar_position =
+        terminal_find_substring_position(&terminal, "█").expect("bar rendered");
+    let second_value_position =
+        terminal_find_substring_position(&terminal, "2.5").expect("second bar value rendered");
+    let second_time_position =
+        terminal_find_substring_position(&terminal, "01-02").expect("second time label rendered");
+    let first_time_position = terminal_find_substring_position_in_area(
+        &terminal,
+        "01-01",
+        ratatui::layout::Rect::new(0, 6, 120, 16),
+    )
+    .expect("first chart time label rendered");
+    assert!(
+        first_bar_position.0 >= chart_title_position.0.saturating_add(3),
+        "{stats_text}"
+    );
+    assert!(
+        first_time_position.0 > chart_title_position.0.saturating_add(15),
+        "{stats_text}"
+    );
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(
+            first_value_position.0,
+            first_value_position.1.saturating_add(1)
+        )]
+            .symbol(),
+        "█",
+        "{stats_text}"
+    );
+    assert_eq!(
+        second_value_position
+            .0
+            .saturating_mul(2)
+            .saturating_add(super::display_width("2.5")),
+        second_time_position
+            .0
+            .saturating_mul(2)
+            .saturating_add(super::display_width("01-02")),
+        "{stats_text}"
+    );
+    assert!(!stats_text.contains("\"requests\""), "{stats_text}");
+}
+
+#[test]
+fn prop_dialog_statistics_chart_points_fill_zero_daily_range() {
+    let start = Date::from_calendar_date(2026, Month::January, 1).unwrap();
+    let end = start.saturating_add(TimeDuration::days(3));
+    let third_day = start.saturating_add(TimeDuration::days(2));
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": super::date_start_timestamp(start), "value": 1.0},
+                        {"time": super::date_start_timestamp(third_day), "value": 3.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "week"},
+        "date_filter": {
+            "time_start": super::date_start_timestamp(start),
+            "time_end": super::date_end_timestamp(end)
+        }
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+
+    let points = super::statistics_chart_points(dialog, Language::Chinese).unwrap();
+
+    assert_eq!(
+        points
+            .iter()
+            .map(|point| point.label.as_str())
+            .collect::<Vec<_>>(),
+        ["01-01", "01-02", "01-03", "01-04"]
+    );
+    assert_eq!(
+        points
+            .iter()
+            .map(|point| point.text_value.as_str())
+            .collect::<Vec<_>>(),
+        ["1", "0", "3", "0"]
+    );
+}
+
+#[test]
+fn prop_dialog_statistics_tallest_bar_keeps_value_label_headroom() {
+    let start = Date::from_calendar_date(2026, Month::January, 1).unwrap();
+    let end = start.saturating_add(TimeDuration::days(1));
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": super::date_start_timestamp(start), "value": 10.0},
+                        {"time": super::date_start_timestamp(end), "value": 1.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "week"},
+        "date_filter": {
+            "time_start": super::date_start_timestamp(start),
+            "time_end": super::date_end_timestamp(end)
+        }
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let stats_text = terminal_text(&terminal);
+    let chart_area = ratatui::layout::Rect::new(0, 6, 100, 16);
+    let title_position =
+        terminal_find_substring_position_in_area(&terminal, "值", chart_area).unwrap();
+    let max_label_position =
+        terminal_find_substring_position_in_area(&terminal, "10", chart_area).unwrap();
+
+    assert!(
+        max_label_position.1 > title_position.1.saturating_add(2),
+        "{stats_text}"
+    );
+}
+
+#[test]
+fn prop_dialog_statistics_zero_value_renders_baseline_marker() {
+    let start = Date::from_calendar_date(2026, Month::January, 1).unwrap();
+    let end = start.saturating_add(TimeDuration::days(1));
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": super::date_start_timestamp(start), "value": 4.0},
+                        {"time": super::date_start_timestamp(end), "value": 0.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "week"},
+        "date_filter": {
+            "time_start": super::date_start_timestamp(start),
+            "time_end": super::date_end_timestamp(end)
+        }
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let stats_text = terminal_text(&terminal);
+    let chart_area = ratatui::layout::Rect::new(0, 6, 100, 16);
+    let zero_label_position =
+        terminal_find_substring_position_in_area(&terminal, "01-02", chart_area).unwrap();
+    let zero_marker_column = zero_label_position
+        .0
+        .saturating_add((super::display_width("01-02") / 2) as u16);
+    let buffer = terminal.backend().buffer();
+
+    assert_eq!(
+        buffer[(zero_marker_column, zero_label_position.1.saturating_sub(1))].symbol(),
+        "▁",
+        "{stats_text}"
+    );
+}
+
+#[test]
+fn prop_dialog_statistics_chart_points_use_range_endpoint_labels_for_month_and_year() {
+    let month_start = Date::from_calendar_date(2026, Month::January, 1).unwrap();
+    let month_end = Date::from_calendar_date(2026, Month::January, 5).unwrap();
+    let third_day = month_start.saturating_add(TimeDuration::days(2));
+    let mut month_app = app_with_single_readonly_prop_dialog();
+    let month_dialog = month_app.prop_dialog.as_mut().unwrap();
+    month_dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    month_dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": super::date_start_timestamp(third_day), "value": 4.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "month"},
+        "date_filter": {
+            "time_start": super::date_start_timestamp(month_start),
+            "time_end": super::date_end_timestamp(month_end)
+        }
+    })));
+
+    let month_points = super::statistics_chart_points(month_dialog, Language::Chinese).unwrap();
+
+    assert_eq!(month_points.first().unwrap().label, "01-01");
+    assert_eq!(month_points.last().unwrap().label, "01-05");
+    assert_eq!(
+        month_points
+            .iter()
+            .map(|point| point.text_value.as_str())
+            .collect::<Vec<_>>(),
+        ["0", "0", "4", "0", "0"]
+    );
+
+    let year_start = Date::from_calendar_date(2025, Month::January, 15).unwrap();
+    let year_end = Date::from_calendar_date(2025, Month::March, 10).unwrap();
+    let february = Date::from_calendar_date(2025, Month::February, 1).unwrap();
+    let mut year_app = app_with_single_readonly_prop_dialog();
+    let year_dialog = year_app.prop_dialog.as_mut().unwrap();
+    year_dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    year_dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": super::date_start_timestamp(february), "value": 8.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "year"},
+        "date_filter": {
+            "time_start": super::date_start_timestamp(year_start),
+            "time_end": super::date_end_timestamp(year_end)
+        }
+    })));
+
+    let year_points = super::statistics_chart_points(year_dialog, Language::Chinese).unwrap();
+
+    assert_eq!(
+        year_points
+            .iter()
+            .map(|point| point.label.as_str())
+            .collect::<Vec<_>>(),
+        ["2025-01", "2025-02", "2025-03"]
+    );
+    assert_eq!(
+        year_points
+            .iter()
+            .map(|point| point.text_value.as_str())
+            .collect::<Vec<_>>(),
+        ["0", "8", "0"]
+    );
+}
+
+#[test]
+fn prop_dialog_statistics_month_labels_stride_when_dense() {
+    let start = Date::from_calendar_date(2026, Month::January, 1).unwrap();
+    let end = Date::from_calendar_date(2026, Month::January, 31).unwrap();
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": super::date_start_timestamp(start), "value": 1.0},
+                        {"time": super::date_start_timestamp(end), "value": 1.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "month"},
+        "date_filter": {
+            "time_start": super::date_start_timestamp(start),
+            "time_end": super::date_end_timestamp(end)
+        }
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let stats_text = terminal_text(&terminal);
+    let chart_area = ratatui::layout::Rect::new(0, 6, 90, 16);
+    let visible_labels = [
+        "01-01", "01-04", "01-07", "01-10", "01-13", "01-16", "01-19", "01-22", "01-25", "01-28",
+        "01-31",
+    ];
+    let positions = visible_labels
+        .iter()
+        .map(|label| {
+            terminal_find_substring_position_in_area(&terminal, label, chart_area)
+                .unwrap_or_else(|| panic!("{label} missing\n{stats_text}"))
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        terminal_find_substring_position_in_area(&terminal, "01-02", chart_area).is_none(),
+        "{stats_text}"
+    );
+    assert!(
+        terminal_find_substring_position_in_area(&terminal, "01-03", chart_area).is_none(),
+        "{stats_text}"
+    );
+    for pair in positions.windows(2) {
+        assert_eq!(pair[0].1, pair[1].1, "{stats_text}");
+        assert!(
+            pair[1].0 >= pair[0].0.saturating_add("01-01".len() as u16 + 1),
+            "{stats_text}"
+        );
+    }
+}
+
+#[test]
+fn statistics_default_query_uses_rolling_time_windows() {
+    let today = super::today_local_date();
+
+    for (period, days) in [
+        (super::StatisticsPeriod::Week, 7),
+        (super::StatisticsPeriod::Month, 30),
+        (super::StatisticsPeriod::Year, 365),
+    ] {
+        let query = super::statistics_default_query(period);
+
+        assert_eq!(
+            query.time_start,
+            super::date_start_timestamp(today.saturating_sub(TimeDuration::days(days))),
+            "{period:?}"
+        );
+        assert_eq!(
+            query.time_end,
+            super::date_end_timestamp(today),
+            "{period:?}"
+        );
+    }
+    assert_eq!(super::StatisticsPeriod::Month.data_type(), "stat_day_v3");
+}
+
+#[test]
+fn prop_dialog_statistics_tab_shows_single_key_description_in_top_bar() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "功耗 / 总耗电".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "data_type": "stat_day_v3",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 0, "value": 1.25}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "week"}
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let stats_text = terminal_text(&terminal);
+    let compact = stats_text.replace(' ', "");
+    assert!(compact.contains("功耗/总耗电"), "{stats_text}");
+}
+
+#[test]
+fn prop_dialog_statistics_dropdown_selects_active_key_and_period() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 4,
+            piid: 1,
+            name: "Peak".to_string(),
+            format: "float".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(0),
+    });
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {"key": "2.2", "response": {"code": 0, "result": [{"time": 0, "value": 1.0}]}},
+            {"key": "4.1", "response": {"code": 0, "result": [{"time": 0, "value": 9.0}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let open_text = terminal_text(&terminal);
+    assert!(
+        terminal_has_green_substring(&terminal, "Energy"),
+        "{open_text}"
+    );
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let selected_text = terminal_text(&terminal);
+    assert!(selected_text.contains("Peak"), "{selected_text}");
+    assert!(selected_text.contains("9"), "{selected_text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let period_text = terminal_text(&terminal);
+    assert!(period_text.contains("周"), "{period_text}");
+    assert!(period_text.contains("月"), "{period_text}");
+    assert!(period_text.contains("年"), "{period_text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert_eq!(
+        super::statistics_period_for_dialog(dialog),
+        super::StatisticsPeriod::Month
+    );
+    let date_filter = super::raw_device_statistics_value(dialog)
+        .and_then(|value| value.get("date_filter"))
+        .expect("date filter set after changing statistics period");
+    assert_eq!(
+        super::json_i64(date_filter.get("time_start")),
+        Some(super::date_start_timestamp(
+            super::today_local_date().saturating_sub(TimeDuration::days(30))
+        ))
+    );
+    assert_eq!(
+        super::json_i64(date_filter.get("time_end")),
+        Some(super::date_end_timestamp(super::today_local_date()))
+    );
+}
+
+#[test]
+fn prop_dialog_statistics_without_response_renders_unsupported_message() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "功耗 / 总耗电".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "data_type": "stat_day_v3"
+            }
+        ],
+        "ui": {"period": "week"}
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let stats_text = terminal_text(&terminal);
+    let compact = stats_text.replace(' ', "");
+    assert!(compact.contains("此设备不支持查看统计数据"), "{stats_text}");
+    assert!(!compact.contains("值↑时间→"), "{stats_text}");
+    assert!(!stats_text.contains('█'), "{stats_text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_render_subtabs_and_table() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.accounts = vec![test_account()];
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.account_uid = "1001".to_string();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "开关 / 开关状态".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "功耗 / 电功率".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "type": "prop",
+                "response": {
+                    "code": 0,
+                    "message": "ok",
+                    "result": [
+                        {"time": 0, "value": "[true]", "uid": "1001"}
+                    ]
+                }
+            },
+            {
+                "key": "2.2",
+                "type": "prop",
+                "response": {
+                    "code": 0,
+                    "message": "ok",
+                    "result": [
+                        {"time": 60, "value": "[17]", "uid": "1001"}
+                    ]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let first_text = terminal_text(&terminal);
+    let first_compact = first_text.replace(' ', "");
+    assert!(first_compact.contains("开关/开关状态"), "{first_text}");
+    assert!(first_compact.contains("S:选择记录"), "{first_text}");
+    assert!(first_compact.contains("用户时间值"), "{first_text}");
+    assert!(first_text.contains("1970-01-01"), "{first_text}");
+    assert!(first_text.contains("[true]"), "{first_text}");
+    assert!(first_compact.contains("账号A"), "{first_text}");
+    assert!(!first_text.contains("\"requests\""), "{first_text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let second_text = terminal_text(&terminal);
+    assert!(second_text.contains("[17]"), "{second_text}");
+    assert!(!second_text.contains("[true]"), "{second_text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_dropdown_selects_active_key() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.accounts = vec![test_account()];
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.account_uid = "1001".to_string();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "开关 / 开关状态".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "功耗 / 电功率".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 0, "value": "[true]", "uid": "1001"}]
+                }
+            },
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 60, "value": "[17]", "uid": "1001"}]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let closed_text = terminal_text(&terminal);
+    let closed_compact = closed_text.replace(' ', "");
+    assert!(closed_compact.contains("S:选择记录"), "{closed_text}");
+    assert!(closed_text.contains("▾"), "{closed_text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let open_text = terminal_text(&terminal);
+    let open_compact = open_text.replace(' ', "");
+    assert!(open_text.contains("┌"), "{open_text}");
+    assert!(open_compact.contains("│功耗/电功率"), "{open_text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let selected_text = terminal_text(&terminal);
+    assert!(selected_text.contains("[17]"), "{selected_text}");
+    assert!(!selected_text.contains("[true]"), "{selected_text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_s_shortcut_opens_selector_and_footer_mentions_it() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "Energy".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}},
+            {"key": "2.2", "response": {"code": 0, "result": [{"time": 60, "value": "[17]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.replace(' ', "").contains("S:选择记录"), "{text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app
+        .prop_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.editing));
+}
+
+#[test]
+fn prop_dialog_operation_records_arrow_keys_move_open_dropdown_highlight() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "Energy".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}},
+            {"key": "2.2", "response": {"code": 0, "result": [{"time": 60, "value": "[17]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(terminal_has_green_substring(&terminal, "Power"));
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app
+        .prop_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.editing && dialog.edit_cursor == 1));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(terminal_has_green_substring(&terminal, "Energy"));
+}
+
+#[test]
+fn prop_dialog_operation_records_arrow_keys_move_rows_not_record_type() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "Energy".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 0, "value": "[true]", "uid": "1001"},
+                        {"time": 60, "value": "[false]", "uid": "1001"}
+                    ]
+                }
+            },
+            {
+                "key": "2.2",
+                "response": {"code": 0, "result": [{"time": 120, "value": "[17]", "uid": "1001"}]}
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let first_text = terminal_text(&terminal);
+    assert!(
+        terminal_has_reversed_substring(&terminal, "[true]"),
+        "{first_text}"
+    );
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert_eq!(
+        app.prop_dialog.as_ref().unwrap().selected,
+        0,
+        "row navigation must not switch the selected record type"
+    );
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("[true]"), "{text}");
+    assert!(text.contains("[false]"), "{text}");
+    assert!(!text.contains("[17]"), "{text}");
+    assert!(
+        terminal_has_reversed_substring(&terminal, "[false]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn prop_dialog_operation_records_scroll_moves_rows_not_record_type() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "Energy".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 0, "value": "[true]", "uid": "1001"},
+                        {"time": 60, "value": "[false]", "uid": "1001"}
+                    ]
+                }
+            },
+            {
+                "key": "2.2",
+                "response": {"code": 0, "result": [{"time": 120, "value": "[17]", "uid": "1001"}]}
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 2,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert_eq!(dialog.selected, 0);
+    assert_eq!(super::operation_record_active_row(dialog), 1);
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 2,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert_eq!(dialog.selected, 0);
+    assert_eq!(super::operation_record_active_row(dialog), 0);
+}
+
+#[test]
+fn prop_dialog_operation_records_active_row_stays_in_view() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    let records = (0..30)
+        .map(|index| {
+            json!({
+                "time": index * 60,
+                "value": format!("[row-{index:02}]"),
+                "uid": "1001"
+            })
+        })
+        .collect::<Vec<_>>();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": records
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    for _ in 0..20 {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    let mut terminal = Terminal::new(TestBackend::new(120, 16)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    assert!(text.contains("[row-20]"), "{text}");
+    assert!(
+        terminal_has_reversed_substring(&terminal, "[row-20]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn prop_dialog_operation_records_footer_shows_date_shortcuts_and_picker_opens() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("D: Date"), "{text}");
+    assert!(text.contains("C: Clear"), "{text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let picker_text = terminal_text(&terminal);
+    assert!(picker_text.contains("Date Range"), "{picker_text}");
+    assert!(!picker_text.contains("Select Start"), "{picker_text}");
+    assert!(!picker_text.contains("Cancel"), "{picker_text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_page_limit_defaults_to_fifty() {
+    assert_eq!(super::OPERATION_RECORD_PAGE_LIMIT, 50);
+}
+
+#[test]
+fn prop_dialog_operation_records_selector_row_shows_right_aligned_date_status() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let placeholder_x = (0..buffer.area.width)
+        .rev()
+        .find(|x| buffer[(*x, 4)].symbol() == "选")
+        .expect("right-aligned date placeholder");
+    assert!(
+        placeholder_x > 90,
+        "placeholder should be aligned on the right side, got x={placeholder_x}"
+    );
+
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    let logs = dialog.items.last_mut().unwrap();
+    logs.value["date_filter"] = json!({
+        "time_start": 0,
+        "time_end": 86_399
+    });
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let row = terminal_text(&terminal)
+        .lines()
+        .nth(4)
+        .unwrap_or_default()
+        .replace(' ', "");
+    assert!(row.contains("1970-01-01"), "{row}");
+    assert!(!row.contains("选择日期范围"), "{row}");
+}
+
+#[test]
+fn prop_dialog_operation_records_date_picker_sets_and_clears_filter() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    let logs = app
+        .prop_dialog
+        .as_ref()
+        .unwrap()
+        .items
+        .last()
+        .unwrap()
+        .value
+        .clone();
+    assert!(logs.get("date_filter").is_some(), "{logs}");
+    assert!(!app.prop_dialog.as_ref().unwrap().editing);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    let logs = &app
+        .prop_dialog
+        .as_ref()
+        .unwrap()
+        .items
+        .last()
+        .unwrap()
+        .value;
+    assert!(logs.get("date_filter").is_none(), "{logs}");
+}
+
+#[test]
+fn prop_dialog_operation_records_date_picker_accepts_mouse_date_selection() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    let before = super::operation_record_date_picker_state(app.prop_dialog.as_ref().unwrap())
+        .unwrap()
+        .cursor;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let calendar_area =
+        super::operation_record_date_picker_calendar_area(terminal_area).expect("calendar area");
+    let target_day = if before.day() == 1 { 2 } else { 1 };
+    let target_date = Date::from_calendar_date(before.year(), before.month(), target_day).unwrap();
+    let needle = format!("{target_day:>2}");
+    let (column, row) =
+        terminal_find_substring_position_in_area(&terminal, needle.as_str(), calendar_area)
+            .unwrap_or_else(|| panic!("{}", terminal_text(&terminal)));
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: column.saturating_add(1),
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    let after =
+        super::operation_record_date_picker_state(app.prop_dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(after.cursor, target_date);
+    assert_eq!(after.pending_start, Some(target_date));
+    assert_ne!(after.cursor, before);
+}
+
+#[test]
+fn prop_dialog_date_picker_popup_wraps_fixed_calendar_with_one_cell_padding() {
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+    let large_terminal_area = ratatui::layout::Rect::new(0, 0, 200, 60);
+    let popup = super::operation_record_date_picker_popup_area(terminal_area);
+    let large_popup = super::operation_record_date_picker_popup_area(large_terminal_area);
+    let calendar =
+        super::operation_record_date_picker_calendar_area(terminal_area).expect("calendar area");
+
+    assert_eq!(popup.width, large_popup.width);
+    assert_eq!(popup.height, large_popup.height);
+    assert_eq!(popup.width, calendar.width.saturating_add(2));
+    assert_eq!(popup.height, calendar.height.saturating_add(2));
+    assert_eq!(calendar.x, popup.x.saturating_add(1));
+    assert_eq!(calendar.y, popup.y.saturating_add(1));
+}
+
+#[test]
+fn prop_dialog_statistics_date_picker_omits_inline_description() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {"key": "2.2", "response": {"code": 0, "result": [{"time": 0, "value": 1.0}]}}
+        ],
+        "ui": {"period": "week"}
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let picker_text = terminal_text(&terminal);
+
+    assert!(picker_text.contains("Stats Range"), "{picker_text}");
+    assert!(!picker_text.contains("Select Week"), "{picker_text}");
+    assert!(!picker_text.contains("Cancel"), "{picker_text}");
+}
+
+#[test]
+fn prop_dialog_statistics_date_picker_mouse_click_selects_date() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {"key": "2.2", "response": {"code": 0, "result": [{"time": 0, "value": 1.0}]}}
+        ],
+        "ui": {"period": "week"}
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    let before = super::statistics_date_picker_state(app.prop_dialog.as_ref().unwrap())
+        .unwrap()
+        .cursor;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let calendar_area =
+        super::operation_record_date_picker_calendar_area(terminal_area).expect("calendar area");
+    let target_day = if before.day() == 1 { 2 } else { 1 };
+    let target_date = Date::from_calendar_date(before.year(), before.month(), target_day).unwrap();
+    let needle = format!("{target_day:>2}");
+    let (column, row) =
+        terminal_find_substring_position_in_area(&terminal, needle.as_str(), calendar_area)
+            .unwrap_or_else(|| panic!("{}", terminal_text(&terminal)));
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: column.saturating_add(1),
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert!(!dialog.editing);
+    let date_filter = super::raw_device_statistics_value(dialog)
+        .and_then(|value| value.get("date_filter"))
+        .expect("date filter selected by mouse click");
+    let (start, end) =
+        super::statistics_period_date_range(super::StatisticsPeriod::Week, target_date);
+    assert_eq!(
+        super::json_i64(date_filter.get("time_start")),
+        Some(super::date_start_timestamp(start))
+    );
+    assert_eq!(
+        super::json_i64(date_filter.get("time_end")),
+        Some(super::date_end_timestamp(end))
+    );
+}
+
+#[test]
+fn prop_dialog_operation_records_user_column_expands_to_nickname() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.accounts = vec![test_account_with("1001", "VeryLongOperatorName", "cn")];
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 0, "value": "[true]", "uid": "1001"}]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    assert!(text.contains("VeryLongOperatorName"), "{text}");
+    assert!(text.replace(' ', "").contains("用户"), "{text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_load_more_row_can_be_active() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "has_more": true,
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 60, "value": "[true]", "uid": "1001"},
+                        {"time": 0, "value": "[false]", "uid": "1001"}
+                    ]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.replace(' ', "").contains("加载更多"), "{text}");
+    assert!(
+        terminal_has_reversed_substring(&terminal, "[true]"),
+        "{text}"
+    );
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let second_text = terminal_text(&terminal);
+    assert!(
+        terminal_has_reversed_substring(&terminal, "[false]"),
+        "{second_text}"
+    );
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let third_text = terminal_text(&terminal);
+    let reversed_row = terminal_first_reversed_cell_row(&terminal).unwrap();
+    let reversed_text = third_text
+        .lines()
+        .nth(reversed_row as usize)
+        .unwrap_or_default()
+        .replace(' ', "");
+    assert!(reversed_text.contains("加载更多"), "{third_text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_no_more_row_can_be_scrolled_into_view() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    let records = (0..18)
+        .map(|index| {
+            json!({
+                "time": index * 60,
+                "value": format!("[row-{index:02}]"),
+                "uid": "1001"
+            })
+        })
+        .collect::<Vec<_>>();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "pagination": {"no_more": true},
+                "response": {
+                    "code": 0,
+                    "result": records
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    for _ in 0..18 {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert_eq!(super::operation_record_active_row(dialog), 18);
+    assert!(text.contains("No More Records"), "{text}");
+    assert!(
+        terminal_has_reversed_substring(&terminal, "No More Records"),
+        "{text}"
+    );
+}
+
+#[test]
+fn prop_dialog_operation_records_body_click_changes_active_row() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 1_900_000_060, "value": "[true]", "uid": "1001"},
+                        {"time": 1_900_000_000, "value": "[false]", "uid": "1001"}
+                    ]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let (column, row) =
+        terminal_find_substring_position(&terminal, "[false]").expect("second row rendered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert_eq!(super::operation_record_active_row(dialog), 1);
+}
+
+#[test]
+fn prop_dialog_operation_records_load_more_row_triggers_by_click_without_dialog_refreshing() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    app.accounts = vec![test_account()];
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "pagination": {"has_more": true, "loading_more": false},
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": 1_900_000_060, "value": "[true]", "uid": "1001"},
+                        {"time": 1_900_000_000, "value": "[false]", "uid": "1001"}
+                    ]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let (column, row) =
+        terminal_find_substring_position(&terminal, "Load More").expect("load more row rendered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    let requests = super::operation_record_requests(dialog);
+    assert_eq!(super::operation_record_active_row(dialog), 2);
+    assert!(
+        super::operation_record_request_is_loading_more(requests[0]),
+        "active_row={} request={}",
+        super::operation_record_active_row(dialog),
+        requests[0]
+    );
+    assert!(
+        !dialog.refreshing,
+        "operation-record pagination should not use the whole-dialog refresh flag"
+    );
+    assert!(dialog.refresh_rx.is_some());
+}
+
+#[test]
+fn prop_dialog_operation_records_selector_click_opens_and_selects() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.accounts = vec![test_account()];
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.account_uid = "1001".to_string();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "开关 / 开关状态".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "功耗 / 电功率".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 0, "value": "[true]", "uid": "1001"}]
+                }
+            },
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 60, "value": "[17]", "uid": "1001"}]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+        ratatui::layout::Rect::new(0, 0, 120, 24),
+    )
+    .unwrap();
+    assert!(
+        app.prop_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.editing),
+        "clicking selector row should open operation record menu"
+    );
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let open_text = terminal_text(&terminal);
+    let open_compact = open_text.replace(' ', "");
+    assert!(open_compact.contains("功耗/电功率"), "{open_text}");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        },
+        ratatui::layout::Rect::new(0, 0, 120, 24),
+    )
+    .unwrap();
+    assert!(
+        app.prop_dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.editing),
+        "clicking dropdown item should close operation record menu"
+    );
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let selected_text = terminal_text(&terminal);
+    assert!(selected_text.contains("[17]"), "{selected_text}");
+    assert!(!selected_text.contains("[true]"), "{selected_text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_selector_row_has_no_left_margin_and_bottom_border() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "开关 / 开关状态".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 0, "value": "[true]", "uid": "1001"}]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(1, 4)].symbol(), "S");
+    assert_eq!(buffer[(1, 5)].symbol(), "─");
+    assert_eq!(buffer[(1, 5)].fg, Color::Reset);
+}
+
+#[test]
+fn prop_dialog_operation_records_dropdown_does_not_expand_selector_row() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "开关 / 开关状态".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "功耗 / 电功率".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 0, "value": "[true]", "uid": "1001"}]
+                }
+            },
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [{"time": 60, "value": "[17]", "uid": "1001"}]
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.editing = true;
+
+    assert_eq!(super::operation_record_selector_height(dialog), 2);
+}
+
+#[test]
+fn prop_dialog_operation_records_loading_shows_loading_text() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.loading = true;
+    dialog
+        .items
+        .push(raw_device_logs_item(json!({"status": "loading"})));
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    let compact = text.replace(' ', "");
+    assert!(compact.contains("加载中"), "{text}");
+    assert!(!compact.contains("暂无操作记录"), "{text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_prop_refresh_does_not_show_log_loading() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.refreshing = true;
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "response": {"code": 0}
+            }
+        ]
+    })));
+
+    let lines = super::operation_records_table_lines(dialog, app.language, app.accounts.as_slice());
+    let text = lines.join("\n");
+    assert!(text.contains("暂无操作记录"), "{text}");
+    assert!(!text.contains("加载中"), "{text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_empty_results_still_show_date_picker_bar() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": []
+    })));
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    assert!(text.contains("D: Select Date Range"), "{text}");
+    assert!(text.contains("No operation records"), "{text}");
+}
+
+#[test]
+fn prop_dialog_operation_records_render_nonzero_code_as_error() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "开关 / 开关状态".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {
+                "key": "2.1",
+                "type": "prop",
+                "response": {
+                    "code": -8,
+                    "message": "invalid params",
+                    "result": null
+                }
+            }
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    let compact = text.replace(' ', "");
+    assert!(compact.contains("错误"), "{text}");
+    assert!(text.contains("code=-8"), "{text}");
+    assert!(text.contains("invalid params"), "{text}");
+}
+
+#[test]
+fn mijia_raw_requests_hide_successful_empty_results() {
+    let entries = super::visible_mijia_raw_request_entries(vec![
+        json!({
+            "key": "2.1",
+            "response": {
+                "code": 0,
+                "message": "ok",
+                "result": []
+            }
+        }),
+        json!({
+            "key": "2.2",
+            "response": {
+                "code": 0,
+                "message": "ok",
+                "result": [{"value": "[true]"}]
+            }
+        }),
+        json!({
+            "key": "2.3",
+            "response": {
+                "code": -8,
+                "message": "invalid params",
+                "result": null
+            }
+        }),
+    ]);
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["key"], "2.2");
+    assert_eq!(entries[1]["key"], "2.3");
+}
+
+#[test]
+fn mijia_statistics_key_uses_power_consumption_float_props_only() {
+    let power = PropItem {
+        siid: 4,
+        piid: 1,
+        name: "Power Consumption / Power Consumption".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    let switch_state = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Switch / Switch Status".to_string(),
+        format: "bool".to_string(),
+        writable: true,
+        value_options: Vec::new(),
+    };
+    let electric_power = PropItem {
+        siid: 4,
+        piid: 2,
+        name: "Power Consumption / Electric Power".to_string(),
+        format: "uint16".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+
+    assert_eq!(super::mijia_statistics_key(&power), Some("4.1".to_string()));
+    assert_eq!(super::mijia_statistics_key(&switch_state), None);
+    assert_eq!(super::mijia_statistics_key(&electric_power), None);
+}
+
+#[test]
 fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
     let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
@@ -9753,13 +12081,13 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
             items: vec![
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 1,
                         name: "zz-long".to_string(),
@@ -9769,8 +12097,8 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
                     },
                     value: Value::Bool(true),
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 2,
                         name: "mid".to_string(),
@@ -9780,8 +12108,8 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
                     },
                     value: json!(30),
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 3,
                         name: "s".to_string(),
@@ -9793,7 +12121,7 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
                 },
             ],
             selected: 0,
-            active_tab: BoolDialogTab::ReadOnly,
+            active_tab: PropDialogTab::ReadOnly,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -9862,12 +12190,12 @@ fn dialog_subtab_click_bounds_handle_wide_char_titles() {
 
 #[test]
 fn prop_dialog_visible_tabs_hide_empty_categories_and_keep_order() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "p1".to_string(),
@@ -9878,7 +12206,7 @@ fn prop_dialog_visible_tabs_hide_empty_categories_and_keep_order() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: vec![ActionItem {
@@ -9906,19 +12234,19 @@ fn prop_dialog_visible_tabs_hide_empty_categories_and_keep_order() {
 
     assert_eq!(
         super::visible_prop_dialog_tabs(&dialog),
-        vec![BoolDialogTab::Actions, BoolDialogTab::Writable]
+        vec![PropDialogTab::Actions, PropDialogTab::Writable]
     );
 }
 
 #[test]
 fn prop_dialog_visible_tab_titles_are_renumbered_one_based() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
         items: vec![
-            BoolToggleItem {
-                prop: BoolPropItem {
+            ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "p1".to_string(),
@@ -9928,8 +12256,8 @@ fn prop_dialog_visible_tab_titles_are_renumbered_one_based() {
                 },
                 value: Value::Bool(true),
             },
-            BoolToggleItem {
-                prop: BoolPropItem {
+            ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 2,
                     name: "p2".to_string(),
@@ -9941,7 +12269,7 @@ fn prop_dialog_visible_tab_titles_are_renumbered_one_based() {
             },
         ],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -9968,13 +12296,13 @@ fn prop_dialog_visible_tab_titles_are_renumbered_one_based() {
 
 #[test]
 fn prop_dialog_visible_tab_titles_empty_when_no_actions_or_properties() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
         items: Vec::new(),
         selected: 0,
-        active_tab: BoolDialogTab::Actions,
+        active_tab: PropDialogTab::Actions,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -10001,13 +12329,13 @@ fn prop_dialog_visible_tab_titles_empty_when_no_actions_or_properties() {
 
 #[test]
 fn prop_dialog_visible_tab_titles_actions_only_renumber_from_one() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
         items: Vec::new(),
         selected: 0,
-        active_tab: BoolDialogTab::Actions,
+        active_tab: PropDialogTab::Actions,
         writable_selected: 0,
         readonly_selected: 0,
         actions: vec![ActionItem {
@@ -10041,23 +12369,27 @@ fn prop_dialog_visible_tab_titles_actions_only_renumber_from_one() {
 
 #[test]
 fn prop_dialog_visible_tab_titles_readonly_only_renumber_from_one() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
-                siid: 2,
-                piid: 2,
-                name: "p2".to_string(),
-                format: "bool".to_string(),
-                writable: false,
-                value_options: Vec::new(),
+        items: vec![
+            ToggleItem {
+                prop: PropItem {
+                    siid: 2,
+                    piid: 2,
+                    name: "p2".to_string(),
+                    format: "bool".to_string(),
+                    writable: false,
+                    value_options: Vec::new(),
+                },
+                value: Value::Bool(false),
             },
-            value: Value::Bool(false),
-        }],
+            raw_device_logs_item(json!({"result": []})),
+            raw_device_statistics_item(json!({"result": []})),
+        ],
         selected: 0,
-        active_tab: BoolDialogTab::ReadOnly,
+        active_tab: PropDialogTab::ReadOnly,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -10078,19 +12410,23 @@ fn prop_dialog_visible_tab_titles_readonly_only_renumber_from_one() {
 
     assert_eq!(
         super::visible_prop_dialog_tab_titles(&dialog, Language::Chinese),
-        vec!["1:只读属性".to_string()]
+        vec![
+            "1:只读属性".to_string(),
+            "2:操作记录".to_string(),
+            "3:统计".to_string(),
+        ]
     );
 }
 
 #[test]
 fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
         items: vec![
-            BoolToggleItem {
-                prop: BoolPropItem {
+            ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "writable-only-item".to_string(),
@@ -10100,8 +12436,8 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
                 },
                 value: Value::Bool(true),
             },
-            BoolToggleItem {
-                prop: BoolPropItem {
+            ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 2,
                     name: "readonly-only-item".to_string(),
@@ -10113,7 +12449,7 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
             },
         ],
         selected: 1,
-        active_tab: BoolDialogTab::ReadOnly,
+        active_tab: PropDialogTab::ReadOnly,
         writable_selected: 0,
         readonly_selected: 1,
         actions: Vec::new(),
@@ -10152,7 +12488,7 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
 
     assert_eq!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::Writable)
+        Some(PropDialogTab::Writable)
     );
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -10164,12 +12500,12 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
 
 #[test]
 fn prop_dialog_applies_cached_mips_property_updates() {
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "switch".to_string(),
@@ -10180,7 +12516,7 @@ fn prop_dialog_applies_cached_mips_property_updates() {
             value: Value::Bool(false),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -10210,13 +12546,13 @@ fn prop_dialog_applies_cached_mips_property_updates() {
 #[test]
 fn process_cloud_mips_messages_logs_messages_and_errors() {
     let _guard = env_guard();
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
         items: Vec::new(),
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -10305,13 +12641,13 @@ fn refresh_cloud_mips_listeners_logs_when_no_eligible_device_groups() {
     std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
     std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
 
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
         items: Vec::new(),
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -10376,12 +12712,12 @@ fn stale_keypress_uses_recent_pingresp_as_mqtt_response_timer() {
     let _guard = env_guard();
     std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
     std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "speaker".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "Power".to_string(),
@@ -10392,7 +12728,7 @@ fn stale_keypress_uses_recent_pingresp_as_mqtt_response_timer() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -10488,12 +12824,12 @@ fn stale_keypress_refreshes_open_prop_editor() {
     let _guard = env_guard();
     std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
     std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "speaker".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "Power".to_string(),
@@ -10504,7 +12840,7 @@ fn stale_keypress_refreshes_open_prop_editor() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -10556,13 +12892,89 @@ fn stale_keypress_refreshes_open_prop_editor() {
 }
 
 #[test]
+fn stale_mouse_click_inside_prop_dialog_does_not_refresh() {
+    let _guard = env_guard();
+    std::env::remove_var("MIT_DISABLE_CLOUD_MIPS");
+    std::env::set_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS", "1");
+    let mut app = test_app_with_prop_dialog(PropDialog {
+        device_did: "dev-1".to_string(),
+        device_name: "speaker".to_string(),
+        account_uid: "1001".to_string(),
+        items: vec![ToggleItem {
+            prop: PropItem {
+                siid: 2,
+                piid: 1,
+                name: "Power".to_string(),
+                format: "bool".to_string(),
+                writable: true,
+                value_options: Vec::new(),
+            },
+            value: Value::Bool(true),
+        }],
+        selected: 0,
+        active_tab: PropDialogTab::Writable,
+        writable_selected: 0,
+        readonly_selected: 0,
+        actions: Vec::new(),
+        actions_selected: 0,
+        writable_list_state: ListState::default(),
+        readonly_list_state: ListState::default(),
+        actions_list_state: ListState::default(),
+        loading: false,
+        loading_rx: None,
+        status: None,
+        editing: false,
+        edit_buffer: String::new(),
+        edit_cursor: 0,
+        edit_error: None,
+        refreshing: false,
+        refresh_rx: None,
+    });
+    let (_tx, rx) = mpsc::channel();
+    let now = Instant::now();
+    {
+        let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+        *runtime = Some(super::CloudMipsRuntime {
+            key: "test-runtime".to_string(),
+            _handles: Vec::new(),
+            rx,
+            last_mqtt_response_at: Some(now - Duration::from_secs(301)),
+            last_ping_req_at: Some(now - Duration::from_secs(301)),
+            last_ping_resp_at: Some(now - Duration::from_secs(301)),
+        });
+    }
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+        ratatui::layout::Rect::new(0, 0, 80, 24),
+    )
+    .unwrap();
+
+    let dialog = app.prop_dialog.as_ref().unwrap();
+    assert!(!dialog.refreshing);
+    assert!(dialog.refresh_rx.is_none());
+    let logs = app.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    assert!(!logs.contains("cloud MIPS response stale"));
+
+    std::env::remove_var("MIT_ENABLE_CLOUD_MIPS_IN_TESTS");
+    let mut runtime = super::cloud_mips_runtime().lock().unwrap();
+    *runtime = None;
+}
+
+#[test]
 fn prop_dialog_keyboard_tab_cycles_over_visible_tabs_when_middle_hidden() {
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 2,
                 name: "readonly-only-item".to_string(),
@@ -10573,7 +12985,7 @@ fn prop_dialog_keyboard_tab_cycles_over_visible_tabs_when_middle_hidden() {
             value: json!(9),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Actions,
+        active_tab: PropDialogTab::Actions,
         writable_selected: 0,
         readonly_selected: 0,
         actions: vec![ActionItem {
@@ -10606,7 +13018,7 @@ fn prop_dialog_keyboard_tab_cycles_over_visible_tabs_when_middle_hidden() {
     .unwrap();
     assert_eq!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::ReadOnly)
+        Some(PropDialogTab::ReadOnly)
     );
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -10618,12 +13030,12 @@ fn prop_dialog_keyboard_tab_cycles_over_visible_tabs_when_middle_hidden() {
 
 #[test]
 fn prop_dialog_hidden_active_tab_is_normalized_before_render() {
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "dev-1".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 2,
                 name: "readonly-only-item".to_string(),
@@ -10634,7 +13046,7 @@ fn prop_dialog_hidden_active_tab_is_normalized_before_render() {
             value: json!(11),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: vec![ActionItem {
@@ -10665,7 +13077,7 @@ fn prop_dialog_hidden_active_tab_is_normalized_before_render() {
 
     assert_eq!(
         app.prop_dialog.as_ref().map(|dialog| dialog.active_tab),
-        Some(BoolDialogTab::Actions)
+        Some(PropDialogTab::Actions)
     );
 
     let text = terminal_text(&terminal);
@@ -10703,13 +13115,13 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "dev-1".to_string(),
             account_uid: "1001".to_string(),
             items: vec![
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 1,
                         name: "p1".to_string(),
@@ -10719,8 +13131,8 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
                     },
                     value: Value::Bool(true),
                 },
-                BoolToggleItem {
-                    prop: BoolPropItem {
+                ToggleItem {
+                    prop: PropItem {
                         siid: 2,
                         piid: 2,
                         name: "p2".to_string(),
@@ -10732,7 +13144,7 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
                 },
             ],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -10869,12 +13281,12 @@ fn clicking_active_prop_dialog_item_executes_it() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "Power".to_string(),
@@ -10885,7 +13297,7 @@ fn clicking_active_prop_dialog_item_executes_it() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -10991,12 +13403,12 @@ fn prop_dialog_actions_tab_renders_action_items() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "电源".to_string(),
@@ -11007,7 +13419,7 @@ fn prop_dialog_actions_tab_renders_action_items() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -11118,13 +13530,13 @@ fn action_param_edit_supports_tab_and_click_focus_switch() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
             items: Vec::new(),
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -11238,13 +13650,13 @@ fn action_param_textarea_row_focus_updates_cursor_and_input() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
             items: Vec::new(),
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -11348,13 +13760,13 @@ fn clicking_action_param_textarea_moves_cursor_to_clicked_character() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
             items: Vec::new(),
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -11363,7 +13775,7 @@ fn clicking_action_param_textarea_moves_cursor_to_clicked_character() {
                 name: "执行文本指令".to_string(),
                 input_piids: vec![1],
                 input_labels: vec!["参数1".to_string()],
-                input_props: vec![BoolPropItem {
+                input_props: vec![PropItem {
                     siid: 5,
                     piid: 1,
                     name: "参数1".to_string(),
@@ -11460,12 +13872,12 @@ fn draw_edit_mode_shows_visible_input_cursor() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "power".to_string(),
@@ -11476,7 +13888,7 @@ fn draw_edit_mode_shows_visible_input_cursor() {
                 value: Value::String("true".to_string()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -11557,12 +13969,12 @@ fn clicking_prop_edit_textarea_moves_cursor_to_clicked_character() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "power".to_string(),
@@ -11573,7 +13985,7 @@ fn clicking_prop_edit_textarea_moves_cursor_to_clicked_character() {
                 value: Value::String("on".to_string()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -11665,12 +14077,12 @@ fn action_param_edit_mode_shows_action_title_not_property_title() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 9,
                     name: "只读属性".to_string(),
@@ -11681,7 +14093,7 @@ fn action_param_edit_mode_shows_action_title_not_property_title() {
                 value: Value::String("x".to_string()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -11780,12 +14192,12 @@ fn action_bool_param_uses_selector_editor() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 5,
                     piid: 2,
                     name: "指令静默执行".to_string(),
@@ -11796,7 +14208,7 @@ fn action_bool_param_uses_selector_editor() {
                 value: Value::Bool(false),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -11866,12 +14278,12 @@ fn action_bool_param_uses_selector_editor() {
 
 #[test]
 fn action_editor_layout_is_compact_without_duplicate_help_lines() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "718342728.s16".to_string(),
         device_name: "右键-客厅".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 5,
                 piid: 2,
                 name: "指令静默执行".to_string(),
@@ -11882,7 +14294,7 @@ fn action_editor_layout_is_compact_without_duplicate_help_lines() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Actions,
+        active_tab: PropDialogTab::Actions,
         writable_selected: 0,
         readonly_selected: 0,
         actions: vec![ActionItem {
@@ -11891,7 +14303,7 @@ fn action_editor_layout_is_compact_without_duplicate_help_lines() {
             name: "执行文本指令".to_string(),
             input_piids: vec![2],
             input_labels: vec!["指令静默执行".to_string()],
-            input_props: vec![BoolPropItem {
+            input_props: vec![PropItem {
                 siid: 5,
                 piid: 2,
                 name: "指令静默执行".to_string(),
@@ -11960,13 +14372,13 @@ fn action_editor_layout_is_compact_without_duplicate_help_lines() {
 
 #[test]
 fn action_without_params_keeps_command_compact() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "718342728.s16".to_string(),
         device_name: "右键-客厅".to_string(),
         account_uid: "1001".to_string(),
         items: Vec::new(),
         selected: 0,
-        active_tab: BoolDialogTab::Actions,
+        active_tab: PropDialogTab::Actions,
         writable_selected: 0,
         readonly_selected: 0,
         actions: vec![ActionItem {
@@ -12042,27 +14454,27 @@ fn action_enum_param_uses_selector_editor() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 5,
                     piid: 3,
                     name: "执行模式".to_string(),
                     format: "uint8".to_string(),
                     writable: false,
                     value_options: vec![
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionA".to_string(),
                             value: Value::Number(0.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionB".to_string(),
                             value: Value::Number(1.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionC".to_string(),
                             value: Value::Number(2.into()),
                         },
@@ -12071,7 +14483,7 @@ fn action_enum_param_uses_selector_editor() {
                 value: Value::Number(1.into()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -12189,13 +14601,13 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
             items: Vec::new(),
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions,
@@ -12254,12 +14666,12 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
 
 #[test]
 fn prop_editor_bottom_lines_show_get_then_set_for_writable_props() {
-    let dialog = BoolDialog {
+    let dialog = PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "speaker".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "Power".to_string(),
@@ -12270,7 +14682,7 @@ fn prop_editor_bottom_lines_show_get_then_set_for_writable_props() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -12300,12 +14712,12 @@ fn prop_editor_bottom_lines_show_get_then_set_for_writable_props() {
 
 #[test]
 fn draw_writable_prop_editor_shows_get_command_above_set_command() {
-    let mut app = test_app_with_prop_dialog(BoolDialog {
+    let mut app = test_app_with_prop_dialog(PropDialog {
         device_did: "dev-1".to_string(),
         device_name: "speaker".to_string(),
         account_uid: "1001".to_string(),
-        items: vec![BoolToggleItem {
-            prop: BoolPropItem {
+        items: vec![ToggleItem {
+            prop: PropItem {
                 siid: 2,
                 piid: 1,
                 name: "Power".to_string(),
@@ -12316,7 +14728,7 @@ fn draw_writable_prop_editor_shows_get_command_above_set_command() {
             value: Value::Bool(true),
         }],
         selected: 0,
-        active_tab: BoolDialogTab::Writable,
+        active_tab: PropDialogTab::Writable,
         writable_selected: 0,
         readonly_selected: 0,
         actions: Vec::new(),
@@ -12402,13 +14814,13 @@ fn action_enum_param_without_readable_prop_still_uses_selector_editor() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
             items: Vec::new(),
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions,
@@ -12496,12 +14908,12 @@ fn writable_bool_prop_enters_selector_editor_before_execution() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "电源".to_string(),
@@ -12512,7 +14924,7 @@ fn writable_bool_prop_enters_selector_editor_before_execution() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -12608,12 +15020,12 @@ fn writable_bool_prop_selector_highlights_current_option_in_green() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "电源".to_string(),
@@ -12624,7 +15036,7 @@ fn writable_bool_prop_selector_highlights_current_option_in_green() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -12708,27 +15120,27 @@ fn writable_enum_prop_enters_selector_editor_before_execution() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 2,
                     name: "模式".to_string(),
                     format: "uint8".to_string(),
                     writable: true,
                     value_options: vec![
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionA".to_string(),
                             value: Value::Number(0.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionB".to_string(),
                             value: Value::Number(1.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionC".to_string(),
                             value: Value::Number(2.into()),
                         },
@@ -12737,7 +15149,7 @@ fn writable_enum_prop_enters_selector_editor_before_execution() {
                 value: Value::Number(1.into()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -12834,27 +15246,27 @@ fn action_enum_param_selector_highlights_current_option_in_green() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 5,
                     piid: 3,
                     name: "执行模式".to_string(),
                     format: "uint8".to_string(),
                     writable: false,
                     value_options: vec![
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionA".to_string(),
                             value: Value::Number(0.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionB".to_string(),
                             value: Value::Number(1.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionC".to_string(),
                             value: Value::Number(2.into()),
                         },
@@ -12863,7 +15275,7 @@ fn action_enum_param_selector_highlights_current_option_in_green() {
                 value: Value::Number(1.into()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -12954,12 +15366,12 @@ fn clicking_writable_bool_prop_selector_option_updates_selection() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "电源".to_string(),
@@ -12970,7 +15382,7 @@ fn clicking_writable_bool_prop_selector_option_updates_selection() {
                 value: Value::Bool(true),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -13072,27 +15484,27 @@ fn clicking_action_enum_param_selector_option_updates_selection() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 5,
                     piid: 3,
                     name: "执行模式".to_string(),
                     format: "uint8".to_string(),
                     writable: false,
                     value_options: vec![
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionA".to_string(),
                             value: Value::Number(0.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionB".to_string(),
                             value: Value::Number(1.into()),
                         },
-                        super::BoolPropValueOption {
+                        super::PropValueOption {
                             label: "optionC".to_string(),
                             value: Value::Number(2.into()),
                         },
@@ -13101,7 +15513,7 @@ fn clicking_action_enum_param_selector_option_updates_selection() {
                 value: Value::Number(1.into()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -13214,12 +15626,12 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 5,
                     piid: 2,
                     name: "静默执行".to_string(),
@@ -13230,7 +15642,7 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
                 value: Value::Bool(false),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -13240,7 +15652,7 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
                 input_piids: vec![1, 2],
                 input_labels: vec!["参数1".to_string(), "参数2".to_string()],
                 input_props: vec![
-                    BoolPropItem {
+                    PropItem {
                         siid: 5,
                         piid: 1,
                         name: "参数1".to_string(),
@@ -13248,7 +15660,7 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
                         writable: false,
                         value_options: Vec::new(),
                     },
-                    BoolPropItem {
+                    PropItem {
                         siid: 5,
                         piid: 2,
                         name: "静默执行".to_string(),
@@ -13355,13 +15767,13 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
             items: Vec::new(),
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -13371,7 +15783,7 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
                 input_piids: vec![1, 2],
                 input_labels: vec!["参数1".to_string(), "参数2".to_string()],
                 input_props: vec![
-                    BoolPropItem {
+                    PropItem {
                         siid: 5,
                         piid: 1,
                         name: "参数1".to_string(),
@@ -13379,7 +15791,7 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
                         writable: false,
                         value_options: Vec::new(),
                     },
-                    BoolPropItem {
+                    PropItem {
                         siid: 5,
                         piid: 2,
                         name: "参数2".to_string(),
@@ -13575,12 +15987,12 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 5,
                     piid: 2,
                     name: "静默执行".to_string(),
@@ -13591,7 +16003,7 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
                 value: Value::Bool(false),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -13601,7 +16013,7 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
                 input_piids: vec![1, 2],
                 input_labels: vec!["参数1".to_string(), "参数2".to_string()],
                 input_props: vec![
-                    BoolPropItem {
+                    PropItem {
                         siid: 5,
                         piid: 1,
                         name: "参数1".to_string(),
@@ -13609,7 +16021,7 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
                         writable: false,
                         value_options: Vec::new(),
                     },
-                    BoolPropItem {
+                    PropItem {
                         siid: 5,
                         piid: 2,
                         name: "静默执行".to_string(),
@@ -13746,12 +16158,12 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "power".to_string(),
@@ -13762,7 +16174,7 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
                 value: Value::String("on".to_string()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -13856,13 +16268,13 @@ fn action_param_textarea_grows_height_when_value_wraps() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "speaker".to_string(),
             account_uid: "1001".to_string(),
             items: Vec::new(),
             selected: 0,
-            active_tab: BoolDialogTab::Actions,
+            active_tab: PropDialogTab::Actions,
             writable_selected: 0,
             readonly_selected: 0,
             actions: vec![ActionItem {
@@ -13871,7 +16283,7 @@ fn action_param_textarea_grows_height_when_value_wraps() {
                 name: "执行文本指令".to_string(),
                 input_piids: vec![1],
                 input_labels: vec!["参数1".to_string()],
-                input_props: vec![BoolPropItem {
+                input_props: vec![PropItem {
                     siid: 5,
                     piid: 1,
                     name: "参数1".to_string(),
@@ -13969,12 +16381,12 @@ fn prop_edit_mode_moves_cursor_with_left_right() {
         device_search_cursor: 0,
         search_inputs: Default::default(),
         search_cursors: [0; 3],
-        prop_dialog: Some(BoolDialog {
+        prop_dialog: Some(PropDialog {
             device_did: "dev-1".to_string(),
             device_name: "living-room".to_string(),
             account_uid: "1001".to_string(),
-            items: vec![BoolToggleItem {
-                prop: BoolPropItem {
+            items: vec![ToggleItem {
+                prop: PropItem {
                     siid: 2,
                     piid: 1,
                     name: "power".to_string(),
@@ -13985,7 +16397,7 @@ fn prop_edit_mode_moves_cursor_with_left_right() {
                 value: Value::String("true".to_string()),
             }],
             selected: 0,
-            active_tab: BoolDialogTab::Writable,
+            active_tab: PropDialogTab::Writable,
             writable_selected: 0,
             readonly_selected: 0,
             actions: Vec::new(),
@@ -14572,17 +16984,7 @@ fn sync_failure_uses_cached_devices_without_quitting() {
         mit_dir.join("auth.json"),
         serde_json::to_string_pretty(&json!({
             "accounts": [
-                {
-                    "region": "cn",
-                    "redirectUri": "http://127.0.0.1:8000/login_redirect",
-                    "uuid": "uuid-a",
-                    "deviceId": "device-a",
-                    "state": "state-a",
-                    "accessToken": "token-a",
-                    "refreshToken": "refresh-a",
-                    "expiresTs": 1,
-                    "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-                }
+                persisted_auth_account_json("1001", "账号A", "union-a", "uuid-a", "device-a", "state-a", "token-a", "refresh-a", 1)
             ]
         }))
         .unwrap(),

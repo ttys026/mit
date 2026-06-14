@@ -19,13 +19,16 @@ use ratatui_textarea::{
     CursorMove, Input as TextAreaInput, Key as TextAreaKey, TextArea, WrapMode,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
+use time::{
+    format_description::FormatItem, macros::format_description, Date, Duration as TimeDuration,
+    Month, OffsetDateTime, UtcOffset,
+};
 use unicode_width::UnicodeWidthChar;
 
 #[cfg(not(test))]
@@ -33,6 +36,7 @@ use std::process::Command;
 
 use crate::cli::ensure_fresh_account;
 use crate::mico_api::{Device, MicoClient};
+use crate::mijia_api::{DeviceHistoryQuery, MijiaClient};
 use crate::mips_cloud::{
     config_from_account, start_property_cache_listener, CloudMipsHandle, CloudMipsStatus,
 };
@@ -64,11 +68,26 @@ const LOG_SCROLLBAR_THUMB: &str = "█";
 const LOG_SCROLLBAR_TRACK: &str = "║";
 const LOG_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
     format_description!("[hour]:[minute]:[second]");
+const OPERATION_RECORD_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
+    format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+const OPERATION_RECORD_DATE_FORMAT: &[FormatItem<'static>] =
+    format_description!("[year]-[month]-[day]");
+const OPERATION_RECORD_DATE_PICKER_CALENDAR_WIDTH: u16 = 21;
+const OPERATION_RECORD_DATE_PICKER_CALENDAR_HEIGHT: u16 = 9;
 const CLOUD_MIPS_RESPONSE_STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 const FOOTER_COPY_LOG_PREFIX: &str = "__footer_copied_at=";
 const FOOTER_COPY_BADGE_TEXT: &str = " [已复制]";
 const CACHE_ACCOUNT_PREFIX: &str = "cache-account:";
 const DEVICE_SEARCH_HEIGHT: u16 = 2;
+const RAW_LOG_FORMAT: &str = "__mit_raw_device_logs";
+const RAW_STATISTICS_FORMAT: &str = "__mit_raw_device_statistics";
+const MIJIA_PROP_DATA_TYPE: &str = "prop";
+const OPERATION_RECORD_PAGE_LIMIT: u32 = 50;
+const OPERATION_RECORD_MENU_MARKER: &str = "__mit_operation_record_menu";
+const OPERATION_RECORD_DATE_PICKER_PREFIX: &str = "__mit_operation_record_date_picker:";
+const STATISTICS_KEY_MENU_MARKER: &str = "__mit_statistics_key_menu";
+const STATISTICS_PERIOD_MENU_MARKER: &str = "__mit_statistics_period_menu";
+const STATISTICS_DATE_PICKER_PREFIX: &str = "__mit_statistics_date_picker:";
 
 fn active_tab_has_search(tab: usize) -> bool {
     matches!(tab, 0..=2)
@@ -100,10 +119,10 @@ pub(crate) fn tab_titles(lang: Language) -> [&'static str; 4] {
         Language::English => ["1:Account", "2:Device", "3:Log", "4:Settings"],
     }
 }
-pub(crate) fn account_list_header_titles(lang: Language) -> [&'static str; 4] {
+pub(crate) fn account_list_header_titles(lang: Language) -> [&'static str; 5] {
     match lang {
-        Language::Chinese => ["地区", "昵称", "ID", "状态"],
-        Language::English => ["Region", "Nickname", "ID", "Status"],
+        Language::Chinese => ["地区", "昵称", "ID", "小米", "米家"],
+        Language::English => ["Region", "Nickname", "ID", "Xiaomi", "Mijia"],
     }
 }
 pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 4] {
@@ -170,6 +189,7 @@ fn update_cloud_mips_runtime_liveness(
             }
         }
         CloudMipsStatus::IgnoredMessage { .. }
+        | CloudMipsStatus::AuthRejected { .. }
         | CloudMipsStatus::Error { .. }
         | CloudMipsStatus::Stopped => {}
     }
@@ -195,7 +215,7 @@ fn spec_node_label(node: &Value, lang: Language) -> Option<&str> {
     }
 }
 
-fn readonly_prop_detail_command(dialog: &BoolDialog) -> Option<String> {
+fn readonly_prop_detail_command(dialog: &PropDialog) -> Option<String> {
     let item = dialog.items.get(dialog.selected)?;
     if item.prop.writable {
         return None;
@@ -409,7 +429,7 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
             let readonly_detail = app
                 .prop_dialog
                 .as_ref()
-                .is_some_and(|dialog| dialog.active_tab == BoolDialogTab::ReadOnly);
+                .is_some_and(|dialog| dialog.active_tab == PropDialogTab::ReadOnly);
             if readonly_detail {
                 match key.code {
                     KeyCode::Esc => app.cancel_prop_edit(),
@@ -420,10 +440,92 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
                 }
                 return Ok(false);
             }
+            let editing_operation_records = app.prop_dialog.as_ref().is_some_and(|dialog| {
+                dialog.active_tab == PropDialogTab::Logs
+                    && dialog.editing
+                    && operation_record_menu_is_open(dialog)
+            });
+            if editing_operation_records {
+                match key.code {
+                    KeyCode::Esc => app.close_operation_record_menu(),
+                    KeyCode::Up => app.move_operation_record_menu(-1),
+                    KeyCode::Down => app.move_operation_record_menu(1),
+                    KeyCode::Enter | KeyCode::Char(' ') => app.select_operation_record_menu_item(),
+                    KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        copy_last_selection(app)
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            let editing_operation_record_date_picker =
+                app.prop_dialog.as_ref().is_some_and(|dialog| {
+                    dialog.active_tab == PropDialogTab::Logs
+                        && dialog.editing
+                        && operation_record_date_picker_is_open(dialog)
+                });
+            if editing_operation_record_date_picker {
+                match key.code {
+                    KeyCode::Esc => app.close_operation_record_date_picker(),
+                    KeyCode::Enter | KeyCode::Char(' ') => app.select_operation_record_date(),
+                    KeyCode::Left => app.move_operation_record_date(-1),
+                    KeyCode::Right => app.move_operation_record_date(1),
+                    KeyCode::Up => app.move_operation_record_date(-7),
+                    KeyCode::Down => app.move_operation_record_date(7),
+                    KeyCode::PageUp => app.move_operation_record_month(-1),
+                    KeyCode::PageDown => app.move_operation_record_month(1),
+                    KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        copy_last_selection(app)
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            let editing_statistics_menu = app.prop_dialog.as_ref().is_some_and(|dialog| {
+                dialog.active_tab == PropDialogTab::Statistics
+                    && dialog.editing
+                    && (statistics_key_menu_is_open(dialog)
+                        || statistics_period_menu_is_open(dialog))
+            });
+            if editing_statistics_menu {
+                match key.code {
+                    KeyCode::Esc => app.close_statistics_menu(),
+                    KeyCode::Up => app.move_statistics_menu(-1),
+                    KeyCode::Down => app.move_statistics_menu(1),
+                    KeyCode::Enter | KeyCode::Char(' ') => app.select_statistics_menu_item(),
+                    KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        copy_last_selection(app)
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            let editing_statistics_date_picker = app.prop_dialog.as_ref().is_some_and(|dialog| {
+                dialog.active_tab == PropDialogTab::Statistics
+                    && dialog.editing
+                    && statistics_date_picker_is_open(dialog)
+            });
+            if editing_statistics_date_picker {
+                match key.code {
+                    KeyCode::Esc => app.close_statistics_date_picker(),
+                    KeyCode::Enter | KeyCode::Char(' ') => app.select_statistics_date(),
+                    KeyCode::Left => app.move_statistics_date(-1),
+                    KeyCode::Right => app.move_statistics_date(1),
+                    KeyCode::Up => app.move_statistics_date(-7),
+                    KeyCode::Down => app.move_statistics_date(7),
+                    KeyCode::PageUp => app.move_statistics_month(-1),
+                    KeyCode::PageDown => app.move_statistics_month(1),
+                    KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        copy_last_selection(app)
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
             let editing_actions = app
                 .prop_dialog
                 .as_ref()
-                .is_some_and(|dialog| dialog.active_tab == BoolDialogTab::Actions);
+                .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Actions);
             match key.code {
                 KeyCode::Esc => app.cancel_prop_edit(),
                 KeyCode::Enter => {
@@ -448,6 +550,22 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
         }
         match key.code {
             KeyCode::Esc => app.prop_dialog = None,
+            KeyCode::Up
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Logs) =>
+            {
+                app.move_operation_record_row(-1)
+            }
+            KeyCode::Down
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Logs) =>
+            {
+                app.move_operation_record_row(1)
+            }
             KeyCode::Up => app.prev_bool_item(),
             KeyCode::Down => app.next_bool_item(),
             KeyCode::Char(ch) if ch.is_ascii_digit() => {
@@ -457,6 +575,72 @@ fn handle_key(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<bool>
             KeyCode::BackTab | KeyCode::Left => app.switch_prop_dialog_tab(false),
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 app.request_prop_dialog_refresh();
+            }
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Logs) =>
+            {
+                app.open_operation_record_menu()
+            }
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Statistics) =>
+            {
+                app.open_statistics_key_menu()
+            }
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Statistics) =>
+            {
+                app.open_statistics_period_menu()
+            }
+            KeyCode::Char('d') | KeyCode::Char('D')
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Logs) =>
+            {
+                app.open_operation_record_date_picker()
+            }
+            KeyCode::Char('d') | KeyCode::Char('D')
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Statistics) =>
+            {
+                app.open_statistics_date_picker()
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && app
+                        .prop_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Logs) =>
+            {
+                app.clear_operation_record_date_filter()
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && app
+                        .prop_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Statistics) =>
+            {
+                app.clear_statistics_date_filter()
+            }
+            KeyCode::Enter | KeyCode::Char(' ')
+                if app
+                    .prop_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Logs) =>
+            {
+                app.activate_operation_record_row()
             }
             KeyCode::Enter | KeyCode::Char(' ') => app.activate_selected_prop(),
             KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -670,7 +854,7 @@ fn handle_mouse(
     if !left_down && !left_drag && !left_up && !scroll_up && !scroll_down {
         return Ok(());
     }
-    if left_down || left_up || scroll_up || scroll_down {
+    if (left_down || left_up || scroll_up || scroll_down) && app.prop_dialog.is_none() {
         app.check_cloud_mips_stale_after_operation();
     }
     if left_down && app.search_is_active() {
@@ -687,6 +871,14 @@ fn handle_mouse(
 
     if left_down && click_outside_selected_range(mouse) {
         clear_selection_state();
+    }
+    if (left_down || scroll_up || scroll_down)
+        && handle_operation_record_mouse(app, mouse, terminal_area)
+    {
+        return Ok(());
+    }
+    if left_down && handle_statistics_mouse(app, mouse, terminal_area) {
+        return Ok(());
     }
     if app.active_tab == 2
         && (left_down || left_drag || left_up)
@@ -751,7 +943,7 @@ fn handle_mouse(
 
         let selected_before = *selected;
         let clicked_row = (mouse.row - inner.y) as usize;
-        if clicked_row >= 3 {
+        if clicked_row >= 4 {
             return Ok(());
         }
         if let Some(AccountActionDialog::Menu { selected }) = &mut app.account_action_dialog {
@@ -789,7 +981,7 @@ fn handle_mouse(
             let editing_actions = app
                 .prop_dialog
                 .as_ref()
-                .is_some_and(|dialog| dialog.active_tab == BoolDialogTab::Actions);
+                .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Actions);
             if left_down {
                 let popup = terminal_area;
                 let inner = fullscreen_dialog_inner_area(popup);
@@ -1158,6 +1350,327 @@ fn handle_mouse(
     Ok(())
 }
 
+enum OperationRecordMouseAction {
+    Open,
+    OpenDatePicker,
+    Close,
+    Select(usize),
+    MoveRow(isize),
+    SetRow(usize),
+    SetDate(Date),
+    Consume,
+}
+
+enum StatisticsMouseAction {
+    OpenKey,
+    OpenPeriod,
+    OpenDatePicker,
+    Close,
+    SelectKey(usize),
+    SelectPeriod(usize),
+    SetDate(Date),
+    Consume,
+}
+
+fn handle_operation_record_mouse(
+    app: &mut TuiApp,
+    mouse: MouseEvent,
+    terminal_area: ratatui::layout::Rect,
+) -> bool {
+    let action = {
+        let Some(dialog) = app.prop_dialog.as_ref() else {
+            return false;
+        };
+        if dialog.active_tab != PropDialogTab::Logs {
+            return false;
+        }
+        let request_count = operation_record_requests(dialog).len();
+        let left_down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+        let scroll_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+        let scroll_down = matches!(mouse.kind, MouseEventKind::ScrollDown);
+        if left_down && operation_record_date_picker_is_open(dialog) {
+            if let Some(date) =
+                operation_record_date_at_position(terminal_area, dialog, mouse.column, mouse.row)
+            {
+                match date {
+                    Some(date) => OperationRecordMouseAction::SetDate(date),
+                    None => OperationRecordMouseAction::Consume,
+                }
+            } else {
+                return false;
+            }
+        } else {
+            let inner = fullscreen_dialog_inner_area(terminal_area);
+            if inner.width == 0 || inner.height == 0 {
+                return false;
+            }
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .split(inner);
+            let list_area = sections[1];
+            if !rect_contains(list_area, mouse.column, mouse.row) {
+                return false;
+            }
+            if scroll_up {
+                OperationRecordMouseAction::MoveRow(-1)
+            } else if scroll_down {
+                OperationRecordMouseAction::MoveRow(1)
+            } else {
+                let selector_height =
+                    operation_record_selector_height(dialog).min(list_area.height);
+                if selector_height == 0 {
+                    return false;
+                }
+                let selector_area =
+                    Rect::new(list_area.x, list_area.y, list_area.width, selector_height);
+                let selector_row_area = Rect::new(
+                    selector_area.x,
+                    selector_area.y,
+                    selector_area.width,
+                    selector_area.height.min(2),
+                );
+                if rect_contains(selector_row_area, mouse.column, mouse.row) {
+                    if operation_record_date_filter_area(selector_row_area, dialog, app.language)
+                        .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                    {
+                        OperationRecordMouseAction::OpenDatePicker
+                    } else if request_count == 0 {
+                        OperationRecordMouseAction::Consume
+                    } else if dialog.editing {
+                        OperationRecordMouseAction::Close
+                    } else {
+                        OperationRecordMouseAction::Open
+                    }
+                } else if dialog.editing {
+                    let Some(dropdown_area) =
+                        operation_record_dropdown_area(list_area, dialog, app.language)
+                    else {
+                        return false;
+                    };
+                    if !rect_contains(dropdown_area, mouse.column, mouse.row) {
+                        return false;
+                    }
+                    let item_top = dropdown_area.y.saturating_add(1);
+                    let item_bottom = item_top.saturating_add(request_count as u16);
+                    let item_left = dropdown_area.x.saturating_add(1);
+                    let item_right = dropdown_area
+                        .x
+                        .saturating_add(dropdown_area.width.saturating_sub(1));
+                    if mouse.row >= item_top
+                        && mouse.row < item_bottom
+                        && mouse.column >= item_left
+                        && mouse.column < item_right
+                    {
+                        OperationRecordMouseAction::Select((mouse.row - item_top) as usize)
+                    } else {
+                        OperationRecordMouseAction::Consume
+                    }
+                } else if left_down {
+                    let body_area = Rect::new(
+                        list_area.x,
+                        list_area.y.saturating_add(selector_height),
+                        list_area.width,
+                        list_area.height.saturating_sub(selector_height),
+                    );
+                    if !rect_contains(body_area, mouse.column, mouse.row) {
+                        return false;
+                    }
+                    let visual_index = dialog
+                        .readonly_list_state
+                        .offset()
+                        .saturating_add(mouse.row.saturating_sub(body_area.y) as usize);
+                    if visual_index == 0 {
+                        OperationRecordMouseAction::Consume
+                    } else {
+                        let row = visual_index - 1;
+                        if row < operation_record_selectable_row_count(dialog) {
+                            OperationRecordMouseAction::SetRow(row)
+                        } else {
+                            OperationRecordMouseAction::Consume
+                        }
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+    };
+
+    match action {
+        OperationRecordMouseAction::Open => app.open_operation_record_menu(),
+        OperationRecordMouseAction::OpenDatePicker => app.open_operation_record_date_picker(),
+        OperationRecordMouseAction::Close => app.close_operation_record_menu(),
+        OperationRecordMouseAction::Select(index) => {
+            if let Some(dialog) = app.prop_dialog.as_mut() {
+                dialog.edit_cursor = index;
+            }
+            app.select_operation_record_menu_item();
+        }
+        OperationRecordMouseAction::MoveRow(delta) => app.move_operation_record_row(delta),
+        OperationRecordMouseAction::SetRow(row) => {
+            if let Some(dialog) = app.prop_dialog.as_mut() {
+                set_operation_record_active_row(dialog, row);
+            }
+            app.activate_operation_record_row();
+        }
+        OperationRecordMouseAction::SetDate(date) => {
+            app.set_operation_record_date_picker_cursor(date);
+            app.select_operation_record_date();
+        }
+        OperationRecordMouseAction::Consume => {}
+    }
+    true
+}
+
+fn handle_statistics_mouse(
+    app: &mut TuiApp,
+    mouse: MouseEvent,
+    terminal_area: ratatui::layout::Rect,
+) -> bool {
+    let action = {
+        let Some(dialog) = app.prop_dialog.as_ref() else {
+            return false;
+        };
+        if dialog.active_tab != PropDialogTab::Statistics {
+            return false;
+        }
+        if statistics_date_picker_is_open(dialog) {
+            if let Some(date) =
+                statistics_date_at_position(terminal_area, dialog, mouse.column, mouse.row)
+            {
+                match date {
+                    Some(date) => StatisticsMouseAction::SetDate(date),
+                    None => StatisticsMouseAction::Consume,
+                }
+            } else {
+                return false;
+            }
+        } else {
+            let inner = fullscreen_dialog_inner_area(terminal_area);
+            if inner.width == 0 || inner.height == 0 {
+                return false;
+            }
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .split(inner);
+            let list_area = sections[1];
+            if !rect_contains(list_area, mouse.column, mouse.row) {
+                return false;
+            }
+            let selector_height = statistics_selector_height(dialog).min(list_area.height);
+            if selector_height == 0 {
+                return false;
+            }
+            let selector_area =
+                Rect::new(list_area.x, list_area.y, list_area.width, selector_height);
+            let selector_row_area = Rect::new(
+                selector_area.x,
+                selector_area.y,
+                selector_area.width,
+                selector_area.height.min(2),
+            );
+            if rect_contains(selector_row_area, mouse.column, mouse.row) {
+                let date_area =
+                    statistics_date_filter_area(selector_row_area, dialog, app.language);
+                let period_area =
+                    statistics_period_area(selector_row_area, date_area, dialog, app.language);
+                if date_area.is_some_and(|area| rect_contains(area, mouse.column, mouse.row)) {
+                    StatisticsMouseAction::OpenDatePicker
+                } else if period_area
+                    .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                {
+                    StatisticsMouseAction::OpenPeriod
+                } else if statistics_requests(dialog).len() <= 1 {
+                    StatisticsMouseAction::Consume
+                } else if dialog.editing {
+                    StatisticsMouseAction::Close
+                } else {
+                    StatisticsMouseAction::OpenKey
+                }
+            } else if statistics_key_menu_is_open(dialog) {
+                let Some(dropdown_area) = statistics_dropdown_area(list_area, dialog, app.language)
+                else {
+                    return false;
+                };
+                if !rect_contains(dropdown_area, mouse.column, mouse.row) {
+                    return false;
+                }
+                let item_top = dropdown_area.y.saturating_add(1);
+                let item_bottom = item_top.saturating_add(statistics_requests(dialog).len() as u16);
+                let item_left = dropdown_area.x.saturating_add(1);
+                let item_right = dropdown_area
+                    .x
+                    .saturating_add(dropdown_area.width.saturating_sub(1));
+                if mouse.row >= item_top
+                    && mouse.row < item_bottom
+                    && mouse.column >= item_left
+                    && mouse.column < item_right
+                {
+                    StatisticsMouseAction::SelectKey((mouse.row - item_top) as usize)
+                } else {
+                    StatisticsMouseAction::Consume
+                }
+            } else if statistics_period_menu_is_open(dialog) {
+                let Some(dropdown_area) = statistics_period_dropdown_area(
+                    list_area,
+                    selector_row_area,
+                    dialog,
+                    app.language,
+                ) else {
+                    return false;
+                };
+                if !rect_contains(dropdown_area, mouse.column, mouse.row) {
+                    return false;
+                }
+                let item_top = dropdown_area.y.saturating_add(1);
+                let item_bottom = item_top.saturating_add(StatisticsPeriod::all().len() as u16);
+                let item_left = dropdown_area.x.saturating_add(1);
+                let item_right = dropdown_area
+                    .x
+                    .saturating_add(dropdown_area.width.saturating_sub(1));
+                if mouse.row >= item_top
+                    && mouse.row < item_bottom
+                    && mouse.column >= item_left
+                    && mouse.column < item_right
+                {
+                    StatisticsMouseAction::SelectPeriod((mouse.row - item_top) as usize)
+                } else {
+                    StatisticsMouseAction::Consume
+                }
+            } else {
+                return false;
+            }
+        }
+    };
+
+    match action {
+        StatisticsMouseAction::OpenKey => app.open_statistics_key_menu(),
+        StatisticsMouseAction::OpenPeriod => app.open_statistics_period_menu(),
+        StatisticsMouseAction::OpenDatePicker => app.open_statistics_date_picker(),
+        StatisticsMouseAction::Close => app.close_statistics_menu(),
+        StatisticsMouseAction::SelectKey(index) => {
+            if let Some(dialog) = app.prop_dialog.as_mut() {
+                dialog.edit_cursor = index;
+            }
+            app.select_statistics_menu_item();
+        }
+        StatisticsMouseAction::SelectPeriod(index) => {
+            if let Some(dialog) = app.prop_dialog.as_mut() {
+                dialog.edit_cursor = index;
+            }
+            app.select_statistics_menu_item();
+        }
+        StatisticsMouseAction::SetDate(date) => {
+            app.set_statistics_date_picker_cursor(date);
+            app.select_statistics_date();
+        }
+        StatisticsMouseAction::Consume => {}
+    }
+    true
+}
+
 fn handle_log_scrollbar_mouse(
     app: &mut TuiApp,
     mouse: MouseEvent,
@@ -1504,6 +2017,9 @@ enum FooterOperation {
     Refresh,
     Search,
     Enter,
+    SelectRecord,
+    DateFilter,
+    ClearDateFilter,
     Back,
     AddAccount,
     Copy,
@@ -1608,7 +2124,37 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
     let current_device_label = lang_str(lang, "当前设备", "Current Device");
     if let Some(dialog) = &app.prop_dialog {
         if dialog.editing {
-            if dialog.active_tab == BoolDialogTab::ReadOnly {
+            if dialog.active_tab == PropDialogTab::Logs {
+                return build_footer_segments(
+                    &[
+                        (
+                            lang_str(lang, "Enter: 选择", "Enter: Select"),
+                            FooterOperation::Enter,
+                        ),
+                        (
+                            lang_str(lang, "Esc: 返回", "Esc: Back"),
+                            FooterOperation::Back,
+                        ),
+                    ],
+                    Some(format!("{current_device_label}: {}", dialog.device_did)),
+                );
+            }
+            if dialog.active_tab == PropDialogTab::Statistics {
+                return build_footer_segments(
+                    &[
+                        (
+                            lang_str(lang, "Enter: 选择", "Enter: Select"),
+                            FooterOperation::Enter,
+                        ),
+                        (
+                            lang_str(lang, "Esc: 返回", "Esc: Back"),
+                            FooterOperation::Back,
+                        ),
+                    ],
+                    Some(format!("{current_device_label}: {}", dialog.device_did)),
+                );
+            }
+            if dialog.active_tab == PropDialogTab::ReadOnly {
                 return build_footer_segments(
                     &[(
                         lang_str(lang, "Esc: 返回", "Esc: Back"),
@@ -1632,7 +2178,7 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
             );
         }
         return match dialog.active_tab {
-            BoolDialogTab::Writable => build_footer_segments(
+            PropDialogTab::Writable => build_footer_segments(
                 &[
                     (
                         lang_str(lang, "R: 刷新", "R: Refresh"),
@@ -1649,7 +2195,7 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
                 ],
                 Some(format!("{current_device_label}: {}", dialog.device_did)),
             ),
-            BoolDialogTab::ReadOnly => build_footer_segments(
+            PropDialogTab::ReadOnly => build_footer_segments(
                 &[
                     (
                         lang_str(lang, "R: 刷新", "R: Refresh"),
@@ -1666,11 +2212,64 @@ fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
                 ],
                 Some(format!("{current_device_label}: {}", dialog.device_did)),
             ),
-            BoolDialogTab::Actions => build_footer_segments(
+            PropDialogTab::Actions => build_footer_segments(
                 &[
                     (
                         lang_str(lang, "R: 刷新", "R: Refresh"),
                         FooterOperation::Refresh,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 返回", "Esc: Back"),
+                        FooterOperation::Back,
+                    ),
+                ],
+                Some(format!("{current_device_label}: {}", dialog.device_did)),
+            ),
+            PropDialogTab::Logs => {
+                let mut ops = vec![(
+                    lang_str(lang, "R: 刷新", "R: Refresh"),
+                    FooterOperation::Refresh,
+                )];
+                if !operation_record_requests(dialog).is_empty() {
+                    ops.push((
+                        lang_str(lang, "S: 选择记录", "S: Select Record"),
+                        FooterOperation::SelectRecord,
+                    ));
+                }
+                ops.push((
+                    lang_str(lang, "D: 日期", "D: Date"),
+                    FooterOperation::DateFilter,
+                ));
+                ops.push((
+                    lang_str(lang, "C: 清除", "C: Clear"),
+                    FooterOperation::ClearDateFilter,
+                ));
+                ops.push((
+                    lang_str(lang, "Esc: 返回", "Esc: Back"),
+                    FooterOperation::Back,
+                ));
+                build_footer_segments(
+                    ops.as_slice(),
+                    Some(format!("{current_device_label}: {}", dialog.device_did)),
+                )
+            }
+            PropDialogTab::Statistics => build_footer_segments(
+                &[
+                    (
+                        lang_str(lang, "R: 刷新", "R: Refresh"),
+                        FooterOperation::Refresh,
+                    ),
+                    (
+                        lang_str(lang, "P: 周/月/年", "P: Period"),
+                        FooterOperation::DateFilter,
+                    ),
+                    (
+                        lang_str(lang, "D: 日期", "D: Date"),
+                        FooterOperation::DateFilter,
+                    ),
+                    (
+                        lang_str(lang, "C: 清除", "C: Clear"),
+                        FooterOperation::ClearDateFilter,
                     ),
                     (
                         lang_str(lang, "Esc: 返回", "Esc: Back"),
@@ -1838,6 +2437,27 @@ fn execute_footer_operation(app: &mut TuiApp, operation: FooterOperation) -> Res
             let _ = handle_key(
                 app,
                 crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )?;
+            Ok(())
+        }
+        FooterOperation::SelectRecord => {
+            let _ = handle_key(
+                app,
+                crossterm::event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            )?;
+            Ok(())
+        }
+        FooterOperation::DateFilter => {
+            let _ = handle_key(
+                app,
+                crossterm::event::KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            )?;
+            Ok(())
+        }
+        FooterOperation::ClearDateFilter => {
+            let _ = handle_key(
+                app,
+                crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
             )?;
             Ok(())
         }
@@ -2325,7 +2945,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 let popup = centered_rect(48, 34, frame.area());
                 let items = [
                     lang_str(app.language, "推送消息", "Push Message"),
-                    lang_str(app.language, "登录", "Login"),
+                    lang_str(app.language, "重新登录(小米)", "Relogin (Xiaomi)"),
+                    lang_str(app.language, "重新登录(米家)", "Relogin (Mijia)"),
                     lang_str(app.language, "退出登录", "Logout"),
                 ]
                 .iter()
@@ -2584,7 +3205,7 @@ struct TuiApp {
     device_search_cursor: usize,
     search_inputs: [String; 3],
     search_cursors: [usize; 3],
-    prop_dialog: Option<BoolDialog>,
+    prop_dialog: Option<PropDialog>,
     account_action_dialog: Option<AccountActionDialog>,
     account_list_state: ListState,
     device_list_state: ListState,
@@ -3216,9 +3837,36 @@ impl TuiApp {
                 CloudMipsStatus::IgnoredMessage { reason } => {
                     self.log(format!("cloud MIPS ignored message: {reason}"))
                 }
+                CloudMipsStatus::AuthRejected { message } => {
+                    self.log(format!(
+                        "cloud MIPS auth rejected: {message}; refreshing auth"
+                    ));
+                    self.handle_cloud_mips_auth_rejected();
+                }
                 CloudMipsStatus::Stopped => self.log("cloud MIPS stopped"),
             }
         }
+    }
+
+    fn handle_cloud_mips_auth_rejected(&mut self) {
+        let groups = self.cloud_mips_account_device_groups();
+        let stale_uids = groups
+            .iter()
+            .map(|(account, _)| account.user.uid.clone())
+            .collect::<HashSet<_>>();
+        if stale_uids.is_empty() {
+            return;
+        }
+        for account in &mut self.accounts {
+            if stale_uids.contains(&account.user.uid) {
+                account.expires_ts = 1;
+            }
+        }
+        match cloud_mips_runtime().lock() {
+            Ok(mut runtime) => *runtime = None,
+            Err(_) => self.log("cloud MIPS runtime lock poisoned"),
+        }
+        self.start_background_sync();
     }
 
     fn apply_cached_prop_dialog_updates(&mut self) {
@@ -3593,7 +4241,8 @@ impl TuiApp {
             row.region.as_str(),
             row.nickname.as_str(),
             row.uid.as_str(),
-            row.status.as_str(),
+            row.xiaomi_status.as_str(),
+            row.mijia_status.as_str(),
             label.as_str(),
         ]
         .iter()
@@ -3930,17 +4579,558 @@ impl TuiApp {
             let next = (current + 1) % indices.len();
             dialog.selected = indices[next];
             match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_selected = dialog.selected,
-                BoolDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
-                BoolDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                PropDialogTab::Writable => dialog.writable_selected = dialog.selected,
+                PropDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
+                PropDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                PropDialogTab::Logs | PropDialogTab::Statistics => {}
             }
         }
+    }
+
+    fn open_operation_record_menu(&mut self) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Logs {
+            return;
+        }
+        let indices = prop_dialog_indices_for_tab(dialog, PropDialogTab::Logs);
+        if indices.is_empty() {
+            return;
+        }
+        dialog.editing = true;
+        dialog.edit_buffer = OPERATION_RECORD_MENU_MARKER.to_string();
+        dialog.edit_error = None;
+        dialog.edit_cursor = operation_record_selected_request_index(dialog);
+    }
+
+    fn close_operation_record_menu(&mut self) {
+        if let Some(dialog) = &mut self.prop_dialog {
+            if dialog.active_tab == PropDialogTab::Logs && operation_record_menu_is_open(dialog) {
+                dialog.editing = false;
+                dialog.edit_buffer.clear();
+                dialog.edit_cursor = operation_record_active_row(dialog);
+            }
+        }
+    }
+
+    fn move_operation_record_menu(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Logs || !dialog.editing {
+            return;
+        }
+        let count = operation_record_requests(dialog).len();
+        if count == 0 {
+            return;
+        }
+        let current = dialog.edit_cursor.min(count - 1);
+        dialog.edit_cursor = if delta.is_negative() {
+            if current == 0 {
+                count - 1
+            } else {
+                current - 1
+            }
+        } else {
+            (current + 1) % count
+        };
+    }
+
+    fn select_operation_record_menu_item(&mut self) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Logs || !dialog.editing {
+            return;
+        }
+        let indices = prop_dialog_indices_for_tab(dialog, PropDialogTab::Logs);
+        if let Some(selected) = indices.get(dialog.edit_cursor).copied() {
+            if let Some(key) = dialog
+                .items
+                .get(selected)
+                .map(|item| mijia_prop_key(&item.prop))
+            {
+                set_operation_record_selected_key(dialog, key.as_str());
+            }
+        }
+        dialog.editing = false;
+        dialog.edit_buffer.clear();
+        dialog.edit_cursor = operation_record_active_row(dialog);
+    }
+
+    fn move_operation_record_row(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Logs || dialog.editing {
+            return;
+        }
+        let count = operation_record_selectable_row_count(dialog);
+        if count == 0 {
+            set_operation_record_active_row(dialog, 0);
+            return;
+        }
+        let current = operation_record_active_row(dialog).min(count - 1);
+        let next = if delta.is_negative() {
+            if current == 0 {
+                count - 1
+            } else {
+                current - 1
+            }
+        } else {
+            (current + 1) % count
+        };
+        set_operation_record_active_row(dialog, next);
+    }
+
+    fn activate_operation_record_row(&mut self) {
+        if self
+            .prop_dialog
+            .as_ref()
+            .is_some_and(operation_record_active_row_is_load_more)
+        {
+            self.request_operation_record_load_more();
+        }
+    }
+
+    fn open_operation_record_date_picker(&mut self) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Logs {
+            return;
+        }
+        let cursor = operation_record_date_filter_for_dialog(dialog)
+            .and_then(|(time_start, _)| timestamp_to_local_date(time_start))
+            .unwrap_or_else(today_local_date);
+        set_operation_record_date_picker_state(
+            dialog,
+            OperationRecordDatePickerState {
+                cursor,
+                pending_start: None,
+            },
+        );
+    }
+
+    fn close_operation_record_date_picker(&mut self) {
+        if let Some(dialog) = &mut self.prop_dialog {
+            if operation_record_date_picker_is_open(dialog) {
+                dialog.editing = false;
+                dialog.edit_buffer.clear();
+                dialog.edit_cursor = operation_record_active_row(dialog);
+            }
+        }
+    }
+
+    fn move_operation_record_date(&mut self, days: i64) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        let Some(mut state) = operation_record_date_picker_state(dialog) else {
+            return;
+        };
+        state.cursor = state.cursor.saturating_add(TimeDuration::days(days));
+        set_operation_record_date_picker_state(dialog, state);
+    }
+
+    fn set_operation_record_date_picker_cursor(&mut self, date: Date) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        let Some(mut state) = operation_record_date_picker_state(dialog) else {
+            return;
+        };
+        state.cursor = date;
+        set_operation_record_date_picker_state(dialog, state);
+    }
+
+    fn move_operation_record_month(&mut self, months: i32) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        let Some(mut state) = operation_record_date_picker_state(dialog) else {
+            return;
+        };
+        state.cursor = add_months_to_date(state.cursor, months);
+        set_operation_record_date_picker_state(dialog, state);
+    }
+
+    fn select_operation_record_date(&mut self) {
+        let mut should_refresh = false;
+        if let Some(dialog) = &mut self.prop_dialog {
+            let Some(mut state) = operation_record_date_picker_state(dialog) else {
+                return;
+            };
+            if let Some(start) = state.pending_start {
+                let (start, end) = if start <= state.cursor {
+                    (start, state.cursor)
+                } else {
+                    (state.cursor, start)
+                };
+                if let Some(value) = operation_record_raw_value_mut(dialog) {
+                    let object = value_object_mut(value);
+                    object.insert(
+                        "date_filter".to_string(),
+                        json!({
+                            "time_start": date_start_timestamp(start),
+                            "time_end": date_end_timestamp(end)
+                        }),
+                    );
+                    operation_record_ui_mut(value).insert("active_row".to_string(), json!(0));
+                }
+                dialog.editing = false;
+                dialog.edit_buffer.clear();
+                dialog.edit_cursor = 0;
+                should_refresh = true;
+            } else {
+                state.pending_start = Some(state.cursor);
+                set_operation_record_date_picker_state(dialog, state);
+            }
+        }
+        if should_refresh {
+            self.request_prop_dialog_refresh();
+        }
+    }
+
+    fn clear_operation_record_date_filter(&mut self) {
+        let mut should_refresh = false;
+        if let Some(dialog) = &mut self.prop_dialog {
+            if dialog.active_tab != PropDialogTab::Logs {
+                return;
+            }
+            if let Some(value) = operation_record_raw_value_mut(dialog) {
+                if value.get("date_filter").is_some() {
+                    clear_operation_record_date_filter_value(value);
+                    should_refresh = true;
+                }
+            }
+            dialog.editing = false;
+            dialog.edit_buffer.clear();
+            dialog.edit_cursor = operation_record_active_row(dialog);
+        }
+        if should_refresh {
+            self.request_prop_dialog_refresh();
+        }
+    }
+
+    fn open_statistics_key_menu(&mut self) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Statistics {
+            return;
+        }
+        if statistics_requests(dialog).len() <= 1 {
+            return;
+        }
+        dialog.editing = true;
+        dialog.edit_buffer = STATISTICS_KEY_MENU_MARKER.to_string();
+        dialog.edit_error = None;
+        dialog.edit_cursor = statistics_selected_request_index(dialog);
+    }
+
+    fn open_statistics_period_menu(&mut self) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Statistics {
+            return;
+        }
+        let current = statistics_period_for_dialog(dialog);
+        dialog.editing = true;
+        dialog.edit_buffer = STATISTICS_PERIOD_MENU_MARKER.to_string();
+        dialog.edit_error = None;
+        dialog.edit_cursor = StatisticsPeriod::all()
+            .into_iter()
+            .position(|period| period == current)
+            .unwrap_or(0);
+    }
+
+    fn close_statistics_menu(&mut self) {
+        if let Some(dialog) = &mut self.prop_dialog {
+            if dialog.active_tab == PropDialogTab::Statistics
+                && (statistics_key_menu_is_open(dialog) || statistics_period_menu_is_open(dialog))
+            {
+                dialog.editing = false;
+                dialog.edit_buffer.clear();
+                dialog.edit_cursor = statistics_selected_request_index(dialog);
+            }
+        }
+    }
+
+    fn move_statistics_menu(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Statistics || !dialog.editing {
+            return;
+        }
+        let count = if statistics_key_menu_is_open(dialog) {
+            statistics_requests(dialog).len()
+        } else if statistics_period_menu_is_open(dialog) {
+            StatisticsPeriod::all().len()
+        } else {
+            0
+        };
+        if count == 0 {
+            return;
+        }
+        let current = dialog.edit_cursor.min(count - 1);
+        dialog.edit_cursor = if delta.is_negative() {
+            if current == 0 {
+                count - 1
+            } else {
+                current - 1
+            }
+        } else {
+            (current + 1) % count
+        };
+    }
+
+    fn select_statistics_menu_item(&mut self) {
+        let mut should_refresh = false;
+        if let Some(dialog) = &mut self.prop_dialog {
+            if dialog.active_tab != PropDialogTab::Statistics || !dialog.editing {
+                return;
+            }
+            if statistics_key_menu_is_open(dialog) {
+                let requests = statistics_requests(dialog);
+                if let Some(key) = requests
+                    .get(dialog.edit_cursor)
+                    .and_then(|request| statistics_request_key(request))
+                    .map(ToString::to_string)
+                {
+                    set_statistics_selected_key(dialog, key.as_str());
+                }
+            } else if statistics_period_menu_is_open(dialog) {
+                let periods = StatisticsPeriod::all();
+                let period = periods
+                    .get(dialog.edit_cursor)
+                    .copied()
+                    .unwrap_or(StatisticsPeriod::Week);
+                if let Some(value) = raw_device_statistics_value_mut(dialog) {
+                    statistics_ui_mut(value).insert("period".to_string(), json!(period.key()));
+                    set_statistics_date_filter_value_ending_today(value, period);
+                    should_refresh = true;
+                } else {
+                    set_statistics_period(dialog, period);
+                }
+            }
+            dialog.editing = false;
+            dialog.edit_buffer.clear();
+            dialog.edit_cursor = statistics_selected_request_index(dialog);
+        }
+        if should_refresh {
+            self.request_prop_dialog_refresh();
+        }
+    }
+
+    fn open_statistics_date_picker(&mut self) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        if dialog.active_tab != PropDialogTab::Statistics {
+            return;
+        }
+        let cursor = statistics_date_filter_for_dialog(dialog)
+            .and_then(|(time_start, _)| timestamp_to_local_date(time_start))
+            .unwrap_or_else(today_local_date);
+        set_statistics_date_picker_state(
+            dialog,
+            OperationRecordDatePickerState {
+                cursor,
+                pending_start: None,
+            },
+        );
+    }
+
+    fn close_statistics_date_picker(&mut self) {
+        if let Some(dialog) = &mut self.prop_dialog {
+            if statistics_date_picker_is_open(dialog) {
+                dialog.editing = false;
+                dialog.edit_buffer.clear();
+                dialog.edit_cursor = statistics_selected_request_index(dialog);
+            }
+        }
+    }
+
+    fn move_statistics_date(&mut self, days: i64) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        let Some(mut state) = statistics_date_picker_state(dialog) else {
+            return;
+        };
+        state.cursor = state.cursor.saturating_add(TimeDuration::days(days));
+        set_statistics_date_picker_state(dialog, state);
+    }
+
+    fn set_statistics_date_picker_cursor(&mut self, date: Date) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        let Some(mut state) = statistics_date_picker_state(dialog) else {
+            return;
+        };
+        state.cursor = date;
+        set_statistics_date_picker_state(dialog, state);
+    }
+
+    fn move_statistics_month(&mut self, months: i32) {
+        let Some(dialog) = &mut self.prop_dialog else {
+            return;
+        };
+        let Some(mut state) = statistics_date_picker_state(dialog) else {
+            return;
+        };
+        state.cursor = add_months_to_date(state.cursor, months);
+        set_statistics_date_picker_state(dialog, state);
+    }
+
+    fn select_statistics_date(&mut self) {
+        let mut should_refresh = false;
+        if let Some(dialog) = &mut self.prop_dialog {
+            let Some(state) = statistics_date_picker_state(dialog) else {
+                return;
+            };
+            let period = statistics_period_for_dialog(dialog);
+            if let Some(value) = raw_device_statistics_value_mut(dialog) {
+                set_statistics_date_filter_value(value, period, state.cursor);
+                should_refresh = true;
+            }
+            dialog.editing = false;
+            dialog.edit_buffer.clear();
+            dialog.edit_cursor = statistics_selected_request_index(dialog);
+        }
+        if should_refresh {
+            self.request_prop_dialog_refresh();
+        }
+    }
+
+    fn clear_statistics_date_filter(&mut self) {
+        let mut should_refresh = false;
+        if let Some(dialog) = &mut self.prop_dialog {
+            if dialog.active_tab != PropDialogTab::Statistics {
+                return;
+            }
+            if let Some(value) = raw_device_statistics_value_mut(dialog) {
+                if value.get("date_filter").is_some() {
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("date_filter");
+                    }
+                    should_refresh = true;
+                }
+            }
+            dialog.editing = false;
+            dialog.edit_buffer.clear();
+            dialog.edit_cursor = statistics_selected_request_index(dialog);
+        }
+        if should_refresh {
+            self.request_prop_dialog_refresh();
+        }
+    }
+
+    fn request_operation_record_load_more(&mut self) {
+        let (account, device_did, logs_index, key, mut value, query) = {
+            let Some(dialog) = self.prop_dialog.as_ref() else {
+                return;
+            };
+            if dialog.active_tab != PropDialogTab::Logs
+                || dialog.loading
+                || dialog.refreshing
+                || dialog.refresh_rx.is_some()
+                || dialog.editing
+            {
+                return;
+            }
+            let Some(logs_index) = raw_device_logs_index(dialog) else {
+                return;
+            };
+            let Some(value) = dialog.items.get(logs_index).map(|item| item.value.clone()) else {
+                return;
+            };
+            let requests = operation_record_requests(dialog);
+            let Some(request) = operation_record_selected_request(dialog, requests.as_slice())
+            else {
+                return;
+            };
+            let Some(key) = operation_record_request_key(request).map(ToString::to_string) else {
+                return;
+            };
+            if !operation_record_active_row_is_load_more(dialog) {
+                return;
+            }
+            let Some(oldest_time) = oldest_operation_record_time(request) else {
+                return;
+            };
+            let mut query = operation_record_default_query(Some(&value));
+            query.limit = OPERATION_RECORD_PAGE_LIMIT;
+            query.time_end = oldest_time.saturating_sub(1);
+            if query.time_end < query.time_start {
+                return;
+            }
+            let Some(account) = self
+                .accounts
+                .iter()
+                .find(|account| account.user.uid == dialog.account_uid)
+                .cloned()
+            else {
+                return;
+            };
+            (
+                account,
+                dialog.device_did.clone(),
+                logs_index,
+                key,
+                value,
+                query,
+            )
+        };
+        set_operation_record_request_loading(&mut value, key.as_str(), true);
+        if let Some(dialog) = &mut self.prop_dialog {
+            if let Some(item) = dialog.items.get_mut(logs_index) {
+                item.value = value.clone();
+            }
+        }
+        let (tx, rx) = mpsc::channel::<PropDialogRefreshMessage>();
+        if let Some(dialog) = &mut self.prop_dialog {
+            dialog.refresh_rx = Some(rx);
+        }
+        thread::spawn(move || {
+            let result = (|| -> Result<PropDialogRefreshMessage> {
+                let auth = account
+                    .mijia
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("当前账号未登录米家"))?;
+                let client = MijiaClient::new()?;
+                let response = client.get_user_device_data_with_query(
+                    auth,
+                    device_did.as_str(),
+                    key.as_str(),
+                    MIJIA_PROP_DATA_TYPE,
+                    query,
+                )?;
+                merge_operation_record_page(&mut value, key.as_str(), query, response);
+                Ok(PropDialogRefreshMessage::Raw(vec![(logs_index, value)]))
+            })()
+            .unwrap_or_else(|error| PropDialogRefreshMessage::Error(error.to_string()));
+            let is_error = matches!(result, PropDialogRefreshMessage::Error(_));
+            let _ = tx.send(result);
+            if !is_error {
+                let _ = tx.send(PropDialogRefreshMessage::Finished);
+            }
+        });
     }
 
     fn prop_dialog_has_toggle_items(&self) -> bool {
         self.prop_dialog.as_ref().is_some_and(|dialog| {
             !dialog.loading
                 && dialog.status.is_none()
+                && !matches!(
+                    dialog.active_tab,
+                    PropDialogTab::Logs | PropDialogTab::Statistics
+                )
                 && !prop_dialog_indices_for_tab(dialog, dialog.active_tab).is_empty()
         })
     }
@@ -3959,9 +5149,10 @@ impl TuiApp {
                 return;
             }
             let preferred = match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_selected,
-                BoolDialogTab::ReadOnly => dialog.readonly_selected,
-                BoolDialogTab::Actions => dialog.actions_selected,
+                PropDialogTab::Writable => dialog.writable_selected,
+                PropDialogTab::ReadOnly => dialog.readonly_selected,
+                PropDialogTab::Actions => dialog.actions_selected,
+                PropDialogTab::Logs | PropDialogTab::Statistics => dialog.selected,
             };
             let selected = if indices.contains(&dialog.selected) {
                 dialog.selected
@@ -3972,9 +5163,10 @@ impl TuiApp {
             };
             dialog.selected = selected;
             match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_selected = selected,
-                BoolDialogTab::ReadOnly => dialog.readonly_selected = selected,
-                BoolDialogTab::Actions => dialog.actions_selected = selected,
+                PropDialogTab::Writable => dialog.writable_selected = selected,
+                PropDialogTab::ReadOnly => dialog.readonly_selected = selected,
+                PropDialogTab::Actions => dialog.actions_selected = selected,
+                PropDialogTab::Logs | PropDialogTab::Statistics => {}
             }
         }
     }
@@ -4022,7 +5214,7 @@ impl TuiApp {
         }
     }
 
-    fn set_prop_dialog_tab(&mut self, target: BoolDialogTab) {
+    fn set_prop_dialog_tab(&mut self, target: PropDialogTab) {
         if let Some(dialog) = &mut self.prop_dialog {
             if dialog.editing {
                 return;
@@ -4032,16 +5224,18 @@ impl TuiApp {
                 return;
             }
             match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_selected = dialog.selected,
-                BoolDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
-                BoolDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                PropDialogTab::Writable => dialog.writable_selected = dialog.selected,
+                PropDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
+                PropDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                PropDialogTab::Logs | PropDialogTab::Statistics => {}
             }
             dialog.active_tab = target;
             // Reset active index to 0 when switching tabs
             match target {
-                BoolDialogTab::Writable => dialog.writable_selected = 0,
-                BoolDialogTab::ReadOnly => dialog.readonly_selected = 0,
-                BoolDialogTab::Actions => dialog.actions_selected = 0,
+                PropDialogTab::Writable => dialog.writable_selected = 0,
+                PropDialogTab::ReadOnly => dialog.readonly_selected = 0,
+                PropDialogTab::Actions => dialog.actions_selected = 0,
+                PropDialogTab::Logs | PropDialogTab::Statistics => {}
             }
             let indices = prop_dialog_indices_for_tab(dialog, target);
             if let Some(selected) = indices.first().copied() {
@@ -4057,17 +5251,19 @@ impl TuiApp {
                 return false;
             }
             let offset = match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_list_state.offset(),
-                BoolDialogTab::ReadOnly => dialog.readonly_list_state.offset(),
-                BoolDialogTab::Actions => dialog.actions_list_state.offset(),
+                PropDialogTab::Writable => dialog.writable_list_state.offset(),
+                PropDialogTab::ReadOnly => dialog.readonly_list_state.offset(),
+                PropDialogTab::Actions => dialog.actions_list_state.offset(),
+                PropDialogTab::Logs | PropDialogTab::Statistics => 0,
             };
             let position = offset.saturating_add(row);
             if let Some(global_index) = indices.get(position) {
                 dialog.selected = *global_index;
                 match dialog.active_tab {
-                    BoolDialogTab::Writable => dialog.writable_selected = dialog.selected,
-                    BoolDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
-                    BoolDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                    PropDialogTab::Writable => dialog.writable_selected = dialog.selected,
+                    PropDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
+                    PropDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                    PropDialogTab::Logs | PropDialogTab::Statistics => {}
                 }
                 return true;
             }
@@ -4082,9 +5278,10 @@ impl TuiApp {
                 return None;
             }
             let offset = match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_list_state.offset(),
-                BoolDialogTab::ReadOnly => dialog.readonly_list_state.offset(),
-                BoolDialogTab::Actions => dialog.actions_list_state.offset(),
+                PropDialogTab::Writable => dialog.writable_list_state.offset(),
+                PropDialogTab::ReadOnly => dialog.readonly_list_state.offset(),
+                PropDialogTab::Actions => dialog.actions_list_state.offset(),
+                PropDialogTab::Logs | PropDialogTab::Statistics => 0,
             };
             let position = offset.saturating_add(row);
             indices.get(position).copied()
@@ -4101,15 +5298,18 @@ impl TuiApp {
             .prop_dialog
             .as_ref()
             .map(|dialog| dialog.active_tab)
-            .unwrap_or(BoolDialogTab::Writable);
-        if active_tab == BoolDialogTab::Actions {
+            .unwrap_or(PropDialogTab::Writable);
+        if active_tab == PropDialogTab::Actions {
             if let Err(error) = self.start_selected_action_params_edit() {
                 account_page::open_offline_prop_dialog_for_current(self, &error);
             }
             return;
         }
-        if active_tab == BoolDialogTab::ReadOnly {
+        if active_tab == PropDialogTab::ReadOnly {
             let _ = self.start_selected_readonly_prop_detail();
+            return;
+        }
+        if matches!(active_tab, PropDialogTab::Logs | PropDialogTab::Statistics) {
             return;
         }
         let Some(item) = self
@@ -4227,7 +5427,7 @@ impl TuiApp {
     fn prop_edit_push(&mut self, ch: char) {
         if let Some(dialog) = &mut self.prop_dialog {
             if dialog.editing {
-                if dialog.active_tab == BoolDialogTab::Actions {
+                if dialog.active_tab == PropDialogTab::Actions {
                     apply_action_param_row_key(
                         dialog,
                         crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
@@ -4251,7 +5451,7 @@ impl TuiApp {
     fn prop_edit_backspace(&mut self) {
         if let Some(dialog) = &mut self.prop_dialog {
             if dialog.editing {
-                if dialog.active_tab == BoolDialogTab::Actions {
+                if dialog.active_tab == PropDialogTab::Actions {
                     apply_action_param_row_key(
                         dialog,
                         crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
@@ -4275,7 +5475,7 @@ impl TuiApp {
     fn prop_edit_move_left(&mut self) {
         if let Some(dialog) = &mut self.prop_dialog {
             if dialog.editing {
-                if dialog.active_tab == BoolDialogTab::Actions {
+                if dialog.active_tab == PropDialogTab::Actions {
                     apply_action_param_row_key(
                         dialog,
                         crossterm::event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
@@ -4297,7 +5497,7 @@ impl TuiApp {
     fn prop_edit_move_right(&mut self) {
         if let Some(dialog) = &mut self.prop_dialog {
             if dialog.editing {
-                if dialog.active_tab == BoolDialogTab::Actions {
+                if dialog.active_tab == PropDialogTab::Actions {
                     apply_action_param_row_key(
                         dialog,
                         crossterm::event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
@@ -4326,7 +5526,7 @@ impl TuiApp {
 
     fn prop_edit_cycle_selector(&mut self, forward: bool) {
         if let Some(dialog) = &mut self.prop_dialog {
-            if !dialog.editing || dialog.active_tab == BoolDialogTab::Actions {
+            if !dialog.editing || dialog.active_tab == PropDialogTab::Actions {
                 return;
             }
             let _ = cycle_prop_edit_selector(dialog, forward);
@@ -4337,7 +5537,7 @@ impl TuiApp {
         if self
             .prop_dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.active_tab == BoolDialogTab::Actions)
+            .is_some_and(|dialog| dialog.active_tab == PropDialogTab::Actions)
         {
             return self.submit_selected_action_params_edit();
         }
@@ -4375,9 +5575,10 @@ impl TuiApp {
             }
             dialog.selected = index;
             match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_selected = index,
-                BoolDialogTab::ReadOnly => dialog.readonly_selected = index,
-                BoolDialogTab::Actions => dialog.actions_selected = index,
+                PropDialogTab::Writable => dialog.writable_selected = index,
+                PropDialogTab::ReadOnly => dialog.readonly_selected = index,
+                PropDialogTab::Actions => dialog.actions_selected = index,
+                PropDialogTab::Logs | PropDialogTab::Statistics => {}
             }
             dialog.editing = false;
             dialog.edit_buffer.clear();
@@ -4394,7 +5595,7 @@ impl TuiApp {
 
     fn next_action_param_focus(&mut self) {
         if let Some(dialog) = &mut self.prop_dialog {
-            if dialog.active_tab != BoolDialogTab::Actions || !dialog.editing {
+            if dialog.active_tab != PropDialogTab::Actions || !dialog.editing {
                 return;
             }
             let rows = action_param_rows_for_dialog(dialog);
@@ -4409,7 +5610,7 @@ impl TuiApp {
 
     fn prev_action_param_focus(&mut self) {
         if let Some(dialog) = &mut self.prop_dialog {
-            if dialog.active_tab != BoolDialogTab::Actions || !dialog.editing {
+            if dialog.active_tab != PropDialogTab::Actions || !dialog.editing {
                 return;
             }
             let rows = action_param_rows_for_dialog(dialog);
@@ -4428,7 +5629,7 @@ impl TuiApp {
 
     fn focus_action_param_row(&mut self, row: usize) {
         if let Some(dialog) = &mut self.prop_dialog {
-            if dialog.active_tab != BoolDialogTab::Actions || !dialog.editing {
+            if dialog.active_tab != PropDialogTab::Actions || !dialog.editing {
                 return;
             }
             let rows = action_param_rows_for_dialog(dialog);
@@ -4537,7 +5738,7 @@ impl TuiApp {
 
     fn next_account_action_item(&mut self) {
         if let Some(AccountActionDialog::Menu { selected }) = &mut self.account_action_dialog {
-            *selected = (*selected + 1) % 3;
+            *selected = (*selected + 1) % 4;
         }
     }
 
@@ -4558,16 +5759,17 @@ impl TuiApp {
             };
             dialog.selected = indices[prev];
             match dialog.active_tab {
-                BoolDialogTab::Writable => dialog.writable_selected = dialog.selected,
-                BoolDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
-                BoolDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                PropDialogTab::Writable => dialog.writable_selected = dialog.selected,
+                PropDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
+                PropDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                PropDialogTab::Logs | PropDialogTab::Statistics => {}
             }
         }
     }
 
     fn prev_account_action_item(&mut self) {
         if let Some(AccountActionDialog::Menu { selected }) = &mut self.account_action_dialog {
-            *selected = if *selected == 0 { 2 } else { *selected - 1 };
+            *selected = if *selected == 0 { 3 } else { *selected - 1 };
         }
     }
 
@@ -4603,39 +5805,49 @@ impl TuiApp {
         let placeholder_items = props
             .iter()
             .cloned()
-            .map(|prop| BoolToggleItem {
+            .map(|prop| ToggleItem {
                 prop,
                 value: Value::Null,
             })
+            .chain([
+                raw_device_logs_item(json!({"status": "loading"})),
+                raw_device_statistics_item(json!({"status": "loading"})),
+            ])
             .collect::<Vec<_>>();
         let writable_indices = placeholder_items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| item.prop.writable.then_some(index))
+            .filter_map(|(index, item)| {
+                (item.prop.writable && !is_raw_device_json_item(item)).then_some(index)
+            })
             .collect::<Vec<_>>();
         let readonly_indices = placeholder_items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| (!item.prop.writable).then_some(index))
+            .filter_map(|(index, item)| {
+                (!item.prop.writable && !is_raw_device_json_item(item)).then_some(index)
+            })
             .collect::<Vec<_>>();
         let active_tab = if !actions.is_empty() {
-            BoolDialogTab::Actions
+            PropDialogTab::Actions
         } else if writable_indices.is_empty() {
-            BoolDialogTab::ReadOnly
+            PropDialogTab::ReadOnly
         } else {
-            BoolDialogTab::Writable
+            PropDialogTab::Writable
         };
         let initial_selected = match active_tab {
-            BoolDialogTab::Writable => writable_indices.first().copied(),
-            BoolDialogTab::ReadOnly => readonly_indices.first().copied(),
-            BoolDialogTab::Actions => Some(0),
+            PropDialogTab::Writable => writable_indices.first().copied(),
+            PropDialogTab::ReadOnly => readonly_indices.first().copied(),
+            PropDialogTab::Actions => Some(0),
+            PropDialogTab::Logs | PropDialogTab::Statistics => None,
         }
         .unwrap_or(0);
         let did = selected.did.clone();
         let property_cache = self.property_cache.clone();
-        let (tx, rx) = mpsc::channel::<std::result::Result<Vec<BoolToggleItem>, String>>();
+        let (tx, rx) = mpsc::channel::<std::result::Result<Vec<ToggleItem>, String>>();
+        let (raw_tx, raw_rx) = mpsc::channel::<PropDialogRefreshMessage>();
         thread::spawn(move || {
-            let result = (|| -> Result<Vec<BoolToggleItem>> {
+            let result = (|| -> Result<(Vec<ToggleItem>, Vec<String>, Vec<String>)> {
                 let query_refs = props
                     .iter()
                     .map(|prop| (did.as_str(), prop.siid, prop.piid))
@@ -4667,10 +5879,15 @@ impl TuiApp {
                     property_cache.set_device_properties(did.clone(), cache_update);
                 }
 
+                let mijia_prop_keys = props.iter().map(mijia_prop_key).collect::<Vec<_>>();
+                let mijia_statistics_keys = props
+                    .iter()
+                    .filter_map(mijia_statistics_key)
+                    .collect::<Vec<_>>();
                 let items = props
                     .into_iter()
                     .enumerate()
-                    .map(|(index, prop)| BoolToggleItem {
+                    .map(|(index, prop)| ToggleItem {
                         prop,
                         value: cached_values
                             .get(index)
@@ -4679,13 +5896,61 @@ impl TuiApp {
                             .unwrap_or(Value::Null),
                     })
                     .collect::<Vec<_>>();
-                Ok(items)
-            })()
-            .map_err(|error| error.to_string());
-            let _ = tx.send(result);
+                Ok((items, mijia_prop_keys, mijia_statistics_keys))
+            })();
+            let (mut items, mijia_prop_keys, mijia_statistics_keys) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = tx.send(Err(error.to_string()));
+                    let _ = raw_tx.send(PropDialogRefreshMessage::Finished);
+                    return;
+                }
+            };
+            let logs_index = items.len();
+            let statistics_index = logs_index + 1;
+            items.push(raw_device_logs_item(json!({"status": "loading"})));
+            items.push(raw_device_statistics_item(json!({"status": "loading"})));
+            if tx.send(Ok(items)).is_err() {
+                return;
+            }
+            let result = (|| -> Result<()> {
+                let logs_value =
+                    load_mijia_device_logs_json(&account, did.as_str(), mijia_prop_keys.as_slice());
+                if raw_tx
+                    .send(PropDialogRefreshMessage::Raw(vec![(
+                        logs_index, logs_value,
+                    )]))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                let statistics_value = load_mijia_device_statistics_json(
+                    &account,
+                    did.as_str(),
+                    mijia_statistics_keys.as_slice(),
+                );
+                if raw_tx
+                    .send(PropDialogRefreshMessage::Raw(vec![(
+                        statistics_index,
+                        statistics_value,
+                    )]))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    let _ = raw_tx.send(PropDialogRefreshMessage::Finished);
+                }
+                Err(error) => {
+                    let _ = raw_tx.send(PropDialogRefreshMessage::Error(error.to_string()));
+                }
+            }
         });
         self.account_action_dialog = None;
-        self.prop_dialog = Some(BoolDialog {
+        self.prop_dialog = Some(PropDialog {
             device_did: selected.did.clone(),
             device_name: selected.name.clone(),
             account_uid,
@@ -4707,7 +5972,7 @@ impl TuiApp {
             edit_cursor: 0,
             edit_error: None,
             refreshing: false,
-            refresh_rx: None,
+            refresh_rx: Some(raw_rx),
         });
         self.log(format!(
             "opened property dialog for {} ({})",
@@ -4725,13 +5990,26 @@ impl TuiApp {
     }
 
     fn request_prop_dialog_refresh_inner(&mut self, allow_editing: bool) {
-        let (device_did, account, queries) = match &self.prop_dialog {
+        let (
+            device_did,
+            account,
+            queries,
+            mijia_prop_keys,
+            mijia_statistics_keys,
+            operation_record_date_filter,
+            statistics_period,
+            statistics_query,
+            statistics_selected_key,
+            logs_index,
+            statistics_index,
+        ) = match &self.prop_dialog {
             Some(dialog)
                 if !dialog.loading
                     && dialog.status.is_none()
                     && !dialog.items.is_empty()
                     && (allow_editing || !dialog.editing)
-                    && !dialog.refreshing =>
+                    && !dialog.refreshing
+                    && dialog.refresh_rx.is_none() =>
             {
                 let Some(account) = self
                     .accounts
@@ -4741,52 +6019,142 @@ impl TuiApp {
                 else {
                     return;
                 };
+                let statistics_period = statistics_period_for_dialog(dialog);
+                let statistics_query =
+                    statistics_query_for_value(raw_device_statistics_value(dialog));
                 (
                     dialog.device_did.clone(),
                     account,
                     dialog
                         .items
                         .iter()
-                        .map(|item| (item.prop.siid, item.prop.piid))
+                        .enumerate()
+                        .filter_map(|(index, item)| {
+                            (!is_raw_device_json_item(item)).then_some((
+                                index,
+                                item.prop.siid,
+                                item.prop.piid,
+                            ))
+                        })
                         .collect::<Vec<_>>(),
+                    dialog
+                        .items
+                        .iter()
+                        .filter(|item| !is_raw_device_json_item(item))
+                        .map(|item| mijia_prop_key(&item.prop))
+                        .collect::<Vec<_>>(),
+                    dialog
+                        .items
+                        .iter()
+                        .filter(|item| !is_raw_device_json_item(item))
+                        .filter_map(|item| mijia_statistics_key(&item.prop))
+                        .collect::<Vec<_>>(),
+                    operation_record_date_filter_for_dialog(dialog),
+                    statistics_period,
+                    statistics_query,
+                    statistics_selected_key(dialog),
+                    raw_device_logs_index(dialog),
+                    raw_device_statistics_index(dialog),
                 )
             }
             _ => return,
         };
         let property_cache = self.property_cache.clone();
-        let (tx, rx) = mpsc::channel::<std::result::Result<Vec<Value>, String>>();
+        let (tx, rx) = mpsc::channel::<PropDialogRefreshMessage>();
         if let Some(dialog) = &mut self.prop_dialog {
-            dialog.refreshing = true;
+            dialog.refreshing = !queries.is_empty();
+            if let Some(index) = logs_index {
+                if let Some(item) = dialog.items.get_mut(index) {
+                    set_raw_device_loading_status(&mut item.value, true);
+                }
+            }
+            if let Some(index) = statistics_index {
+                if let Some(item) = dialog.items.get_mut(index) {
+                    set_raw_device_loading_status(&mut item.value, true);
+                }
+            }
             dialog.refresh_rx = Some(rx);
         }
         thread::spawn(move || {
-            let result = (|| -> Result<Vec<Value>> {
-                let query_refs = queries
-                    .iter()
-                    .map(|(siid, piid)| (device_did.as_str(), *siid, *piid))
-                    .collect::<Vec<_>>();
-                let client = MicoClient::new(&account)?;
-                let values = client.get_props_batch(&query_refs)?;
-                let list = values
-                    .as_array()
-                    .ok_or_else(|| anyhow!("property refresh did not return list"))?;
+            let result = (|| -> Result<()> {
+                if !queries.is_empty() {
+                    let query_refs = queries
+                        .iter()
+                        .map(|(_, siid, piid)| (device_did.as_str(), *siid, *piid))
+                        .collect::<Vec<_>>();
+                    let client = MicoClient::new(&account)?;
+                    let values = client.get_props_batch(&query_refs)?;
+                    let list = values
+                        .as_array()
+                        .ok_or_else(|| anyhow!("property refresh did not return list"))?;
 
-                // Update cache with fresh values
-                let mut cache_update: std::collections::HashMap<(i64, i64), Value> =
-                    std::collections::HashMap::new();
-                for (idx, (siid, piid)) in queries.iter().enumerate() {
-                    let value = list.get(idx).cloned().unwrap_or(Value::Null);
-                    cache_update.insert((*siid, *piid), value);
+                    // Update cache with fresh values
+                    let mut cache_update: std::collections::HashMap<(i64, i64), Value> =
+                        std::collections::HashMap::new();
+                    for (idx, (_, siid, piid)) in queries.iter().enumerate() {
+                        let value = list.get(idx).cloned().unwrap_or(Value::Null);
+                        cache_update.insert((*siid, *piid), value);
+                    }
+                    property_cache.set_device_properties(device_did.clone(), cache_update);
+
+                    let updates = queries
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (item_index, _, _))| {
+                            (
+                                *item_index,
+                                list.get(idx)
+                                    .and_then(extract_prop_value)
+                                    .unwrap_or(Value::Null),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if tx.send(PropDialogRefreshMessage::Props(updates)).is_err() {
+                        return Ok(());
+                    }
                 }
-                property_cache.set_device_properties(device_did.clone(), cache_update);
 
-                Ok(list
-                    .iter()
-                    .map(|raw| extract_prop_value(raw).unwrap_or(Value::Null))
-                    .collect::<Vec<_>>())
-            })()
-            .map_err(|error| error.to_string());
-            let _ = tx.send(result);
+                if let Some(index) = logs_index {
+                    let value = load_mijia_device_logs_json_with_query(
+                        &account,
+                        device_did.as_str(),
+                        mijia_prop_keys.as_slice(),
+                        operation_record_date_filter,
+                    );
+                    if tx
+                        .send(PropDialogRefreshMessage::Raw(vec![(index, value)]))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                if let Some(index) = statistics_index {
+                    let value = load_mijia_device_statistics_json_with_query(
+                        &account,
+                        device_did.as_str(),
+                        mijia_statistics_keys.as_slice(),
+                        statistics_period,
+                        statistics_query,
+                        statistics_selected_key,
+                    );
+                    if tx
+                        .send(PropDialogRefreshMessage::Raw(vec![(index, value)]))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(PropDialogRefreshMessage::Finished);
+                }
+                Err(error) => {
+                    let _ = tx.send(PropDialogRefreshMessage::Error(error.to_string()));
+                }
+            }
         });
     }
 
@@ -4810,17 +6178,21 @@ impl TuiApp {
                 dialog.loading_rx = None;
                 match result {
                     Ok(items) => {
+                        dialog.refreshing = false;
                         let previous_selected = dialog.selected;
                         let previous_writable_selected = dialog.writable_selected;
                         let previous_readonly_selected = dialog.readonly_selected;
                         let previous_actions_selected = dialog.actions_selected;
                         dialog.items = items;
                         let writable_indices =
-                            prop_dialog_indices_for_tab(dialog, BoolDialogTab::Writable);
+                            prop_dialog_indices_for_tab(dialog, PropDialogTab::Writable);
                         let readonly_indices =
-                            prop_dialog_indices_for_tab(dialog, BoolDialogTab::ReadOnly);
+                            prop_dialog_indices_for_tab(dialog, PropDialogTab::ReadOnly);
                         let actions_indices =
-                            prop_dialog_indices_for_tab(dialog, BoolDialogTab::Actions);
+                            prop_dialog_indices_for_tab(dialog, PropDialogTab::Actions);
+                        let logs_indices = prop_dialog_indices_for_tab(dialog, PropDialogTab::Logs);
+                        let statistics_indices =
+                            prop_dialog_indices_for_tab(dialog, PropDialogTab::Statistics);
                         let preserve_index = |indices: &[usize], preferred: usize| {
                             indices
                                 .iter()
@@ -4836,24 +6208,30 @@ impl TuiApp {
                         dialog.actions_selected =
                             preserve_index(&actions_indices, previous_actions_selected);
                         dialog.selected = match dialog.active_tab {
-                            BoolDialogTab::Writable => {
+                            PropDialogTab::Writable => {
                                 preserve_index(&writable_indices, previous_selected)
                             }
-                            BoolDialogTab::ReadOnly => {
+                            PropDialogTab::ReadOnly => {
                                 preserve_index(&readonly_indices, previous_selected)
                             }
-                            BoolDialogTab::Actions => {
+                            PropDialogTab::Actions => {
                                 preserve_index(&actions_indices, previous_selected)
+                            }
+                            PropDialogTab::Logs => preserve_index(&logs_indices, previous_selected),
+                            PropDialogTab::Statistics => {
+                                preserve_index(&statistics_indices, previous_selected)
                             }
                         };
                         match dialog.active_tab {
-                            BoolDialogTab::Writable => dialog.writable_selected = dialog.selected,
-                            BoolDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
-                            BoolDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                            PropDialogTab::Writable => dialog.writable_selected = dialog.selected,
+                            PropDialogTab::ReadOnly => dialog.readonly_selected = dialog.selected,
+                            PropDialogTab::Actions => dialog.actions_selected = dialog.selected,
+                            PropDialogTab::Logs | PropDialogTab::Statistics => {}
                         }
                         dialog.status = None;
                     }
                     Err(error) => {
+                        dialog.refreshing = false;
                         dialog.items.clear();
                         dialog.status = Some(error.clone());
                         self.log(format!("property dialog loading failed: {error}"));
@@ -4862,37 +6240,81 @@ impl TuiApp {
             }
         }
 
-        let refresh_recv = match self.prop_dialog.as_ref() {
-            Some(dialog) if dialog.refreshing => match dialog.refresh_rx.as_ref() {
-                Some(rx) => match rx.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        Some(Err("property refresh worker disconnected".to_string()))
-                    }
-                },
-                None => None,
-            },
-            _ => None,
-        };
-        let Some(refresh_result) = refresh_recv else {
-            return;
-        };
-        if let Some(dialog) = &mut self.prop_dialog {
-            dialog.refreshing = false;
-            dialog.refresh_rx = None;
-            match refresh_result {
-                Ok(values) => {
-                    for (index, value) in values.into_iter().enumerate() {
-                        if let Some(item) = dialog.items.get_mut(index) {
-                            item.value = value;
+        let (mut refresh_messages, refresh_disconnected) = match self.prop_dialog.as_ref() {
+            Some(dialog) if dialog.refreshing || dialog.refresh_rx.is_some() => {
+                let Some(rx) = dialog.refresh_rx.as_ref() else {
+                    return;
+                };
+                let mut messages = Vec::new();
+                let mut disconnected = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(message) => messages.push(message),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
                         }
                     }
                 }
-                Err(error) => {
-                    self.log(format!("property dialog refresh failed: {error}"));
+                (messages, disconnected)
+            }
+            _ => return,
+        };
+        if refresh_messages.is_empty() {
+            if refresh_disconnected {
+                refresh_messages.push(PropDialogRefreshMessage::Error(
+                    "property refresh worker disconnected".to_string(),
+                ));
+            } else {
+                return;
+            }
+        }
+        let mut error_to_log = None;
+        if let Some(dialog) = &mut self.prop_dialog {
+            let mut close_refresh = false;
+            for message in refresh_messages {
+                match message {
+                    PropDialogRefreshMessage::Props(updates) => {
+                        for (index, value) in updates {
+                            if let Some(item) = dialog.items.get_mut(index) {
+                                item.value = value;
+                            }
+                        }
+                        dialog.refreshing = false;
+                    }
+                    PropDialogRefreshMessage::Raw(updates) => {
+                        for (index, value) in updates {
+                            if let Some(item) = dialog.items.get_mut(index) {
+                                item.value = value;
+                            }
+                        }
+                    }
+                    PropDialogRefreshMessage::Finished => {
+                        close_refresh = true;
+                    }
+                    PropDialogRefreshMessage::Error(error) => {
+                        if let Some(value) = operation_record_raw_value_mut(dialog) {
+                            set_raw_device_loading_status(value, false);
+                            set_all_operation_record_requests_loading(value, false);
+                        }
+                        if let Some(index) = raw_device_statistics_index(dialog) {
+                            if let Some(item) = dialog.items.get_mut(index) {
+                                set_raw_device_loading_status(&mut item.value, false);
+                            }
+                        }
+                        error_to_log = Some(error);
+                        close_refresh = true;
+                    }
                 }
             }
+            if close_refresh || refresh_disconnected {
+                dialog.refreshing = false;
+                dialog.refresh_rx = None;
+            }
+        }
+        if let Some(error) = error_to_log {
+            self.log(format!("property dialog refresh failed: {error}"));
         }
     }
 
@@ -5383,17 +6805,17 @@ fn sort_devices_by_room(devices: &mut [Device]) {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct BoolPropItem {
+struct PropItem {
     siid: i64,
     piid: i64,
     name: String,
     format: String,
     writable: bool,
-    value_options: Vec<BoolPropValueOption>,
+    value_options: Vec<PropValueOption>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct BoolPropValueOption {
+struct PropValueOption {
     value: Value,
     label: String,
 }
@@ -5405,30 +6827,1902 @@ struct ActionItem {
     name: String,
     input_piids: Vec<i64>,
     input_labels: Vec<String>,
-    input_props: Vec<BoolPropItem>,
+    input_props: Vec<PropItem>,
 }
 
 #[derive(Clone, Debug)]
-struct BoolToggleItem {
-    prop: BoolPropItem,
+struct ToggleItem {
+    prop: PropItem,
     value: Value,
 }
 
+#[derive(Debug)]
+enum PropDialogRefreshMessage {
+    Props(Vec<(usize, Value)>),
+    Raw(Vec<(usize, Value)>),
+    Finished,
+    Error(String),
+}
+
+fn mijia_prop_key(prop: &PropItem) -> String {
+    format!("{}.{}", prop.siid, prop.piid)
+}
+
+fn mijia_statistics_key(prop: &PropItem) -> Option<String> {
+    let name = prop.name.to_ascii_lowercase();
+    let looks_like_power_consumption =
+        name.contains("power consumption") || prop.name.contains("功耗");
+    (looks_like_power_consumption && prop.format.eq_ignore_ascii_case("float"))
+        .then(|| mijia_prop_key(prop))
+}
+
+fn raw_device_logs_item(value: Value) -> ToggleItem {
+    raw_device_json_item("操作记录", RAW_LOG_FORMAT, value)
+}
+
+fn raw_device_statistics_item(value: Value) -> ToggleItem {
+    raw_device_json_item("统计", RAW_STATISTICS_FORMAT, value)
+}
+
+fn raw_device_json_item(name: &str, format: &str, value: Value) -> ToggleItem {
+    ToggleItem {
+        prop: PropItem {
+            siid: 0,
+            piid: 0,
+            name: name.to_string(),
+            format: format.to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value,
+    }
+}
+
+fn is_raw_device_logs_item(item: &ToggleItem) -> bool {
+    item.prop.format == RAW_LOG_FORMAT
+}
+
+fn is_raw_device_statistics_item(item: &ToggleItem) -> bool {
+    item.prop.format == RAW_STATISTICS_FORMAT
+}
+
+fn is_raw_device_json_item(item: &ToggleItem) -> bool {
+    is_raw_device_logs_item(item) || is_raw_device_statistics_item(item)
+}
+
+fn raw_device_logs_index(dialog: &PropDialog) -> Option<usize> {
+    dialog
+        .items
+        .iter()
+        .enumerate()
+        .find_map(|(index, item)| is_raw_device_logs_item(item).then_some(index))
+}
+
+fn raw_device_statistics_index(dialog: &PropDialog) -> Option<usize> {
+    dialog
+        .items
+        .iter()
+        .enumerate()
+        .find_map(|(index, item)| is_raw_device_statistics_item(item).then_some(index))
+}
+
+fn operation_record_raw_value(dialog: &PropDialog) -> Option<&Value> {
+    raw_device_logs_index(dialog)
+        .and_then(|index| dialog.items.get(index))
+        .map(|item| &item.value)
+}
+
+fn operation_record_raw_value_mut(dialog: &mut PropDialog) -> Option<&mut Value> {
+    let index = raw_device_logs_index(dialog)?;
+    dialog.items.get_mut(index).map(|item| &mut item.value)
+}
+
+fn raw_device_statistics_value(dialog: &PropDialog) -> Option<&Value> {
+    raw_device_statistics_index(dialog)
+        .and_then(|index| dialog.items.get(index))
+        .map(|item| &item.value)
+}
+
+fn raw_device_statistics_value_mut(dialog: &mut PropDialog) -> Option<&mut Value> {
+    let index = raw_device_statistics_index(dialog)?;
+    dialog.items.get_mut(index).map(|item| &mut item.value)
+}
+
+fn value_object_mut(value: &mut Value) -> &mut Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value
+        .as_object_mut()
+        .expect("value was normalized to object")
+}
+
+fn set_raw_device_loading_status(value: &mut Value, loading: bool) {
+    let object = value_object_mut(value);
+    if loading {
+        object.insert("status".to_string(), json!("loading"));
+    } else {
+        object.remove("status");
+    }
+}
+
+fn operation_record_ui_mut(value: &mut Value) -> &mut Map<String, Value> {
+    let object = value_object_mut(value);
+    let ui = object.entry("ui").or_insert_with(|| json!({}));
+    value_object_mut(ui)
+}
+
+fn statistics_ui_mut(value: &mut Value) -> &mut Map<String, Value> {
+    let object = value_object_mut(value);
+    let ui = object.entry("ui").or_insert_with(|| json!({}));
+    value_object_mut(ui)
+}
+
+fn operation_record_selected_key(dialog: &PropDialog) -> Option<String> {
+    operation_record_raw_value(dialog)
+        .and_then(|value| value.get("ui"))
+        .and_then(|ui| ui.get("selected_key"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            dialog
+                .items
+                .get(dialog.selected)
+                .filter(|item| !is_raw_device_json_item(item))
+                .map(|item| mijia_prop_key(&item.prop))
+        })
+}
+
+fn set_operation_record_selected_key(dialog: &mut PropDialog, key: &str) {
+    if let Some(value) = operation_record_raw_value_mut(dialog) {
+        let ui = operation_record_ui_mut(value);
+        ui.insert("selected_key".to_string(), Value::String(key.to_string()));
+        ui.insert("active_row".to_string(), json!(0));
+    }
+    if let Some(index) = dialog
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !is_raw_device_json_item(item))
+        .find_map(|(index, item)| (mijia_prop_key(&item.prop) == key).then_some(index))
+    {
+        dialog.selected = index;
+    }
+}
+
+fn operation_record_active_row(dialog: &PropDialog) -> usize {
+    operation_record_raw_value(dialog)
+        .and_then(|value| value.get("ui"))
+        .and_then(|ui| ui.get("active_row"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+fn set_operation_record_active_row(dialog: &mut PropDialog, row: usize) {
+    if let Some(value) = operation_record_raw_value_mut(dialog) {
+        operation_record_ui_mut(value).insert("active_row".to_string(), json!(row));
+    }
+}
+
+fn operation_record_menu_is_open(dialog: &PropDialog) -> bool {
+    dialog.editing
+        && dialog.active_tab == PropDialogTab::Logs
+        && dialog.edit_buffer == OPERATION_RECORD_MENU_MARKER
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OperationRecordDatePickerState {
+    cursor: Date,
+    pending_start: Option<Date>,
+}
+
+fn operation_record_date_picker_is_open(dialog: &PropDialog) -> bool {
+    dialog.editing
+        && dialog.active_tab == PropDialogTab::Logs
+        && operation_record_date_picker_state(dialog).is_some()
+}
+
+fn encode_operation_record_date_picker(state: OperationRecordDatePickerState) -> String {
+    let start = state
+        .pending_start
+        .map(|date| date.to_julian_day().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{}{}:{}",
+        OPERATION_RECORD_DATE_PICKER_PREFIX,
+        state.cursor.to_julian_day(),
+        start
+    )
+}
+
+fn operation_record_date_picker_state(
+    dialog: &PropDialog,
+) -> Option<OperationRecordDatePickerState> {
+    let rest = dialog
+        .edit_buffer
+        .strip_prefix(OPERATION_RECORD_DATE_PICKER_PREFIX)?;
+    let (cursor, start) = rest.split_once(':')?;
+    let cursor = cursor
+        .parse::<i32>()
+        .ok()
+        .and_then(|day| Date::from_julian_day(day).ok())?;
+    let pending_start = if start == "-" {
+        None
+    } else {
+        start
+            .parse::<i32>()
+            .ok()
+            .and_then(|day| Date::from_julian_day(day).ok())
+    };
+    Some(OperationRecordDatePickerState {
+        cursor,
+        pending_start,
+    })
+}
+
+fn set_operation_record_date_picker_state(
+    dialog: &mut PropDialog,
+    state: OperationRecordDatePickerState,
+) {
+    dialog.editing = true;
+    dialog.edit_buffer = encode_operation_record_date_picker(state);
+    dialog.edit_cursor = operation_record_active_row(dialog);
+}
+
+pub(in crate::tui) fn operation_record_date_picker_popup_area(terminal_area: Rect) -> Rect {
+    let width = OPERATION_RECORD_DATE_PICKER_CALENDAR_WIDTH
+        .saturating_add(2)
+        .min(terminal_area.width);
+    let height = OPERATION_RECORD_DATE_PICKER_CALENDAR_HEIGHT
+        .saturating_add(2)
+        .min(terminal_area.height);
+    Rect::new(
+        terminal_area
+            .x
+            .saturating_add(terminal_area.width.saturating_sub(width) / 2),
+        terminal_area
+            .y
+            .saturating_add(terminal_area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
+}
+
+pub(in crate::tui) fn operation_record_date_picker_calendar_area(
+    terminal_area: Rect,
+) -> Option<Rect> {
+    let popup = operation_record_date_picker_popup_area(terminal_area);
+    if popup.width == 0 || popup.height == 0 {
+        return None;
+    }
+    let width = OPERATION_RECORD_DATE_PICKER_CALENDAR_WIDTH.min(popup.width.saturating_sub(2));
+    let height = OPERATION_RECORD_DATE_PICKER_CALENDAR_HEIGHT.min(popup.height.saturating_sub(2));
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1),
+        width,
+        height,
+    ))
+}
+
+fn operation_record_date_at_position(
+    terminal_area: Rect,
+    dialog: &PropDialog,
+    column: u16,
+    row: u16,
+) -> Option<Option<Date>> {
+    let popup = operation_record_date_picker_popup_area(terminal_area);
+    if !rect_contains(popup, column, row) {
+        return None;
+    }
+    let Some(calendar_area) = operation_record_date_picker_calendar_area(terminal_area) else {
+        return Some(None);
+    };
+    if !rect_contains(calendar_area, column, row) {
+        return Some(None);
+    }
+    let Some(state) = operation_record_date_picker_state(dialog) else {
+        return Some(None);
+    };
+    let relative_y = row.saturating_sub(calendar_area.y);
+    if relative_y < 2 {
+        return Some(None);
+    }
+    let week_index = relative_y.saturating_sub(2);
+    if week_index >= 6 {
+        return Some(None);
+    }
+    let relative_x = column.saturating_sub(calendar_area.x);
+    let day_index = relative_x / 3;
+    if day_index >= 7 {
+        return Some(None);
+    }
+    let Ok(first_of_month) = Date::from_calendar_date(state.cursor.year(), state.cursor.month(), 1)
+    else {
+        return Some(None);
+    };
+    let start_offset = i64::from(first_of_month.weekday().number_days_from_sunday());
+    let first_visible = first_of_month.saturating_sub(TimeDuration::days(start_offset));
+    let offset_days = i64::from(week_index) * 7 + i64::from(day_index);
+    Some(Some(
+        first_visible.saturating_add(TimeDuration::days(offset_days)),
+    ))
+}
+
+fn statistics_date_at_position(
+    terminal_area: Rect,
+    dialog: &PropDialog,
+    column: u16,
+    row: u16,
+) -> Option<Option<Date>> {
+    let popup = operation_record_date_picker_popup_area(terminal_area);
+    if !rect_contains(popup, column, row) {
+        return None;
+    }
+    let Some(calendar_area) = operation_record_date_picker_calendar_area(terminal_area) else {
+        return Some(None);
+    };
+    if !rect_contains(calendar_area, column, row) {
+        return Some(None);
+    }
+    let Some(state) = statistics_date_picker_state(dialog) else {
+        return Some(None);
+    };
+    let relative_y = row.saturating_sub(calendar_area.y);
+    if relative_y < 2 {
+        return Some(None);
+    }
+    let week_index = relative_y.saturating_sub(2);
+    if week_index >= 6 {
+        return Some(None);
+    }
+    let relative_x = column.saturating_sub(calendar_area.x);
+    let day_index = relative_x / 3;
+    if day_index >= 7 {
+        return Some(None);
+    }
+    let Ok(first_of_month) = Date::from_calendar_date(state.cursor.year(), state.cursor.month(), 1)
+    else {
+        return Some(None);
+    };
+    let start_offset = i64::from(first_of_month.weekday().number_days_from_sunday());
+    let first_visible = first_of_month.saturating_sub(TimeDuration::days(start_offset));
+    let offset_days = i64::from(week_index) * 7 + i64::from(day_index);
+    Some(Some(
+        first_visible.saturating_add(TimeDuration::days(offset_days)),
+    ))
+}
+
+fn local_utc_offset() -> UtcOffset {
+    UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
+}
+
+fn today_local_date() -> Date {
+    OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .date()
+}
+
+fn timestamp_to_local_date(timestamp: i64) -> Option<Date> {
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.to_offset(local_utc_offset()).date())
+}
+
+fn date_start_timestamp(date: Date) -> i64 {
+    date.midnight()
+        .assume_offset(local_utc_offset())
+        .unix_timestamp()
+}
+
+fn date_end_timestamp(date: Date) -> i64 {
+    date_start_timestamp(date.saturating_add(TimeDuration::DAY)).saturating_sub(1)
+}
+
+fn operation_record_date_filter(value: &Value) -> Option<(i64, i64)> {
+    value.get("date_filter").and_then(|filter| {
+        Some((
+            json_i64(filter.get("time_start"))?,
+            json_i64(filter.get("time_end"))?,
+        ))
+    })
+}
+
+fn operation_record_date_filter_for_dialog(dialog: &PropDialog) -> Option<(i64, i64)> {
+    operation_record_raw_value(dialog).and_then(operation_record_date_filter)
+}
+
+fn operation_record_default_query(value: Option<&Value>) -> DeviceHistoryQuery {
+    let mut query = DeviceHistoryQuery::recent(OPERATION_RECORD_PAGE_LIMIT);
+    if let Some((time_start, time_end)) = value.and_then(operation_record_date_filter) {
+        query.time_start = time_start;
+        query.time_end = time_end;
+    }
+    query
+}
+
+fn clear_operation_record_date_filter_value(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("date_filter");
+        if let Some(ui) = object.get_mut("ui").and_then(Value::as_object_mut) {
+            ui.insert("active_row".to_string(), json!(0));
+        }
+    }
+}
+
+fn month_from_number(month: u8) -> Month {
+    match month {
+        1 => Month::January,
+        2 => Month::February,
+        3 => Month::March,
+        4 => Month::April,
+        5 => Month::May,
+        6 => Month::June,
+        7 => Month::July,
+        8 => Month::August,
+        9 => Month::September,
+        10 => Month::October,
+        11 => Month::November,
+        _ => Month::December,
+    }
+}
+
+fn add_months_to_date(date: Date, delta: i32) -> Date {
+    let month_number = i32::from(date.month() as u8);
+    let total = date
+        .year()
+        .saturating_mul(12)
+        .saturating_add(month_number - 1)
+        .saturating_add(delta);
+    let year = total.div_euclid(12);
+    let month = month_from_number((total.rem_euclid(12) + 1) as u8);
+    let day = date.day().min(month.length(year));
+    Date::from_calendar_date(year, month, day).unwrap_or(date)
+}
+
+fn raw_device_tab_text(dialog: &PropDialog, tab: PropDialogTab) -> String {
+    let item = dialog.items.iter().find(|item| match tab {
+        PropDialogTab::Logs => is_raw_device_logs_item(item),
+        PropDialogTab::Statistics => is_raw_device_statistics_item(item),
+        _ => false,
+    });
+    item.map(|item| {
+        serde_json::to_string_pretty(&item.value)
+            .or_else(|_| serde_json::to_string(&item.value))
+            .unwrap_or_else(|_| "null".to_string())
+    })
+    .unwrap_or_else(|| {
+        if dialog.loading {
+            "加载中...".to_string()
+        } else {
+            "暂无数据".to_string()
+        }
+    })
+}
+
+fn operation_record_tab_titles(dialog: &PropDialog, lang: Language) -> Vec<String> {
+    operation_record_requests(dialog)
+        .iter()
+        .filter_map(|request| operation_record_request_key(request))
+        .map(|key| operation_record_key_label(dialog, key, lang))
+        .collect()
+}
+
+fn operation_record_selector_label(dialog: &PropDialog, lang: Language) -> String {
+    let requests = operation_record_requests(dialog);
+    let current = operation_record_selected_request(dialog, requests.as_slice())
+        .and_then(operation_record_request_key)
+        .map(|key| operation_record_key_label(dialog, key, lang))
+        .unwrap_or_else(|| {
+            if operation_record_logs_are_loading(dialog) {
+                lang_str(lang, "加载中...", "Loading...").to_string()
+            } else {
+                lang_str(lang, "暂无操作记录", "No operation records").to_string()
+            }
+        });
+    format!(
+        "{}: {current} ▾",
+        lang_str(lang, "S: 选择记录", "S: Record")
+    )
+}
+
+fn operation_record_date_filter_label(dialog: &PropDialog, lang: Language) -> String {
+    let Some((time_start, time_end)) = operation_record_date_filter_for_dialog(dialog) else {
+        return lang_str(lang, "D: 选择日期范围", "D: Select Date Range").to_string();
+    };
+    let start = format_operation_record_date(time_start);
+    let end = format_operation_record_date(time_end);
+    format!("{start} - {end}")
+}
+
+fn operation_record_date_filter_area(
+    selector_row_area: Rect,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    let width = display_width(operation_record_date_filter_label(dialog, lang).as_str());
+    if width == 0 || selector_row_area.width == 0 || selector_row_area.height == 0 {
+        return None;
+    }
+    let width = width.min(selector_row_area.width);
+    Some(Rect::new(
+        selector_row_area
+            .x
+            .saturating_add(selector_row_area.width.saturating_sub(width)),
+        selector_row_area.y,
+        width,
+        1,
+    ))
+}
+
+fn operation_record_dropdown_width(dialog: &PropDialog, lang: Language) -> u16 {
+    operation_record_tab_titles(dialog, lang)
+        .into_iter()
+        .map(|title| display_width(title.as_str()).saturating_add(6))
+        .max()
+        .unwrap_or(24)
+        .max(24)
+}
+
+fn operation_record_selector_height(dialog: &PropDialog) -> u16 {
+    if raw_device_logs_index(dialog).is_some() {
+        2
+    } else {
+        0
+    }
+}
+
+fn operation_record_dropdown_area(
+    list_area: Rect,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    let request_count = operation_record_requests(dialog).len();
+    if request_count == 0 || list_area.height <= 2 {
+        return None;
+    }
+    let height = request_count
+        .saturating_add(2)
+        .min(list_area.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    if height == 0 {
+        return None;
+    }
+    Some(Rect::new(
+        list_area.x,
+        list_area.y.saturating_add(2),
+        operation_record_dropdown_width(dialog, lang).min(list_area.width),
+        height,
+    ))
+}
+
+fn operation_records_display_text(
+    dialog: &PropDialog,
+    lang: Language,
+    accounts: &[AuthAccount],
+) -> String {
+    let mut lines = Vec::new();
+    if operation_record_selector_height(dialog) > 0 {
+        lines.push(operation_record_selector_label(dialog, lang));
+        lines.push(String::new());
+    }
+    lines.extend(operation_records_table_lines(dialog, lang, accounts));
+    lines.join("\n")
+}
+
+fn operation_records_table_lines(
+    dialog: &PropDialog,
+    lang: Language,
+    accounts: &[AuthAccount],
+) -> Vec<String> {
+    let logs_loading = operation_record_logs_are_loading(dialog);
+    let requests = operation_record_requests(dialog);
+    let Some(request) = operation_record_selected_request(dialog, requests.as_slice()) else {
+        if logs_loading {
+            return vec![lang_str(lang, "加载中...", "Loading...").to_string()];
+        }
+        return vec![lang_str(lang, "暂无操作记录", "No operation records").to_string()];
+    };
+    if let Some(error) = request.get("error").and_then(Value::as_str) {
+        return vec![format!("{}: {error}", lang_str(lang, "错误", "Error"))];
+    }
+    let Some(response) = request.get("response") else {
+        if logs_loading || operation_record_request_is_loading_more(request) {
+            return vec![lang_str(lang, "加载中...", "Loading...").to_string()];
+        }
+        return vec![lang_str(lang, "暂无操作记录", "No operation records").to_string()];
+    };
+    if !json_code_is_zero(response.get("code")) {
+        let code = json_i64(response.get("code"))
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let message = json_text(response.get("message"))
+            .or_else(|| json_text(response.get("desc")))
+            .unwrap_or_default();
+        return vec![format!(
+            "{}: code={}{}",
+            lang_str(lang, "错误", "Error"),
+            code,
+            if message.is_empty() {
+                String::new()
+            } else {
+                format!(" message={message}")
+            }
+        )];
+    }
+    let Some(records) = response.get("result").and_then(Value::as_array) else {
+        if logs_loading {
+            return vec![lang_str(lang, "加载中...", "Loading...").to_string()];
+        }
+        return vec![lang_str(lang, "暂无操作记录", "No operation records").to_string()];
+    };
+    if records.is_empty() {
+        if logs_loading {
+            return vec![lang_str(lang, "加载中...", "Loading...").to_string()];
+        }
+        return vec![lang_str(lang, "暂无操作记录", "No operation records").to_string()];
+    }
+
+    let user_width = operation_record_user_column_width(records, accounts, lang);
+    let mut lines = vec![format_operation_record_table_row(
+        lang_str(lang, "用户", "User"),
+        lang_str(lang, "时间", "Time"),
+        lang_str(lang, "值", "Value"),
+        user_width,
+    )];
+    lines.extend(records.iter().map(|record| {
+        let time = format_operation_record_timestamp(record.get("time"));
+        let value = json_text(record.get("value"))
+            .unwrap_or_else(|| json_compact_text(record.get("value")).unwrap_or_default());
+        let uid = json_text(record.get("uid"));
+        let user = operation_record_user_label(accounts, uid.as_deref());
+        format_operation_record_table_row(user.as_str(), time.as_str(), value.as_str(), user_width)
+    }));
+    if operation_record_request_is_loading_more(request) {
+        lines.push(lang_str(lang, "加载中...", "Loading...").to_string());
+    } else if operation_record_request_has_more(request) {
+        lines.push(lang_str(lang, "加载更多", "Load More").to_string());
+    } else if operation_record_request_no_more(request) {
+        lines.push(lang_str(lang, "没有更多记录", "No More Records").to_string());
+    }
+    lines
+}
+
+fn operation_records_active_visual_index(dialog: &PropDialog) -> Option<usize> {
+    let row_count = operation_record_selectable_row_count(dialog);
+    if row_count == 0 {
+        return None;
+    }
+    Some(operation_record_active_row(dialog).min(row_count - 1) + 1)
+}
+
+fn operation_record_user_column_width(
+    records: &[Value],
+    accounts: &[AuthAccount],
+    lang: Language,
+) -> usize {
+    let header_width = display_width(lang_str(lang, "用户", "User")) as usize;
+    records
+        .iter()
+        .filter_map(|record| json_text(record.get("uid")))
+        .map(|uid| operation_record_user_label(accounts, Some(uid.as_str())))
+        .map(|user| display_width(user.as_str()) as usize)
+        .max()
+        .unwrap_or(header_width)
+        .max(header_width)
+}
+
+fn operation_record_requests(dialog: &PropDialog) -> Vec<&Value> {
+    raw_device_logs_index(dialog)
+        .and_then(|index| dialog.items.get(index))
+        .and_then(|item| item.value.get("requests"))
+        .and_then(Value::as_array)
+        .map(|requests| requests.iter().collect())
+        .unwrap_or_default()
+}
+
+pub(in crate::tui) fn operation_record_logs_are_loading(dialog: &PropDialog) -> bool {
+    operation_record_raw_value(dialog)
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "loading")
+}
+
+fn raw_device_statistics_are_loading(dialog: &PropDialog) -> bool {
+    raw_device_statistics_value(dialog)
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "loading")
+}
+
+pub(in crate::tui) fn prop_dialog_active_tab_is_loading(dialog: &PropDialog) -> bool {
+    if dialog.loading {
+        return true;
+    }
+    match dialog.active_tab {
+        PropDialogTab::Logs => operation_record_logs_are_loading(dialog),
+        PropDialogTab::Statistics => raw_device_statistics_are_loading(dialog),
+        PropDialogTab::Writable | PropDialogTab::ReadOnly | PropDialogTab::Actions => {
+            dialog.refreshing
+        }
+    }
+}
+
+fn operation_record_selected_request<'a>(
+    dialog: &PropDialog,
+    requests: &'a [&'a Value],
+) -> Option<&'a Value> {
+    if requests.is_empty() {
+        return None;
+    }
+    let selected_key = operation_record_selected_key(dialog);
+    selected_key
+        .as_deref()
+        .and_then(|key| {
+            requests
+                .iter()
+                .copied()
+                .find(|request| operation_record_request_key(request) == Some(key))
+        })
+        .or_else(|| requests.first().copied())
+}
+
+fn operation_record_selected_request_index(dialog: &PropDialog) -> usize {
+    let requests = operation_record_requests(dialog);
+    let selected_key = operation_record_selected_key(dialog);
+    selected_key
+        .as_deref()
+        .and_then(|key| {
+            requests
+                .iter()
+                .position(|request| operation_record_request_key(request) == Some(key))
+        })
+        .unwrap_or(0)
+}
+
+fn operation_record_request_key(request: &Value) -> Option<&str> {
+    request.get("key").and_then(Value::as_str)
+}
+
+fn operation_record_key_label(dialog: &PropDialog, key: &str, _lang: Language) -> String {
+    dialog
+        .items
+        .iter()
+        .filter(|item| !is_raw_device_json_item(item))
+        .find(|item| mijia_prop_key(&item.prop) == key)
+        .map(|item| item.prop.name.clone())
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn operation_record_tab_indices(dialog: &PropDialog) -> Vec<usize> {
+    let raw_index = raw_device_logs_index(dialog);
+    let mut indices = operation_record_requests(dialog)
+        .iter()
+        .filter_map(|request| operation_record_request_key(request))
+        .filter_map(|key| {
+            dialog
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| !is_raw_device_json_item(item))
+                .find_map(|(index, item)| (mijia_prop_key(&item.prop) == key).then_some(index))
+                .or(raw_index)
+        })
+        .collect::<Vec<_>>();
+    indices.dedup();
+    if indices.is_empty() {
+        if let Some(index) = raw_index {
+            indices.push(index);
+        }
+    }
+    indices
+}
+
+fn statistics_requests(dialog: &PropDialog) -> Vec<&Value> {
+    raw_device_statistics_index(dialog)
+        .and_then(|index| dialog.items.get(index))
+        .and_then(|item| item.value.get("requests"))
+        .and_then(Value::as_array)
+        .map(|requests| requests.iter().collect())
+        .unwrap_or_default()
+}
+
+fn statistics_request_key(request: &Value) -> Option<&str> {
+    request.get("key").and_then(Value::as_str)
+}
+
+fn statistics_selected_key(dialog: &PropDialog) -> Option<String> {
+    raw_device_statistics_value(dialog)
+        .and_then(|value| value.get("ui"))
+        .and_then(|ui| ui.get("selected_key"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            dialog
+                .items
+                .get(dialog.selected)
+                .filter(|item| !is_raw_device_json_item(item))
+                .map(|item| mijia_prop_key(&item.prop))
+        })
+        .or_else(|| {
+            statistics_requests(dialog)
+                .first()
+                .and_then(|request| statistics_request_key(request))
+                .map(ToString::to_string)
+        })
+}
+
+fn set_statistics_selected_key(dialog: &mut PropDialog, key: &str) {
+    if let Some(value) = raw_device_statistics_value_mut(dialog) {
+        statistics_ui_mut(value).insert("selected_key".to_string(), Value::String(key.to_string()));
+    }
+    if let Some(index) = dialog
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !is_raw_device_json_item(item))
+        .find_map(|(index, item)| (mijia_prop_key(&item.prop) == key).then_some(index))
+    {
+        dialog.selected = index;
+    }
+}
+
+fn statistics_selected_request<'a>(
+    dialog: &PropDialog,
+    requests: &'a [&'a Value],
+) -> Option<&'a Value> {
+    if requests.is_empty() {
+        return None;
+    }
+    let selected_key = statistics_selected_key(dialog);
+    selected_key
+        .as_deref()
+        .and_then(|key| {
+            requests
+                .iter()
+                .copied()
+                .find(|request| statistics_request_key(request) == Some(key))
+        })
+        .or_else(|| requests.first().copied())
+}
+
+fn statistics_selected_request_index(dialog: &PropDialog) -> usize {
+    let requests = statistics_requests(dialog);
+    let selected_key = statistics_selected_key(dialog);
+    selected_key
+        .as_deref()
+        .and_then(|key| {
+            requests
+                .iter()
+                .position(|request| statistics_request_key(request) == Some(key))
+        })
+        .unwrap_or(0)
+}
+
+fn statistics_key_label(dialog: &PropDialog, key: &str, _lang: Language) -> String {
+    dialog
+        .items
+        .iter()
+        .filter(|item| !is_raw_device_json_item(item))
+        .find(|item| mijia_prop_key(&item.prop) == key)
+        .map(|item| item.prop.name.clone())
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn statistics_tab_titles(dialog: &PropDialog, lang: Language) -> Vec<String> {
+    statistics_requests(dialog)
+        .iter()
+        .filter_map(|request| statistics_request_key(request))
+        .map(|key| statistics_key_label(dialog, key, lang))
+        .collect()
+}
+
+fn statistics_current_key_label(dialog: &PropDialog, lang: Language) -> String {
+    let requests = statistics_requests(dialog);
+    statistics_selected_request(dialog, requests.as_slice())
+        .and_then(statistics_request_key)
+        .map(|key| statistics_key_label(dialog, key, lang))
+        .unwrap_or_else(|| {
+            if raw_device_statistics_are_loading(dialog) {
+                lang_str(lang, "加载中...", "Loading...").to_string()
+            } else {
+                lang_str(lang, "暂无统计", "No stats").to_string()
+            }
+        })
+}
+
+fn statistics_selector_label(dialog: &PropDialog, lang: Language) -> String {
+    let current = statistics_current_key_label(dialog, lang);
+    format!("{}: {current} ▾", lang_str(lang, "S: 统计项", "S: Stats"))
+}
+
+fn statistics_period_for_value(value: Option<&Value>) -> StatisticsPeriod {
+    value
+        .and_then(|value| value.get("ui"))
+        .and_then(|ui| ui.get("period"))
+        .and_then(Value::as_str)
+        .and_then(StatisticsPeriod::from_key)
+        .unwrap_or(StatisticsPeriod::Week)
+}
+
+fn statistics_period_for_dialog(dialog: &PropDialog) -> StatisticsPeriod {
+    statistics_period_for_value(raw_device_statistics_value(dialog))
+}
+
+fn set_statistics_period(dialog: &mut PropDialog, period: StatisticsPeriod) {
+    if let Some(value) = raw_device_statistics_value_mut(dialog) {
+        statistics_ui_mut(value).insert("period".to_string(), json!(period.key()));
+    }
+}
+
+fn statistics_period_label(dialog: &PropDialog, lang: Language) -> String {
+    format!("{} ▾", statistics_period_for_dialog(dialog).label(lang))
+}
+
+fn statistics_date_filter(value: &Value) -> Option<(i64, i64)> {
+    value.get("date_filter").and_then(|filter| {
+        Some((
+            json_i64(filter.get("time_start"))?,
+            json_i64(filter.get("time_end"))?,
+        ))
+    })
+}
+
+fn statistics_date_filter_for_dialog(dialog: &PropDialog) -> Option<(i64, i64)> {
+    raw_device_statistics_value(dialog).and_then(statistics_date_filter)
+}
+
+fn statistics_date_filter_label(dialog: &PropDialog, lang: Language) -> String {
+    let Some((time_start, time_end)) = statistics_date_filter_for_dialog(dialog) else {
+        return lang_str(lang, "D: 选择时间范围", "D: Select Range").to_string();
+    };
+    let start = format_operation_record_date(time_start);
+    let end = format_operation_record_date(time_end);
+    format!("{start} - {end}")
+}
+
+fn statistics_period_date_range(period: StatisticsPeriod, cursor: Date) -> (Date, Date) {
+    match period {
+        StatisticsPeriod::Week => {
+            let start = cursor.saturating_sub(TimeDuration::days(i64::from(
+                cursor.weekday().number_days_from_monday(),
+            )));
+            (start, start.saturating_add(TimeDuration::days(6)))
+        }
+        StatisticsPeriod::Month => {
+            let start =
+                Date::from_calendar_date(cursor.year(), cursor.month(), 1).unwrap_or(cursor);
+            let next_month = add_months_to_date(start, 1);
+            (start, next_month.saturating_sub(TimeDuration::DAY))
+        }
+        StatisticsPeriod::Year => {
+            let start =
+                Date::from_calendar_date(cursor.year(), Month::January, 1).unwrap_or(cursor);
+            let end =
+                Date::from_calendar_date(cursor.year(), Month::December, 31).unwrap_or(cursor);
+            (start, end)
+        }
+    }
+}
+
+fn statistics_period_date_range_ending_today(period: StatisticsPeriod) -> (Date, Date) {
+    let end = today_local_date();
+    let start = match period {
+        StatisticsPeriod::Week => end.saturating_sub(TimeDuration::days(7)),
+        StatisticsPeriod::Month => end.saturating_sub(TimeDuration::days(30)),
+        StatisticsPeriod::Year => end.saturating_sub(TimeDuration::days(365)),
+    };
+    (start, end)
+}
+
+fn statistics_query_limit(period: StatisticsPeriod, time_start: i64, time_end: i64) -> u32 {
+    if time_end < time_start {
+        return 1;
+    }
+    let days = (time_end - time_start) / 86_400 + 1;
+    let count = match period {
+        StatisticsPeriod::Week | StatisticsPeriod::Month => days,
+        StatisticsPeriod::Year => {
+            let start = timestamp_to_local_date(time_start);
+            let end = timestamp_to_local_date(time_end);
+            match (start, end) {
+                (Some(start), Some(end)) => {
+                    let start_month = i64::from(start.year()) * 12 + i64::from(start.month() as u8);
+                    let end_month = i64::from(end.year()) * 12 + i64::from(end.month() as u8);
+                    end_month.saturating_sub(start_month).saturating_add(1)
+                }
+                _ => 12,
+            }
+        }
+    };
+    count.clamp(1, u32::MAX as i64) as u32
+}
+
+fn statistics_default_query(period: StatisticsPeriod) -> DeviceHistoryQuery {
+    let (start, end) = statistics_period_date_range_ending_today(period);
+    let time_start = date_start_timestamp(start);
+    let time_end = date_end_timestamp(end);
+    DeviceHistoryQuery {
+        time_start,
+        time_end,
+        limit: statistics_query_limit(period, time_start, time_end),
+    }
+}
+
+fn statistics_query_for_value(value: Option<&Value>) -> DeviceHistoryQuery {
+    let period = statistics_period_for_value(value);
+    if let Some((time_start, time_end)) = value.and_then(statistics_date_filter) {
+        return DeviceHistoryQuery {
+            time_start,
+            time_end,
+            limit: statistics_query_limit(period, time_start, time_end),
+        };
+    }
+    statistics_default_query(period)
+}
+
+fn set_statistics_date_filter_value(value: &mut Value, period: StatisticsPeriod, cursor: Date) {
+    let (start, end) = statistics_period_date_range(period, cursor);
+    set_statistics_date_filter_value_from_range(value, start, end);
+}
+
+fn set_statistics_date_filter_value_ending_today(value: &mut Value, period: StatisticsPeriod) {
+    let (start, end) = statistics_period_date_range_ending_today(period);
+    set_statistics_date_filter_value_from_range(value, start, end);
+}
+
+fn set_statistics_date_filter_value_from_range(value: &mut Value, start: Date, end: Date) {
+    let object = value_object_mut(value);
+    object.insert(
+        "date_filter".to_string(),
+        json!({
+            "time_start": date_start_timestamp(start),
+            "time_end": date_end_timestamp(end)
+        }),
+    );
+}
+
+fn statistics_period_options(lang: Language) -> Vec<String> {
+    StatisticsPeriod::all()
+        .into_iter()
+        .map(|period| period.label(lang).to_string())
+        .collect()
+}
+
+fn statistics_selector_height(dialog: &PropDialog) -> u16 {
+    if raw_device_statistics_index(dialog).is_some() {
+        2
+    } else {
+        0
+    }
+}
+
+fn statistics_dropdown_width(dialog: &PropDialog, lang: Language) -> u16 {
+    statistics_tab_titles(dialog, lang)
+        .into_iter()
+        .map(|title| display_width(title.as_str()).saturating_add(6))
+        .max()
+        .unwrap_or(24)
+        .max(24)
+}
+
+fn statistics_dropdown_area(list_area: Rect, dialog: &PropDialog, lang: Language) -> Option<Rect> {
+    let request_count = statistics_requests(dialog).len();
+    if request_count <= 1 || list_area.height <= 2 {
+        return None;
+    }
+    let height = request_count
+        .saturating_add(2)
+        .min(list_area.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    if height == 0 {
+        return None;
+    }
+    Some(Rect::new(
+        list_area.x,
+        list_area.y.saturating_add(2),
+        statistics_dropdown_width(dialog, lang).min(list_area.width),
+        height,
+    ))
+}
+
+fn statistics_date_filter_area(
+    selector_row_area: Rect,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    let width = display_width(statistics_date_filter_label(dialog, lang).as_str());
+    if width == 0 || selector_row_area.width == 0 || selector_row_area.height == 0 {
+        return None;
+    }
+    let width = width.min(selector_row_area.width);
+    Some(Rect::new(
+        selector_row_area
+            .x
+            .saturating_add(selector_row_area.width.saturating_sub(width)),
+        selector_row_area.y,
+        width,
+        1,
+    ))
+}
+
+fn statistics_period_area(
+    selector_row_area: Rect,
+    date_area: Option<Rect>,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    let width = display_width(statistics_period_label(dialog, lang).as_str());
+    if width == 0 || selector_row_area.width == 0 || selector_row_area.height == 0 {
+        return None;
+    }
+    let right_edge = date_area
+        .map(|area| area.x.saturating_sub(2))
+        .unwrap_or_else(|| selector_row_area.x.saturating_add(selector_row_area.width));
+    if right_edge <= selector_row_area.x {
+        return None;
+    }
+    let width = width.min(right_edge.saturating_sub(selector_row_area.x));
+    Some(Rect::new(
+        right_edge.saturating_sub(width),
+        selector_row_area.y,
+        width,
+        1,
+    ))
+}
+
+fn statistics_period_dropdown_area(
+    list_area: Rect,
+    selector_row_area: Rect,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    if list_area.height <= 2 {
+        return None;
+    }
+    let date_area = statistics_date_filter_area(selector_row_area, dialog, lang);
+    let period_area = statistics_period_area(selector_row_area, date_area, dialog, lang)?;
+    let height = 5_u16.min(list_area.height.saturating_sub(2));
+    if height == 0 {
+        return None;
+    }
+    Some(Rect::new(
+        period_area.x.saturating_sub(2),
+        list_area.y.saturating_add(2),
+        period_area.width.saturating_add(4).min(list_area.width),
+        height,
+    ))
+}
+
+fn statistics_key_menu_is_open(dialog: &PropDialog) -> bool {
+    dialog.editing
+        && dialog.active_tab == PropDialogTab::Statistics
+        && dialog.edit_buffer == STATISTICS_KEY_MENU_MARKER
+}
+
+fn statistics_period_menu_is_open(dialog: &PropDialog) -> bool {
+    dialog.editing
+        && dialog.active_tab == PropDialogTab::Statistics
+        && dialog.edit_buffer == STATISTICS_PERIOD_MENU_MARKER
+}
+
+fn encode_statistics_date_picker(state: OperationRecordDatePickerState) -> String {
+    format!(
+        "{}{}",
+        STATISTICS_DATE_PICKER_PREFIX,
+        state.cursor.to_julian_day()
+    )
+}
+
+fn statistics_date_picker_state(dialog: &PropDialog) -> Option<OperationRecordDatePickerState> {
+    let rest = dialog
+        .edit_buffer
+        .strip_prefix(STATISTICS_DATE_PICKER_PREFIX)?;
+    let cursor = rest
+        .parse::<i32>()
+        .ok()
+        .and_then(|day| Date::from_julian_day(day).ok())?;
+    Some(OperationRecordDatePickerState {
+        cursor,
+        pending_start: None,
+    })
+}
+
+fn statistics_date_picker_is_open(dialog: &PropDialog) -> bool {
+    dialog.editing
+        && dialog.active_tab == PropDialogTab::Statistics
+        && statistics_date_picker_state(dialog).is_some()
+}
+
+fn set_statistics_date_picker_state(
+    dialog: &mut PropDialog,
+    state: OperationRecordDatePickerState,
+) {
+    dialog.editing = true;
+    dialog.edit_buffer = encode_statistics_date_picker(state);
+    dialog.edit_cursor = statistics_selected_request_index(dialog);
+}
+
+fn statistics_tab_indices(dialog: &PropDialog) -> Vec<usize> {
+    let raw_index = raw_device_statistics_index(dialog);
+    let mut indices = statistics_requests(dialog)
+        .iter()
+        .filter_map(|request| statistics_request_key(request))
+        .filter_map(|key| {
+            dialog
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| !is_raw_device_json_item(item))
+                .find_map(|(index, item)| (mijia_prop_key(&item.prop) == key).then_some(index))
+                .or(raw_index)
+        })
+        .collect::<Vec<_>>();
+    indices.dedup();
+    if indices.is_empty() {
+        if let Some(index) = raw_index {
+            indices.push(index);
+        }
+    }
+    indices
+}
+
+#[derive(Clone, Debug)]
+struct StatisticsChartPoint {
+    label: String,
+    value: f64,
+    text_value: String,
+}
+
+fn statistics_chart_points(
+    dialog: &PropDialog,
+    lang: Language,
+) -> Result<Vec<StatisticsChartPoint>, String> {
+    let requests = statistics_requests(dialog);
+    let Some(request) = statistics_selected_request(dialog, requests.as_slice()) else {
+        if raw_device_statistics_are_loading(dialog) {
+            return Err(lang_str(lang, "加载中...", "Loading...").to_string());
+        }
+        return Err(statistics_unsupported_message(lang));
+    };
+    if let Some(error) = request.get("error").and_then(Value::as_str) {
+        return Err(format!("{}: {error}", lang_str(lang, "错误", "Error")));
+    }
+    let Some(response) = request.get("response") else {
+        if raw_device_statistics_are_loading(dialog) {
+            return Err(lang_str(lang, "加载中...", "Loading...").to_string());
+        }
+        return Err(statistics_unsupported_message(lang));
+    };
+    if !json_code_is_zero(response.get("code")) {
+        let code = json_i64(response.get("code"))
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let message = json_text(response.get("message"))
+            .or_else(|| json_text(response.get("desc")))
+            .unwrap_or_default();
+        return Err(format!(
+            "{}: code={}{}",
+            lang_str(lang, "错误", "Error"),
+            code,
+            if message.is_empty() {
+                String::new()
+            } else {
+                format!(" message={message}")
+            }
+        ));
+    }
+    let Some(records) = response.get("result").and_then(Value::as_array) else {
+        return Err(statistics_unsupported_message(lang));
+    };
+    let period = statistics_period_for_dialog(dialog);
+    let Some((range_start, range_end)) = statistics_chart_date_range(dialog, period) else {
+        return Err(statistics_unsupported_message(lang));
+    };
+    if range_end < range_start {
+        return Err(statistics_unsupported_message(lang));
+    }
+    let buckets = statistics_chart_buckets(period, range_start, range_end);
+    if buckets.is_empty() {
+        return Err(statistics_unsupported_message(lang));
+    }
+    let mut values = vec![0.0_f64; buckets.len()];
+    for record in records {
+        let Some(time) = json_i64(record.get("time")) else {
+            continue;
+        };
+        let Some(value) = statistics_numeric_value(record.get("value")) else {
+            continue;
+        };
+        let Some(date) = timestamp_to_local_date(time) else {
+            continue;
+        };
+        let Some(index) =
+            statistics_chart_bucket_index(period, range_start, range_end, buckets.len(), date)
+        else {
+            continue;
+        };
+        values[index] += value;
+    }
+    Ok(buckets
+        .into_iter()
+        .zip(values)
+        .map(|(date, value)| StatisticsChartPoint {
+            label: format_statistics_date_label(date, period),
+            value,
+            text_value: format_statistics_value(value),
+        })
+        .collect())
+}
+
+fn statistics_unsupported_message(lang: Language) -> String {
+    lang_str(
+        lang,
+        "此设备不支持查看统计数据",
+        "This device does not support stats",
+    )
+    .to_string()
+}
+
+fn statistics_chart_date_range(
+    dialog: &PropDialog,
+    period: StatisticsPeriod,
+) -> Option<(Date, Date)> {
+    if let Some((time_start, time_end)) = statistics_date_filter_for_dialog(dialog) {
+        return Some((
+            timestamp_to_local_date(time_start)?,
+            timestamp_to_local_date(time_end)?,
+        ));
+    }
+    let query = statistics_default_query(period);
+    Some((
+        timestamp_to_local_date(query.time_start)?,
+        timestamp_to_local_date(query.time_end)?,
+    ))
+}
+
+fn statistics_chart_buckets(period: StatisticsPeriod, start: Date, end: Date) -> Vec<Date> {
+    let time_start = date_start_timestamp(start);
+    let time_end = date_end_timestamp(end);
+    let count = statistics_query_limit(period, time_start, time_end).max(1) as usize;
+    match period {
+        StatisticsPeriod::Week | StatisticsPeriod::Month => (0..count)
+            .map(|offset| start.saturating_add(TimeDuration::days(offset as i64)))
+            .take_while(|date| *date <= end)
+            .collect(),
+        StatisticsPeriod::Year => (0..count)
+            .map(|index| {
+                if index == 0 {
+                    start
+                } else if index == count.saturating_sub(1) {
+                    end
+                } else {
+                    add_months_to_date(start, index as i32)
+                }
+            })
+            .collect(),
+    }
+}
+
+fn statistics_chart_bucket_index(
+    period: StatisticsPeriod,
+    start: Date,
+    end: Date,
+    bucket_count: usize,
+    date: Date,
+) -> Option<usize> {
+    if bucket_count == 0 || date < start || date > end {
+        return None;
+    }
+    let index = match period {
+        StatisticsPeriod::Week | StatisticsPeriod::Month => {
+            i64::from(date.to_julian_day() - start.to_julian_day())
+        }
+        StatisticsPeriod::Year => {
+            let start_month = i64::from(start.year()) * 12 + i64::from(start.month() as u8);
+            let date_month = i64::from(date.year()) * 12 + i64::from(date.month() as u8);
+            date_month.saturating_sub(start_month)
+        }
+    };
+    if index < 0 {
+        return None;
+    }
+    Some((index as usize).min(bucket_count.saturating_sub(1)))
+}
+
+fn statistics_numeric_value(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => {
+            let text = text.trim();
+            text.parse::<f64>().ok().or_else(|| {
+                serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|value| statistics_numeric_value(Some(&value)))
+            })
+        }
+        Value::Array(values) => values
+            .first()
+            .and_then(|value| statistics_numeric_value(Some(value))),
+        _ => None,
+    }
+}
+
+fn format_statistics_value(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+fn format_statistics_date_label(date: Date, period: StatisticsPeriod) -> String {
+    match period {
+        StatisticsPeriod::Year => date
+            .format(format_description!("[year]-[month]"))
+            .unwrap_or_else(|_| "-".to_string()),
+        StatisticsPeriod::Week | StatisticsPeriod::Month => date
+            .format(format_description!("[month]-[day]"))
+            .unwrap_or_else(|_| "-".to_string()),
+    }
+}
+
+fn operation_record_request_is_loading_more(request: &Value) -> bool {
+    request
+        .get("pagination")
+        .and_then(|pagination| pagination.get("loading_more"))
+        .and_then(Value::as_bool)
+        .or_else(|| request.get("loading_more").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn operation_record_request_has_more(request: &Value) -> bool {
+    request
+        .get("pagination")
+        .and_then(|pagination| pagination.get("has_more"))
+        .and_then(Value::as_bool)
+        .or_else(|| request.get("has_more").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn operation_record_request_no_more(request: &Value) -> bool {
+    request
+        .get("pagination")
+        .and_then(|pagination| pagination.get("no_more"))
+        .and_then(Value::as_bool)
+        .or_else(|| request.get("no_more").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn operation_record_request_records(request: &Value) -> &[Value] {
+    request
+        .get("response")
+        .and_then(|response| response.get("result"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn operation_record_selectable_row_count(dialog: &PropDialog) -> usize {
+    let requests = operation_record_requests(dialog);
+    let Some(request) = operation_record_selected_request(dialog, requests.as_slice()) else {
+        return 0;
+    };
+    let records = operation_record_request_records(request);
+    let mut count = records.len();
+    if operation_record_request_has_more(request)
+        || operation_record_request_is_loading_more(request)
+        || operation_record_request_no_more(request)
+    {
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+fn operation_record_active_row_is_load_more(dialog: &PropDialog) -> bool {
+    let requests = operation_record_requests(dialog);
+    let Some(request) = operation_record_selected_request(dialog, requests.as_slice()) else {
+        return false;
+    };
+    let records_len = operation_record_request_records(request).len();
+    records_len > 0
+        && operation_record_active_row(dialog) == records_len
+        && operation_record_request_has_more(request)
+        && !operation_record_request_is_loading_more(request)
+}
+
+fn format_operation_record_table_row(
+    user: &str,
+    time: &str,
+    value: &str,
+    user_width: usize,
+) -> String {
+    format!(
+        "{}  {}  {}",
+        display_truncate_pad(user, user_width),
+        display_truncate_pad(time, 19),
+        value
+    )
+}
+
+fn format_operation_record_timestamp(value: Option<&Value>) -> String {
+    let Some(mut seconds) = json_i64(value) else {
+        return "-".to_string();
+    };
+    if seconds > 10_000_000_000 {
+        seconds /= 1000;
+    }
+    let Ok(timestamp) = OffsetDateTime::from_unix_timestamp(seconds) else {
+        return "-".to_string();
+    };
+    let timestamp = match UtcOffset::current_local_offset() {
+        Ok(offset) => timestamp.to_offset(offset),
+        Err(_) => timestamp,
+    };
+    timestamp
+        .format(OPERATION_RECORD_TIMESTAMP_FORMAT)
+        .unwrap_or_else(|_| "-".to_string())
+}
+
+fn format_operation_record_date(seconds: i64) -> String {
+    let Some(date) = timestamp_to_local_date(seconds) else {
+        return "-".to_string();
+    };
+    date.format(OPERATION_RECORD_DATE_FORMAT)
+        .unwrap_or_else(|_| "-".to_string())
+}
+
+fn operation_record_user_label(accounts: &[AuthAccount], uid: Option<&str>) -> String {
+    let uid = uid.map(str::trim).filter(|value| !value.is_empty());
+    let Some(uid) = uid else {
+        return "-".to_string();
+    };
+    accounts
+        .iter()
+        .find(|account| account.user.uid == uid)
+        .map(|account| account.user.nickname.trim())
+        .filter(|nickname| !nickname.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| uid.to_string())
+}
+
+fn json_i64(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.trim().to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn json_compact_text(value: Option<&Value>) -> Option<String> {
+    serde_json::to_string(value?).ok()
+}
+
+fn operation_record_request_mut_in_value<'a>(
+    value: &'a mut Value,
+    key: &str,
+) -> Option<&'a mut Value> {
+    value
+        .get_mut("requests")
+        .and_then(Value::as_array_mut)?
+        .iter_mut()
+        .find(|request| operation_record_request_key(request) == Some(key))
+}
+
+fn set_operation_record_request_loading(value: &mut Value, key: &str, loading: bool) {
+    if let Some(request) = operation_record_request_mut_in_value(value, key) {
+        let pagination = value_object_mut(
+            value_object_mut(request)
+                .entry("pagination")
+                .or_insert_with(|| json!({})),
+        );
+        pagination.insert("loading_more".to_string(), json!(loading));
+    }
+}
+
+fn set_all_operation_record_requests_loading(value: &mut Value, loading: bool) {
+    let Some(requests) = value.get_mut("requests").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for request in requests {
+        let pagination = value_object_mut(
+            value_object_mut(request)
+                .entry("pagination")
+                .or_insert_with(|| json!({})),
+        );
+        pagination.insert("loading_more".to_string(), json!(loading));
+    }
+}
+
+fn oldest_operation_record_time(request: &Value) -> Option<i64> {
+    operation_record_request_records(request)
+        .iter()
+        .filter_map(|record| json_i64(record.get("time")))
+        .min()
+}
+
+fn merge_operation_record_page(
+    value: &mut Value,
+    key: &str,
+    query: DeviceHistoryQuery,
+    response: Value,
+) {
+    let new_count = response
+        .get("result")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let Some(request) = operation_record_request_mut_in_value(value, key) else {
+        return;
+    };
+    let pagination = value_object_mut(
+        value_object_mut(request)
+            .entry("pagination")
+            .or_insert_with(|| json!({})),
+    );
+    pagination.insert("time_start".to_string(), json!(query.time_start));
+    pagination.insert("time_end".to_string(), json!(query.time_end));
+    pagination.insert("limit".to_string(), json!(query.limit));
+    pagination.insert("loading_more".to_string(), json!(false));
+
+    if !json_code_is_zero(response.get("code")) {
+        pagination.insert("has_more".to_string(), json!(false));
+        pagination.insert("no_more".to_string(), json!(true));
+        value_object_mut(request).insert("response".to_string(), response);
+        return;
+    }
+
+    let has_more = new_count >= query.limit as usize && new_count > 0;
+    pagination.insert("has_more".to_string(), json!(has_more));
+    pagination.insert("no_more".to_string(), json!(!has_more));
+
+    let Some(new_records) = response.get("result").and_then(Value::as_array) else {
+        return;
+    };
+    let response_value = value_object_mut(request)
+        .entry("response")
+        .or_insert_with(|| json!({"code": 0, "result": []}));
+    let response_object = value_object_mut(response_value);
+    response_object.insert("code".to_string(), json!(0));
+    let result = response_object.entry("result").or_insert_with(|| json!([]));
+    if !result.is_array() {
+        *result = json!([]);
+    }
+    if let Some(records) = result.as_array_mut() {
+        records.extend(new_records.iter().cloned());
+    }
+}
+
+fn load_mijia_device_logs_json(account: &AuthAccount, did: &str, keys: &[String]) -> Value {
+    load_mijia_device_logs_json_with_query(account, did, keys, None)
+}
+
+fn load_mijia_device_logs_json_with_query(
+    account: &AuthAccount,
+    did: &str,
+    keys: &[String],
+    date_filter: Option<(i64, i64)>,
+) -> Value {
+    load_mijia_raw_json(account, |client, auth| {
+        let mut query = DeviceHistoryQuery::recent(OPERATION_RECORD_PAGE_LIMIT);
+        if let Some((time_start, time_end)) = date_filter {
+            query.time_start = time_start;
+            query.time_end = time_end;
+        }
+        json!({
+            "requests": visible_mijia_raw_request_entries(keys
+                .iter()
+                .map(|key| {
+                    match client.get_user_device_data_with_query(auth, did, key, MIJIA_PROP_DATA_TYPE, query) {
+                        Ok(response) => {
+                            let result_len = response
+                                .get("result")
+                                .and_then(Value::as_array)
+                                .map(Vec::len)
+                                .unwrap_or(0);
+                            json!({
+                                "key": key,
+                                "type": MIJIA_PROP_DATA_TYPE,
+                                "response": response,
+                                "pagination": {
+                                    "time_start": query.time_start,
+                                    "time_end": query.time_end,
+                                    "limit": query.limit,
+                                    "has_more": result_len >= query.limit as usize && result_len > 0,
+                                    "no_more": result_len < query.limit as usize,
+                                    "loading_more": false
+                                }
+                            })
+                        }
+                        Err(error) => json!({
+                            "key": key,
+                            "type": MIJIA_PROP_DATA_TYPE,
+                            "error": error.to_string()
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>())
+            ,
+            "date_filter": date_filter.map(|(time_start, time_end)| json!({
+                "time_start": time_start,
+                "time_end": time_end
+            }))
+        })
+    })
+}
+
+fn load_mijia_device_statistics_json(account: &AuthAccount, did: &str, keys: &[String]) -> Value {
+    let period = StatisticsPeriod::Week;
+    load_mijia_device_statistics_json_with_query(
+        account,
+        did,
+        keys,
+        period,
+        statistics_default_query(period),
+        None,
+    )
+}
+
+fn load_mijia_device_statistics_json_with_query(
+    account: &AuthAccount,
+    did: &str,
+    keys: &[String],
+    period: StatisticsPeriod,
+    query: DeviceHistoryQuery,
+    selected_key: Option<String>,
+) -> Value {
+    load_mijia_raw_json(account, |client, auth| {
+        let data_type = period.data_type();
+        let mut ui = Map::new();
+        ui.insert("period".to_string(), json!(period.key()));
+        if let Some(selected_key) = selected_key.as_deref() {
+            ui.insert("selected_key".to_string(), json!(selected_key));
+        }
+        json!({
+            "requests": visible_mijia_raw_request_entries(keys
+                .iter()
+                .map(|key| {
+                    match client.get_user_statistics_with_query(auth, did, key, data_type, query) {
+                        Ok(response) => json!({
+                            "key": key,
+                            "data_type": data_type,
+                            "response": response
+                        }),
+                        Err(error) => json!({
+                            "key": key,
+                            "data_type": data_type,
+                            "error": error.to_string()
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>()),
+            "ui": Value::Object(ui),
+            "date_filter": {
+                "time_start": query.time_start,
+                "time_end": query.time_end
+            }
+        })
+    })
+}
+
+fn visible_mijia_raw_request_entries(entries: Vec<Value>) -> Vec<Value> {
+    entries
+        .into_iter()
+        .filter(|entry| !is_successful_empty_mijia_response(entry.get("response")))
+        .collect()
+}
+
+fn is_successful_empty_mijia_response(response: Option<&Value>) -> bool {
+    let Some(response) = response else {
+        return false;
+    };
+    json_code_is_zero(response.get("code"))
+        && response
+            .get("result")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+}
+
+fn json_code_is_zero(value: Option<&Value>) -> bool {
+    json_i64(value) == Some(0)
+}
+
+fn load_mijia_raw_json(
+    account: &AuthAccount,
+    fetch: impl FnOnce(&MijiaClient, &crate::storage::MijiaAuth) -> Value,
+) -> Value {
+    let Some(mijia) = account.mijia.as_ref() else {
+        return json!({
+            "error": "mijia auth is missing"
+        });
+    };
+    match MijiaClient::new() {
+        Ok(client) => fetch(&client, mijia),
+        Err(error) => json!({
+            "error": error.to_string()
+        }),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BoolDialogTab {
+enum StatisticsPeriod {
+    Week,
+    Month,
+    Year,
+}
+
+impl StatisticsPeriod {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+
+    fn label(self, lang: Language) -> &'static str {
+        match self {
+            Self::Week => lang_str(lang, "周", "Week"),
+            Self::Month => lang_str(lang, "月", "Month"),
+            Self::Year => lang_str(lang, "年", "Year"),
+        }
+    }
+
+    fn data_type(self) -> &'static str {
+        match self {
+            Self::Week => "stat_day_v3",
+            Self::Month => "stat_day_v3",
+            Self::Year => "stat_month_v3",
+        }
+    }
+
+    fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "week" => Some(Self::Week),
+            "month" => Some(Self::Month),
+            "year" => Some(Self::Year),
+            _ => None,
+        }
+    }
+
+    fn all() -> [Self; 3] {
+        [Self::Week, Self::Month, Self::Year]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PropDialogTab {
     Actions,
     Writable,
     ReadOnly,
+    Logs,
+    Statistics,
 }
 
 #[derive(Debug)]
-struct BoolDialog {
+struct PropDialog {
     device_did: String,
     device_name: String,
     account_uid: String,
-    items: Vec<BoolToggleItem>,
+    items: Vec<ToggleItem>,
     selected: usize,
-    active_tab: BoolDialogTab,
+    active_tab: PropDialogTab,
     writable_selected: usize,
     readonly_selected: usize,
     actions: Vec<ActionItem>,
@@ -5437,14 +8731,14 @@ struct BoolDialog {
     readonly_list_state: ListState,
     actions_list_state: ListState,
     loading: bool,
-    loading_rx: Option<Receiver<std::result::Result<Vec<BoolToggleItem>, String>>>,
+    loading_rx: Option<Receiver<std::result::Result<Vec<ToggleItem>, String>>>,
     status: Option<String>,
     editing: bool,
     edit_buffer: String,
     edit_cursor: usize,
     edit_error: Option<String>,
     refreshing: bool,
-    refresh_rx: Option<Receiver<std::result::Result<Vec<Value>, String>>>,
+    refresh_rx: Option<Receiver<PropDialogRefreshMessage>>,
 }
 
 #[derive(Clone, Debug)]
@@ -5592,7 +8886,7 @@ pub(in crate::tui) fn textarea_cursor_for_mouse(
     best
 }
 
-pub(in crate::tui) fn prop_edit_textarea_area(dialog: &BoolDialog, editor_area: Rect) -> Rect {
+pub(in crate::tui) fn prop_edit_textarea_area(dialog: &PropDialog, editor_area: Rect) -> Rect {
     let textarea_height = textarea_visual_height(dialog.edit_buffer.as_str(), editor_area.width)
         .max(2)
         .min(editor_area.height.max(1));
@@ -5731,7 +9025,7 @@ fn apply_single_line_textarea_key(
     *cursor = col.min(input.chars().count());
 }
 
-fn apply_action_param_row_key(dialog: &mut BoolDialog, key: crossterm::event::KeyEvent) {
+fn apply_action_param_row_key(dialog: &mut PropDialog, key: crossterm::event::KeyEvent) {
     let mut rows = action_param_rows_for_dialog(dialog);
     if rows.is_empty() {
         return;
@@ -5810,7 +9104,7 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> TextAreaInp
     }
 }
 
-fn action_param_rows_for_dialog(dialog: &BoolDialog) -> Vec<String> {
+fn action_param_rows_for_dialog(dialog: &PropDialog) -> Vec<String> {
     let Some(action) = dialog.actions.get(dialog.selected) else {
         return Vec::new();
     };
@@ -5831,12 +9125,12 @@ fn action_param_rows_for_dialog(dialog: &BoolDialog) -> Vec<String> {
     rows
 }
 
-fn set_action_param_rows_in_dialog(dialog: &mut BoolDialog, rows: &[String]) {
+fn set_action_param_rows_in_dialog(dialog: &mut PropDialog, rows: &[String]) {
     dialog.edit_buffer = rows.join("\n");
 }
 
 fn action_param_selector_options(
-    dialog: &BoolDialog,
+    dialog: &PropDialog,
     action: &ActionItem,
     index: usize,
 ) -> Option<Vec<(String, Value)>> {
@@ -5856,7 +9150,7 @@ fn action_param_selector_options(
 }
 
 fn action_param_selector_index(
-    dialog: &BoolDialog,
+    dialog: &PropDialog,
     action: &ActionItem,
     index: usize,
     options: &[(String, Value)],
@@ -5881,7 +9175,7 @@ fn action_param_selector_index(
 }
 
 fn action_param_selector_value(
-    dialog: &BoolDialog,
+    dialog: &PropDialog,
     action: &ActionItem,
     index: usize,
     row: Option<&str>,
@@ -5891,7 +9185,7 @@ fn action_param_selector_value(
     options.get(idx).map(|(_, value)| value.clone())
 }
 
-fn action_param_default_row(dialog: &BoolDialog, action: &ActionItem, index: usize) -> String {
+fn action_param_default_row(dialog: &PropDialog, action: &ActionItem, index: usize) -> String {
     if let Some(value) = action_param_selector_value(dialog, action, index, None) {
         return serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
     }
@@ -5941,7 +9235,7 @@ fn selector_option_value_at_offset(options: &[(String, Value)], offset: u16) -> 
 }
 
 fn action_param_selector_line(
-    dialog: &BoolDialog,
+    dialog: &PropDialog,
     action: &ActionItem,
     index: usize,
     row: Option<&str>,
@@ -5956,7 +9250,7 @@ fn action_param_selector_line(
     ))
 }
 
-fn selector_options_for_prop(prop: &BoolPropItem) -> Option<Vec<(String, Value)>> {
+fn selector_options_for_prop(prop: &PropItem) -> Option<Vec<(String, Value)>> {
     if prop.format == "bool" {
         return Some(vec![
             ("true".to_string(), Value::Bool(true)),
@@ -5981,19 +9275,19 @@ fn selector_options_for_prop(prop: &BoolPropItem) -> Option<Vec<(String, Value)>
     )
 }
 
-fn prop_edit_selector_options(item: &BoolToggleItem) -> Option<Vec<(String, Value)>> {
+fn prop_edit_selector_options(item: &ToggleItem) -> Option<Vec<(String, Value)>> {
     selector_options_for_prop(&item.prop)
 }
 
-fn prop_edit_selector_index(item: &BoolToggleItem, options: &[(String, Value)]) -> usize {
+fn prop_edit_selector_index(item: &ToggleItem, options: &[(String, Value)]) -> usize {
     options
         .iter()
         .position(|(_, value)| *value == item.value)
         .unwrap_or(0)
 }
 
-fn prop_edit_selector_is_active(dialog: &BoolDialog) -> bool {
-    if dialog.active_tab == BoolDialogTab::Actions || !dialog.editing {
+fn prop_edit_selector_is_active(dialog: &PropDialog) -> bool {
+    if dialog.active_tab == PropDialogTab::Actions || !dialog.editing {
         return false;
     }
     dialog
@@ -6003,7 +9297,7 @@ fn prop_edit_selector_is_active(dialog: &BoolDialog) -> bool {
         .is_some()
 }
 
-fn prop_edit_selector_value(dialog: &BoolDialog, item: &BoolToggleItem) -> Option<Value> {
+fn prop_edit_selector_value(dialog: &PropDialog, item: &ToggleItem) -> Option<Value> {
     let options = prop_edit_selector_options(item)?;
     if let Ok(current) = parse_prop_input_value(dialog.edit_buffer.as_str()) {
         if let Some((_, value)) = options.iter().find(|(_, value)| *value == current) {
@@ -6014,7 +9308,7 @@ fn prop_edit_selector_value(dialog: &BoolDialog, item: &BoolToggleItem) -> Optio
     options.get(index).map(|(_, value)| value.clone())
 }
 
-fn cycle_prop_edit_selector(dialog: &mut BoolDialog, forward: bool) -> bool {
+fn cycle_prop_edit_selector(dialog: &mut PropDialog, forward: bool) -> bool {
     let Some(item) = dialog.items.get(dialog.selected) else {
         return false;
     };
@@ -6038,7 +9332,7 @@ fn cycle_prop_edit_selector(dialog: &mut BoolDialog, forward: bool) -> bool {
     true
 }
 
-fn prop_edit_selector_options_text(dialog: &BoolDialog) -> Option<String> {
+fn prop_edit_selector_options_text(dialog: &PropDialog) -> Option<String> {
     let item = dialog.items.get(dialog.selected)?;
     let options = prop_edit_selector_options(item)?;
     Some(
@@ -6050,7 +9344,7 @@ fn prop_edit_selector_options_text(dialog: &BoolDialog) -> Option<String> {
     )
 }
 
-fn prop_edit_selector_line(dialog: &BoolDialog, base_style: Style) -> Option<Line<'static>> {
+fn prop_edit_selector_line(dialog: &PropDialog, base_style: Style) -> Option<Line<'static>> {
     let item = dialog.items.get(dialog.selected)?;
     let options = prop_edit_selector_options(item)?;
     let active_value = prop_edit_selector_value(dialog, item);
@@ -6061,39 +9355,49 @@ fn prop_edit_selector_line(dialog: &BoolDialog, base_style: Style) -> Option<Lin
     ))
 }
 
-fn visible_prop_dialog_tabs(dialog: &BoolDialog) -> Vec<BoolDialogTab> {
+fn visible_prop_dialog_tabs(dialog: &PropDialog) -> Vec<PropDialogTab> {
     let mut tabs = Vec::new();
     if !dialog.actions.is_empty() {
-        tabs.push(BoolDialogTab::Actions);
+        tabs.push(PropDialogTab::Actions);
     }
-    if !prop_dialog_indices_for_tab(dialog, BoolDialogTab::Writable).is_empty() {
-        tabs.push(BoolDialogTab::Writable);
+    if !prop_dialog_indices_for_tab(dialog, PropDialogTab::Writable).is_empty() {
+        tabs.push(PropDialogTab::Writable);
     }
-    if !prop_dialog_indices_for_tab(dialog, BoolDialogTab::ReadOnly).is_empty() {
-        tabs.push(BoolDialogTab::ReadOnly);
+    if !prop_dialog_indices_for_tab(dialog, PropDialogTab::ReadOnly).is_empty() {
+        tabs.push(PropDialogTab::ReadOnly);
+    }
+    if !prop_dialog_indices_for_tab(dialog, PropDialogTab::Logs).is_empty() {
+        tabs.push(PropDialogTab::Logs);
+    }
+    if !prop_dialog_indices_for_tab(dialog, PropDialogTab::Statistics).is_empty() {
+        tabs.push(PropDialogTab::Statistics);
     }
     tabs
 }
 
 #[cfg(test)]
-fn all_prop_dialog_tabs() -> [BoolDialogTab; 3] {
+fn all_prop_dialog_tabs() -> [PropDialogTab; 5] {
     [
-        BoolDialogTab::Actions,
-        BoolDialogTab::Writable,
-        BoolDialogTab::ReadOnly,
+        PropDialogTab::Actions,
+        PropDialogTab::Writable,
+        PropDialogTab::ReadOnly,
+        PropDialogTab::Logs,
+        PropDialogTab::Statistics,
     ]
 }
 
-fn prop_dialog_tab_title(tab: BoolDialogTab, lang: Language) -> &'static str {
+fn prop_dialog_tab_title(tab: PropDialogTab, lang: Language) -> &'static str {
     match tab {
-        BoolDialogTab::Actions => lang_str(lang, "快捷操作", "Quick Actions"),
-        BoolDialogTab::Writable => lang_str(lang, "修改参数", "Edit Properties"),
-        BoolDialogTab::ReadOnly => lang_str(lang, "只读属性", "Read-only Properties"),
+        PropDialogTab::Actions => lang_str(lang, "快捷操作", "Quick Actions"),
+        PropDialogTab::Writable => lang_str(lang, "修改参数", "Edit Properties"),
+        PropDialogTab::ReadOnly => lang_str(lang, "只读属性", "Read-only Properties"),
+        PropDialogTab::Logs => lang_str(lang, "操作记录", "Operation Records"),
+        PropDialogTab::Statistics => lang_str(lang, "统计", "Stats"),
     }
 }
 
 fn numbered_prop_dialog_tab_titles(
-    tabs: impl IntoIterator<Item = BoolDialogTab>,
+    tabs: impl IntoIterator<Item = PropDialogTab>,
     lang: Language,
 ) -> Vec<String> {
     tabs.into_iter()
@@ -6107,25 +9411,35 @@ fn all_prop_dialog_tab_titles(lang: Language) -> Vec<String> {
     numbered_prop_dialog_tab_titles(all_prop_dialog_tabs(), lang)
 }
 
-fn visible_prop_dialog_tab_titles(dialog: &BoolDialog, lang: Language) -> Vec<String> {
+fn visible_prop_dialog_tab_titles(dialog: &PropDialog, lang: Language) -> Vec<String> {
     numbered_prop_dialog_tab_titles(visible_prop_dialog_tabs(dialog), lang)
 }
 
-fn prop_dialog_indices_for_tab(dialog: &BoolDialog, tab: BoolDialogTab) -> Vec<usize> {
+fn prop_dialog_indices_for_tab(dialog: &PropDialog, tab: PropDialogTab) -> Vec<usize> {
     match tab {
-        BoolDialogTab::Actions => (0..dialog.actions.len()).collect(),
+        PropDialogTab::Actions => (0..dialog.actions.len()).collect(),
+        PropDialogTab::Logs => operation_record_tab_indices(dialog),
+        PropDialogTab::Statistics => statistics_tab_indices(dialog),
         _ => {
             let mut indices = dialog
                 .items
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| match tab {
-                    BoolDialogTab::Writable if item.prop.writable => Some(index),
-                    BoolDialogTab::ReadOnly if !item.prop.writable => Some(index),
+                    PropDialogTab::Writable
+                        if item.prop.writable && !is_raw_device_json_item(item) =>
+                    {
+                        Some(index)
+                    }
+                    PropDialogTab::ReadOnly
+                        if !item.prop.writable && !is_raw_device_json_item(item) =>
+                    {
+                        Some(index)
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if matches!(tab, BoolDialogTab::ReadOnly) {
+            if matches!(tab, PropDialogTab::ReadOnly) {
                 indices.sort_by(|left, right| {
                     let left_name = &dialog.items[*left].prop.name;
                     let right_name = &dialog.items[*right].prop.name;
@@ -6142,7 +9456,7 @@ fn prop_dialog_indices_for_tab(dialog: &BoolDialog, tab: BoolDialogTab) -> Vec<u
 }
 
 fn format_prop_dialog_list_item_line(
-    item: &BoolToggleItem,
+    item: &ToggleItem,
     selected: bool,
     loading: bool,
     lang: Language,
@@ -6192,7 +9506,7 @@ fn format_prop_dialog_action_list_item_line(action: &ActionItem, selected: bool)
     format!("{selected_marker} {}", action.name)
 }
 
-fn action_params_command_preview(dialog: &BoolDialog) -> Option<String> {
+fn action_params_command_preview(dialog: &PropDialog) -> Option<String> {
     let action = dialog.actions.get(dialog.selected)?;
     let rows = action_param_rows_for_dialog(dialog);
     if rows.len() != action.input_piids.len() {
@@ -6212,7 +9526,7 @@ fn action_params_command_preview(dialog: &BoolDialog) -> Option<String> {
     ))
 }
 
-fn prop_edit_command_preview(dialog: &BoolDialog) -> Option<String> {
+fn prop_edit_command_preview(dialog: &PropDialog) -> Option<String> {
     let item = dialog.items.get(dialog.selected)?;
     if !item.prop.writable {
         return None;
@@ -6229,7 +9543,7 @@ fn prop_edit_command_preview(dialog: &BoolDialog) -> Option<String> {
     ))
 }
 
-fn prop_edit_get_command(dialog: &BoolDialog) -> Option<String> {
+fn prop_edit_get_command(dialog: &PropDialog) -> Option<String> {
     let item = dialog.items.get(dialog.selected)?;
     if !item.prop.writable {
         return None;
@@ -6283,13 +9597,13 @@ fn format_preview_push_command(uid: &str, text: &str) -> String {
     format!("mit push --uid {} {}", uid, preview_param(text))
 }
 
-pub(in crate::tui) fn prop_dialog_title(dialog: &BoolDialog, lang: Language) -> String {
+pub(in crate::tui) fn prop_dialog_title(dialog: &PropDialog, lang: Language) -> String {
     let dialog_title = if dialog.device_name.trim().is_empty() {
         dialog.device_did.as_str()
     } else {
         dialog.device_name.as_str()
     };
-    if dialog.loading || dialog.refreshing {
+    if prop_dialog_active_tab_is_loading(dialog) {
         format!(
             "{dialog_title} ({})",
             lang_str(lang, "刷新中...", "Loading...")
@@ -6299,8 +9613,8 @@ pub(in crate::tui) fn prop_dialog_title(dialog: &BoolDialog, lang: Language) -> 
     }
 }
 
-pub(in crate::tui) fn prop_editor_header_lines(dialog: &BoolDialog, lang: Language) -> Vec<String> {
-    if dialog.active_tab == BoolDialogTab::ReadOnly {
+pub(in crate::tui) fn prop_editor_header_lines(dialog: &PropDialog, lang: Language) -> Vec<String> {
+    if dialog.active_tab == PropDialogTab::ReadOnly {
         let Some(item) = dialog.items.get(dialog.selected) else {
             return vec!["No selected property".to_string()];
         };
@@ -6318,7 +9632,7 @@ pub(in crate::tui) fn prop_editor_header_lines(dialog: &BoolDialog, lang: Langua
             ),
         ];
     }
-    if dialog.active_tab == BoolDialogTab::Actions {
+    if dialog.active_tab == PropDialogTab::Actions {
         return dialog
             .actions
             .get(dialog.selected)
@@ -6379,7 +9693,7 @@ pub(in crate::tui) fn textarea_visual_height(text: &str, width: u16) -> u16 {
 }
 
 fn action_param_row_height(
-    dialog: &BoolDialog,
+    dialog: &PropDialog,
     action: &ActionItem,
     index: usize,
     value: &str,
@@ -6401,7 +9715,7 @@ pub(in crate::tui) struct ActionParamRowLayout {
 }
 
 pub(in crate::tui) fn action_param_row_layouts(
-    dialog: &BoolDialog,
+    dialog: &PropDialog,
     editor_area: Rect,
 ) -> Vec<ActionParamRowLayout> {
     let rows = action_param_rows_for_dialog(dialog);
@@ -6462,7 +9776,7 @@ pub(in crate::tui) struct PropEditorLayout {
 }
 
 pub(in crate::tui) fn prop_editor_layout(
-    dialog: &BoolDialog,
+    dialog: &PropDialog,
     inner: Rect,
     lang: Language,
 ) -> PropEditorLayout {
@@ -6471,7 +9785,7 @@ pub(in crate::tui) fn prop_editor_layout(
         .map(|line| wrapped_text_line_count(line, inner.width))
         .sum::<u16>();
     let action_rows = action_param_rows_for_dialog(dialog);
-    let editor_lines = if dialog.active_tab == BoolDialogTab::Actions {
+    let editor_lines = if dialog.active_tab == PropDialogTab::Actions {
         dialog
             .actions
             .get(dialog.selected)
@@ -6505,7 +9819,7 @@ pub(in crate::tui) fn prop_editor_layout(
                     .sum::<u16>()
             })
             .unwrap_or(0)
-    } else if dialog.active_tab == BoolDialogTab::ReadOnly {
+    } else if dialog.active_tab == PropDialogTab::ReadOnly {
         0
     } else if prop_edit_selector_options_text(dialog).is_some() {
         1
@@ -6525,7 +9839,7 @@ pub(in crate::tui) fn prop_editor_layout(
     next_y = next_y.saturating_add(header_height);
     remaining = remaining.saturating_sub(header_height);
 
-    let needs_header_editor_gap = dialog.active_tab == BoolDialogTab::Actions;
+    let needs_header_editor_gap = dialog.active_tab == PropDialogTab::Actions;
     if header_height > 0 && editor_lines > 0 && remaining > 0 && needs_header_editor_gap {
         next_y = next_y.saturating_add(1);
         remaining = remaining.saturating_sub(1);
@@ -6552,8 +9866,8 @@ pub(in crate::tui) fn prop_editor_layout(
     }
 }
 
-fn prop_editor_bottom_lines(dialog: &BoolDialog, lang: Language) -> Vec<String> {
-    if dialog.active_tab == BoolDialogTab::ReadOnly {
+fn prop_editor_bottom_lines(dialog: &PropDialog, lang: Language) -> Vec<String> {
+    if dialog.active_tab == PropDialogTab::ReadOnly {
         return readonly_prop_detail_command(dialog)
             .map(|command| {
                 vec![format!(
@@ -6564,7 +9878,7 @@ fn prop_editor_bottom_lines(dialog: &BoolDialog, lang: Language) -> Vec<String> 
             .unwrap_or_default();
     }
     let mut bottom_lines = Vec::new();
-    if dialog.active_tab != BoolDialogTab::Actions {
+    if dialog.active_tab != PropDialogTab::Actions {
         if let Some(command) = prop_edit_get_command(dialog) {
             bottom_lines.push(format!(
                 "{}: {command}",
@@ -6572,7 +9886,7 @@ fn prop_editor_bottom_lines(dialog: &BoolDialog, lang: Language) -> Vec<String> 
             ));
         }
     }
-    let command_preview = if dialog.active_tab == BoolDialogTab::Actions {
+    let command_preview = if dialog.active_tab == PropDialogTab::Actions {
         action_params_command_preview(dialog)
     } else {
         prop_edit_command_preview(dialog)
@@ -6592,7 +9906,7 @@ fn prop_editor_bottom_lines(dialog: &BoolDialog, lang: Language) -> Vec<String> 
     bottom_lines
 }
 
-fn collect_readable_props(spec: &Value, lang: Language) -> Vec<BoolPropItem> {
+fn collect_readable_props(spec: &Value, lang: Language) -> Vec<PropItem> {
     let mut out = Vec::new();
     let Some(services) = spec.get("services").and_then(Value::as_array) else {
         return out;
@@ -6640,7 +9954,7 @@ fn collect_readable_props(spec: &Value, lang: Language) -> Vec<BoolPropItem> {
                                     serde_json::to_string(&value)
                                         .unwrap_or_else(|_| "null".to_string())
                                 });
-                            Some(BoolPropValueOption { value, label })
+                            Some(PropValueOption { value, label })
                         })
                         .collect::<Vec<_>>()
                 })
@@ -6664,7 +9978,7 @@ fn collect_readable_props(spec: &Value, lang: Language) -> Vec<BoolPropItem> {
             } else {
                 prop_name
             };
-            out.push(BoolPropItem {
+            out.push(PropItem {
                 siid,
                 piid,
                 name,
@@ -6747,14 +10061,14 @@ fn extract_actions_from_spec(spec: &Value, lang: Language) -> Vec<ActionItem> {
                                                     serde_json::to_string(&value)
                                                         .unwrap_or_else(|_| "null".to_string())
                                                 });
-                                            Some(BoolPropValueOption { value, label })
+                                            Some(PropValueOption { value, label })
                                         })
                                         .collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default();
                             Some((
                                 piid,
-                                BoolPropItem {
+                                PropItem {
                                     siid,
                                     piid,
                                     name,
@@ -6764,7 +10078,7 @@ fn extract_actions_from_spec(spec: &Value, lang: Language) -> Vec<ActionItem> {
                                 },
                             ))
                         })
-                        .collect::<HashMap<i64, BoolPropItem>>()
+                        .collect::<HashMap<i64, PropItem>>()
                 })
                 .unwrap_or_default();
             if let Some(service_actions) = service.get("actions").and_then(|v| v.as_array()) {
@@ -6794,7 +10108,7 @@ fn extract_actions_from_spec(spec: &Value, lang: Language) -> Vec<ActionItem> {
                             .iter()
                             .enumerate()
                             .map(|(idx, piid)| {
-                                property_by_iid.get(piid).cloned().unwrap_or(BoolPropItem {
+                                property_by_iid.get(piid).cloned().unwrap_or(PropItem {
                                     siid,
                                     piid: *piid,
                                     name: input_labels[idx].clone(),

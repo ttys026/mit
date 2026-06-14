@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -56,16 +56,17 @@ fn auth_login_starts_callback_server_and_saves_pending_auth_state() {
 
     let auth: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
     let pending = auth.get("pendingAuth").and_then(Value::as_object).unwrap();
+    let xiaomi = pending.get("xiaomi").and_then(Value::as_object).unwrap();
     assert_eq!(
-        pending.get("uuid").and_then(Value::as_str).unwrap().len(),
+        xiaomi.get("uuid").and_then(Value::as_str).unwrap().len(),
         32
     );
-    assert!(pending
+    assert!(xiaomi
         .get("deviceId")
         .and_then(Value::as_str)
         .unwrap()
         .starts_with("mico."));
-    assert!(!pending
+    assert!(!xiaomi
         .get("state")
         .and_then(Value::as_str)
         .unwrap()
@@ -199,6 +200,301 @@ fn auth_login_skips_browser_open_when_disabled_for_tests() {
 }
 
 #[test]
+fn auth_login_xiaomi_subcommand_uses_existing_oauth_flow() {
+    let _guard = auth_login_test_guard();
+    let test_home = make_temp_dir("mit-login-xiaomi-subcommand");
+    let port = pick_free_port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/login_redirect");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["auth", "login", "xiaomi"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_REDIRECT_URI", redirect_uri.as_str())
+        .env("MIT_DISABLE_BROWSER_OPEN", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let auth_path = test_home.join(".mit").join("auth.json");
+    for _ in 0..50 {
+        if auth_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(auth_path.exists(), "auth.json was not created");
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(&format!("http://127.0.0.1:{port}/login")));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn auth_login_mijia_subcommand_shows_qr_and_saves_mijia_auth() {
+    let _guard = auth_login_test_guard();
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-login-mijia-subcommand");
+    let port = pick_free_port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/login_redirect");
+    let child = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["auth", "login", "mijia"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_REDIRECT_URI", redirect_uri.as_str())
+        .env("MIT_DISABLE_BROWSER_OPEN", "1")
+        .env(
+            "MIT_MIJIA_SERVICE_LOGIN_URL",
+            server.mijia_service_login_url(),
+        )
+        .env("MIT_MIJIA_LOGIN_URL", server.mijia_login_url())
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_port_in_use(&redirect_uri);
+    let qr_response = send_login_entry_open(&redirect_uri);
+    assert!(
+        qr_response.contains("请使用米家 App 扫描二维码完成登录"),
+        "qr response: {qr_response}"
+    );
+    assert!(
+        qr_response.contains("<img") && qr_response.contains("/mijia/qr.png"),
+        "qr response: {qr_response}"
+    );
+    assert!(
+        qr_response.contains("href=\"") && qr_response.contains("/mijia/qr-login"),
+        "qr response: {qr_response}"
+    );
+    assert!(
+        qr_response.contains("/mijia_login_status")
+            && qr_response.contains("授权成功，可以关闭此页面")
+            && qr_response.contains("本地登录服务已停止或超时"),
+        "qr response: {qr_response}"
+    );
+
+    let status_response = wait_for_mijia_status_success(&redirect_uri);
+    assert!(
+        status_response.contains("\"status\":\"succeeded\"")
+            && status_response.contains("授权成功，可以关闭此页面"),
+        "status response: {status_response}"
+    );
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let auth_path = test_home.join(".mit").join("auth.json");
+    let auth: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let mijia = auth["accounts"][0]["mijia"].as_object().unwrap();
+    assert_eq!(mijia["userId"], "1001");
+    assert_eq!(mijia["serviceToken"], "service-token-a");
+
+    let requests = server.requests();
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/pass/serviceLogin"));
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/longPolling/loginUrl"));
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/longPolling/lp"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn auth_login_mijia_subcommand_merges_existing_xiaomi_account_by_uid() {
+    let _guard = auth_login_test_guard();
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-login-mijia-merge-xiaomi");
+    let auth_dir = test_home.join(".mit");
+    fs::create_dir_all(&auth_dir).unwrap();
+    let auth_path = auth_dir.join("auth.json");
+    fs::write(
+        &auth_path,
+        serde_json::to_string_pretty(&json!({
+            "accounts": [
+                {
+                    "version": 1,
+                    "xiaomi": {
+                        "region": "cn",
+                        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+                        "uuid": "uuid-a",
+                        "deviceId": "mico.uuid-a",
+                        "state": "state-a",
+                        "accessToken": "token-a",
+                        "refreshToken": "refresh-a",
+                        "expiresTs": 111
+                    },
+                    "mijia": null,
+                    "user": {
+                        "uid": "1001",
+                        "nickname": "账号A",
+                        "icon": "icon-a",
+                        "unionId": "union-a"
+                    }
+                }
+            ],
+            "pendingAuth": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let port = pick_free_port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/login_redirect");
+    let child = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["auth", "login", "mijia"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_REDIRECT_URI", redirect_uri.as_str())
+        .env("MIT_DISABLE_BROWSER_OPEN", "1")
+        .env(
+            "MIT_MIJIA_SERVICE_LOGIN_URL",
+            server.mijia_service_login_url(),
+        )
+        .env("MIT_MIJIA_LOGIN_URL", server.mijia_login_url())
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_port_in_use(&redirect_uri);
+    let qr_response = send_login_entry_open(&redirect_uri);
+    assert!(
+        qr_response.contains("请使用米家 App 扫描二维码完成登录"),
+        "qr response: {qr_response}"
+    );
+    let status_response = wait_for_mijia_status_success(&redirect_uri);
+    assert!(
+        status_response.contains("\"status\":\"succeeded\""),
+        "status response: {status_response}"
+    );
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let auth: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let accounts = auth["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1);
+    let account = &accounts[0];
+    assert!(account["xiaomi"].is_object());
+    assert_eq!(account["user"]["uid"], "1001");
+    assert_eq!(account["user"]["nickname"], "账号A");
+    assert_eq!(account["mijia"]["userId"], "1001");
+    assert_eq!(account["mijia"]["serviceToken"], "service-token-a");
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn auth_login_xiaomi_subcommand_merges_existing_mijia_account_by_resolved_uid() {
+    let _guard = auth_login_test_guard();
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-login-xiaomi-merge-mijia");
+    let auth_dir = test_home.join(".mit");
+    fs::create_dir_all(&auth_dir).unwrap();
+    let auth_path = auth_dir.join("auth.json");
+    fs::write(
+        &auth_path,
+        serde_json::to_string_pretty(&json!({
+            "accounts": [
+                {
+                    "version": 1,
+                    "xiaomi": null,
+                    "mijia": {
+                        "ua": "Android-15-test",
+                        "deviceId": "mijia-device-a",
+                        "passO": "pass-o-a",
+                        "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+                        "passToken": "pass-token-a",
+                        "userId": "",
+                        "cUserId": "c-1001",
+                        "serviceToken": "service-token-a",
+                        "expireTime": 222,
+                        "saveTime": 123
+                    },
+                    "user": {
+                        "uid": "c-1001",
+                        "nickname": "",
+                        "icon": "",
+                        "unionId": ""
+                    }
+                }
+            ],
+            "pendingAuth": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let port = pick_free_port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/login_redirect");
+    let child = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["auth", "login", "xiaomi"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_REDIRECT_URI", redirect_uri.as_str())
+        .env("MIT_DISABLE_BROWSER_OPEN", "1")
+        .env("MIT_MICO_BASE_URL", server.base_url())
+        .env("MIT_USER_PROFILE_URL", server.user_profile_url())
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    for _ in 0..50 {
+        if auth_path.exists() {
+            let auth: Value =
+                serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+            if auth.get("pendingAuth").and_then(Value::as_object).is_some() {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let auth: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let state = auth
+        .get("pendingAuth")
+        .and_then(Value::as_object)
+        .and_then(|pending| pending.get("xiaomi"))
+        .and_then(Value::as_object)
+        .and_then(|xiaomi| xiaomi.get("state"))
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let callback_response = send_callback(&redirect_uri, &state);
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        callback_response.contains("授权成功，可以关闭此页面"),
+        "callback response: {callback_response}"
+    );
+
+    let auth: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let accounts = auth["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1);
+    let account = &accounts[0];
+    assert!(account["xiaomi"].is_object());
+    assert_eq!(account["user"]["uid"], "1001");
+    assert_eq!(account["user"]["nickname"], "账号A");
+    assert_eq!(account["mijia"]["userId"], "1001");
+    assert_eq!(account["mijia"]["serviceToken"], "service-token-a");
+    let requests = server.requests();
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/app/v2/homeroom/gethome_merged"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
 fn auth_login_rejects_redirect_uri_flag() {
     let _guard = auth_login_test_guard();
     let test_home = make_temp_dir("mit-login-reject-flag");
@@ -273,6 +569,12 @@ fn auth_login_json_emits_ndjson_progress() {
         .env("MIT_REDIRECT_URI", redirect_uri.as_str())
         .env("MIT_MICO_BASE_URL", server.base_url())
         .env("MIT_USER_PROFILE_URL", server.user_profile_url())
+        .env(
+            "MIT_MIJIA_SERVICE_LOGIN_URL",
+            server.mijia_service_login_url(),
+        )
+        .env("MIT_MIJIA_LOGIN_URL", server.mijia_login_url())
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -291,7 +593,9 @@ fn auth_login_json_emits_ndjson_progress() {
     let state = auth
         .get("pendingAuth")
         .and_then(Value::as_object)
-        .and_then(|pending| pending.get("state"))
+        .and_then(|pending| pending.get("xiaomi"))
+        .and_then(Value::as_object)
+        .and_then(|xiaomi| xiaomi.get("state"))
         .and_then(Value::as_str)
         .unwrap()
         .to_string();
@@ -335,7 +639,16 @@ fn auth_login_json_emits_ndjson_progress() {
         "login entry response: {callback_redirect_response}\nstderr: {stderr}\nstdout: {stdout}"
     );
     assert!(
-        callback_response.starts_with("HTTP/1.1 200 OK"),
+        callback_response.starts_with("HTTP/1.1 302 Found"),
+        "callback response: {callback_response}\nstderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(
+        callback_response.contains("Location: ") && callback_response.contains("/mijia/qr-login"),
+        "callback response: {callback_response}\nstderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(
+        !callback_response.contains("请使用米家 App 扫描二维码完成登录")
+            && !callback_response.contains("<img"),
         "callback response: {callback_response}\nstderr: {stderr}\nstdout: {stdout}"
     );
     assert_eq!(events[0]["type"], "authUrlPrinted");
@@ -360,6 +673,13 @@ fn auth_login_json_emits_ndjson_progress() {
     assert!(requests
         .iter()
         .any(|request| request.path == "/app/v2/oauth/get_uid_by_unionid"));
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/longPolling/lp"));
+
+    let auth: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let mijia = auth["accounts"][0]["mijia"].as_object().unwrap();
+    assert_eq!(mijia["serviceToken"], "service-token-a");
 
     let _ = fs::remove_dir_all(&test_home);
 }
@@ -377,6 +697,12 @@ fn auth_login_handles_chunked_callback_request() {
         .env("MIT_REDIRECT_URI", redirect_uri.as_str())
         .env("MIT_MICO_BASE_URL", server.base_url())
         .env("MIT_USER_PROFILE_URL", server.user_profile_url())
+        .env(
+            "MIT_MIJIA_SERVICE_LOGIN_URL",
+            server.mijia_service_login_url(),
+        )
+        .env("MIT_MIJIA_LOGIN_URL", server.mijia_login_url())
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -395,7 +721,9 @@ fn auth_login_handles_chunked_callback_request() {
     let state = auth
         .get("pendingAuth")
         .and_then(Value::as_object)
-        .and_then(|pending| pending.get("state"))
+        .and_then(|pending| pending.get("xiaomi"))
+        .and_then(Value::as_object)
+        .and_then(|xiaomi| xiaomi.get("state"))
         .and_then(Value::as_str)
         .unwrap()
         .to_string();
@@ -406,7 +734,16 @@ fn auth_login_handles_chunked_callback_request() {
 
     assert!(output.status.success(), "stderr: {stderr}");
     assert!(
-        callback_response.starts_with("HTTP/1.1 200 OK"),
+        callback_response.starts_with("HTTP/1.1 302 Found"),
+        "callback response: {callback_response}\nstderr: {stderr}"
+    );
+    assert!(
+        callback_response.contains("Location: ") && callback_response.contains("/mijia/qr-login"),
+        "callback response: {callback_response}\nstderr: {stderr}"
+    );
+    assert!(
+        !callback_response.contains("请使用米家 App 扫描二维码完成登录")
+            && !callback_response.contains("<img"),
         "callback response: {callback_response}\nstderr: {stderr}"
     );
 
@@ -472,21 +809,38 @@ fn send_login_entry_callback(redirect_uri: &str, state: &str) -> String {
 }
 
 fn send_login_entry_open(redirect_uri: &str) -> String {
+    send_get_path(redirect_uri, "/login")
+}
+
+fn wait_for_mijia_status_success(redirect_uri: &str) -> String {
+    let mut last_response = String::new();
+    for _ in 0..50 {
+        last_response = send_get_path(redirect_uri, "/mijia_login_status");
+        if last_response.contains("\"status\":\"succeeded\"") {
+            return last_response;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("mijia login status did not succeed: {last_response}");
+}
+
+fn send_get_path(redirect_uri: &str, path: &str) -> String {
     let parsed = url::Url::parse(redirect_uri).unwrap();
     let host = parsed.host_str().unwrap();
     let port = parsed.port_or_known_default().unwrap();
     let mut stream = std::net::TcpStream::connect((host, port)).unwrap();
     stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
         .write_all(
-            format!(
-                "GET /login HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
-                host, port
-            )
-            .as_bytes(),
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )
         .unwrap();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
+    let _ = stream.read_to_string(&mut response);
     response
 }
 
@@ -496,6 +850,19 @@ fn pick_free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn wait_for_port_in_use(redirect_uri: &str) {
+    let parsed = url::Url::parse(redirect_uri).unwrap();
+    let host = parsed.host_str().unwrap();
+    let port = parsed.port_or_known_default().unwrap();
+    for _ in 0..50 {
+        if TcpListener::bind((host, port)).is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("callback server did not bind {host}:{port}");
 }
 
 fn make_temp_dir(prefix: &str) -> PathBuf {
