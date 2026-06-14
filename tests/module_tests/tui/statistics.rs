@@ -63,10 +63,16 @@ fn prop_dialog_statistics_tab_renders_controls_and_bar_chart() {
     assert!(compact.contains("S:统计项"), "{stats_text}");
     assert!(compact.contains("功耗/总耗电"), "{stats_text}");
     assert!(compact.contains("周▾"), "{stats_text}");
-    assert!(
-        stats_text.contains("1970-01-01 - 1970-01-08"),
-        "{stats_text}"
+    // The range label renders the date_filter timestamps as *local* dates, so the
+    // exact strings depend on the machine timezone (e.g. time_end 604799 rounds to
+    // Jan 7 in UTC but Jan 8 in UTC+8). Compute the expectation the same way the
+    // production code does so the assertion is timezone-independent.
+    let expected_range = format!(
+        "{} - {}",
+        super::format_operation_record_date(0),
+        super::format_operation_record_date(604_799),
     );
+    assert!(stats_text.contains(&expected_range), "{stats_text}");
     assert!(compact.contains("值↑时间→"), "{stats_text}");
     assert!(stats_text.contains("01-01"), "{stats_text}");
     assert!(stats_text.contains("2.5"), "{stats_text}");
