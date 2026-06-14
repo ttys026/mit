@@ -1,6 +1,8 @@
 //! Auth login subprocess tracking: register/cancel the in-flight browser
 //! login process and the channel message reporting its completion.
-use anyhow::{bail, Result};
+#[cfg(not(test))]
+use anyhow::bail;
+use anyhow::Result;
 #[cfg(not(test))]
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
