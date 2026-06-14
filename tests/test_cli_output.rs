@@ -325,7 +325,10 @@ fn bare_root_uses_chinese_summary_by_default() {
 
 #[test]
 fn cli_source_does_not_keep_unused_command_formatters() {
-    let source = include_str!("../src/cli.rs");
+    let source = concat!(
+        include_str!("../src/cli/mod.rs"),
+        include_str!("../src/cli/login.rs"),
+    );
 
     assert!(!source.contains("pub fn format_props_set_command("));
     assert!(!source.contains("pub fn format_props_act_command("));
