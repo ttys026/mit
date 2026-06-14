@@ -658,7 +658,7 @@ fn source_tests_live_under_tests_folder() {
     );
     assert_externalized_test_hook(
         include_str!("../src/tui/mod.rs"),
-        "#[path = \"../../tests/module_tests/tui.rs\"]",
+        "#[path = \"../../tests/module_tests/tui/mod.rs\"]",
         "src/tui/mod.rs",
     );
 }

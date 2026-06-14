@@ -1361,5 +1361,5 @@ enum AccountActionDialog {
 }
 
 #[cfg(test)]
-#[path = "../../tests/module_tests/tui.rs"]
+#[path = "../../tests/module_tests/tui/mod.rs"]
 mod tests;
