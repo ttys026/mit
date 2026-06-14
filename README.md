@@ -97,6 +97,8 @@ mit auth login --region cn                       # Specify Xiaomi region for com
 mit auth login xiaomi                            # Log in to Xiaomi OAuth only
 mit auth login mijia                             # Log in to Mijia QR only
 mit auth list                                    # List saved accounts
+mit auth logout                                  # Log out (only one account) and delete its cache
+mit auth logout --uid 1001                       # Log out a specific account
 
 # ── TUI ────────────────────────────────────────────────────
 mit tui                                          # Launch full-screen dashboard
@@ -116,6 +118,15 @@ mit props act did-1 5 1 1 2                      # Invoke action with parameters
 mit props sub                                    # Subscribe to all device property changes
 mit props sub did-1                              # Subscribe to all changes for one device
 mit props sub did-1 2 1                          # Subscribe to one property
+
+# ── Device history & statistics (Mijia) ────────────────────
+mit logs did-1 2.1                               # Operation records for property 2.1
+mit logs did-1 2.1 3.1 --limit 100               # Multiple keys, up to 100 records each
+mit stats did-1 3.1 --period week                # Statistics for a key (week|month|year)
+
+# ── Maintenance ────────────────────────────────────────────
+mit cache clean                                  # Delete device/spec caches (keep login)
+mit reset --yes                                  # Delete all data under ~/.mit (requires --yes)
 ```
 
 ### Notes

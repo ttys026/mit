@@ -312,6 +312,10 @@ fn bare_root_uses_chinese_summary_by_default() {
             "- devices：列出设备",
             "- props：读写 MIoT 属性和 action",
             "- push：向已登录账号发送通知",
+            "- logs：查看设备操作记录（米家历史日志）",
+            "- stats：查看设备统计数据（米家统计）",
+            "- cache：清理缓存（保留登录）",
+            "- reset：重置全部数据（删除 ~/.mit）",
             "- tui：启动全屏 TUI 控制台",
             "",
             "运行 `mit --help` 查看完整帮助。",
@@ -321,7 +325,10 @@ fn bare_root_uses_chinese_summary_by_default() {
 
 #[test]
 fn cli_source_does_not_keep_unused_command_formatters() {
-    let source = include_str!("../src/cli.rs");
+    let source = concat!(
+        include_str!("../src/cli/mod.rs"),
+        include_str!("../src/cli/login.rs"),
+    );
 
     assert!(!source.contains("pub fn format_props_set_command("));
     assert!(!source.contains("pub fn format_props_act_command("));
@@ -648,8 +655,13 @@ fn source_tests_live_under_tests_folder() {
         "src/mico_api.rs",
     );
     assert_externalized_test_hook(
+        include_str!("../src/mijia_api.rs"),
+        "#[path = \"../tests/module_tests/mijia_api.rs\"]",
+        "src/mijia_api.rs",
+    );
+    assert_externalized_test_hook(
         include_str!("../src/tui/mod.rs"),
-        "#[path = \"../../tests/module_tests/tui.rs\"]",
+        "#[path = \"../../tests/module_tests/tui/mod.rs\"]",
         "src/tui/mod.rs",
     );
 }

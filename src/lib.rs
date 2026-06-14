@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod cli;
 pub mod mico_api;
 pub mod miio_local;

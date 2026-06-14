@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::ListState;
-use std::fs;
 use std::io::BufRead;
 #[cfg(not(test))]
 use std::io::Read;
@@ -11,7 +10,7 @@ use std::thread;
 use unicode_width::UnicodeWidthStr;
 
 use crate::mijia_api::is_mijia_auth_present;
-use crate::storage::{get_auth_accounts, save_auth, AuthAccount, Language};
+use crate::storage::{get_auth_accounts, AuthAccount, Language};
 use crate::tui::extract_auth_url_from_line;
 #[cfg(not(test))]
 use crate::tui::open_url_in_browser;
@@ -407,22 +406,14 @@ impl TuiApp {
     }
 
     pub(crate) fn account_logout_current_account(&mut self, uid: &str) -> Result<()> {
-        if uid.trim().is_empty() || uid == "-" {
-            bail!("当前没有可登出的账号");
-        }
-
-        self.auth_state
-            .accounts
-            .retain(|account| account.user.uid != uid);
-        if self
-            .auth_state
-            .pending_auth
-            .as_ref()
-            .is_some_and(|account| account.user.uid == uid)
-        {
-            self.auth_state.pending_auth = None;
-        }
-        self.auth_state = save_auth(&self.auth_state)?;
+        // Remove the account from auth state and delete its on-disk cache via the
+        // shared action layer (the same path the CLI's `auth logout` uses), then
+        // reconcile the in-memory TUI state below.
+        self.auth_state = crate::actions::logout_account(
+            &self.home_dir.join(".mit"),
+            self.auth_state.clone(),
+            uid,
+        )?;
         self.accounts = get_auth_accounts(&self.auth_state)?
             .into_iter()
             .filter(|a| !a.user.uid.trim().is_empty())
@@ -450,13 +441,6 @@ impl TuiApp {
         }
 
         self.offline_account_uids.remove(uid);
-
-        let account_cache_dir = self.home_dir.join(".mit").join("accounts").join(uid);
-        if let Err(error) = fs::remove_dir_all(&account_cache_dir) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
-        }
 
         self.bootstrap_pending = None;
         if self.accounts.is_empty() {
