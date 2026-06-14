@@ -1,5 +1,5 @@
-// Auto-split from the former monolithic tui.rs. Shares the `tests` module
-// scope (imports + helpers) of mod.rs via include!; do not add `use` here.
+// Auto-split: shares the `tests` module scope (imports + helpers) of
+// mod.rs via include!; do not add `use` here.
 
 #[test]
 fn prop_dialog_statistics_tab_renders_controls_and_bar_chart() {

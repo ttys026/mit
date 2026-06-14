@@ -1,5 +1,5 @@
-// Auto-split from the former monolithic tui.rs. Shares the `tests` module
-// scope (imports + helpers) of mod.rs via include!; do not add `use` here.
+// Auto-split: shares the `tests` module scope (imports + helpers) of
+// mod.rs via include!; do not add `use` here.
 
 #[test]
 fn process_prop_dialog_loading_clears_props_loading_while_records_remain_pending() {
@@ -622,40 +622,6 @@ fn prop_dialog_date_picker_popup_wraps_fixed_calendar_with_one_cell_padding() {
 }
 
 #[test]
-fn prop_dialog_operation_records_user_column_expands_to_nickname() {
-    let mut app = app_with_single_readonly_prop_dialog();
-    app.accounts = vec![test_account_with("1001", "VeryLongOperatorName", "cn")];
-    let dialog = app.prop_dialog.as_mut().unwrap();
-    dialog.items[0].prop = PropItem {
-        siid: 2,
-        piid: 1,
-        name: "Power".to_string(),
-        format: "bool".to_string(),
-        writable: false,
-        value_options: Vec::new(),
-    };
-    dialog.items.push(raw_device_logs_item(json!({
-        "requests": [
-            {
-                "key": "2.1",
-                "response": {
-                    "code": 0,
-                    "result": [{"time": 0, "value": "[true]", "uid": "1001"}]
-                }
-            }
-        ]
-    })));
-    dialog.active_tab = PropDialogTab::Logs;
-    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-
-    let text = terminal_text(&terminal);
-    assert!(text.contains("VeryLongOperatorName"), "{text}");
-    assert!(text.replace(' ', "").contains("用户"), "{text}");
-}
-
-#[test]
 fn prop_dialog_operation_records_load_more_row_can_be_active() {
     let mut app = app_with_single_readonly_prop_dialog();
     let dialog = app.prop_dialog.as_mut().unwrap();
@@ -1160,4 +1126,719 @@ fn prop_dialog_operation_records_render_nonzero_code_as_error() {
     assert!(compact.contains("错误"), "{text}");
     assert!(text.contains("code=-8"), "{text}");
     assert!(text.contains("invalid params"), "{text}");
+}
+
+#[test]
+fn draw_devices_selected_row_uses_reversed_style() {
+    let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
+    let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
+    let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
+    let mut app = TuiApp {
+        home_dir: PathBuf::from("."),
+        auth_state: default_auth(),
+        accounts: Vec::new(),
+        account_index: 0,
+        devices: vec![
+            Device {
+                did: "dev-1".to_string(),
+                name: "d1".to_string(),
+                model: "xiaomi.wifispeaker.lx04".to_string(),
+                online: true,
+
+                home_id: "cache-account:1001".to_string(),
+                home_name: "A(1001)".to_string(),
+                room_id: "room-1".to_string(),
+                room_name: "客厅".to_string(),
+            },
+            Device {
+                did: "dev-2".to_string(),
+                name: "d2".to_string(),
+                model: "xiaomi.wifispeaker.lx04".to_string(),
+                online: true,
+
+                home_id: "cache-account:1002".to_string(),
+                home_name: "B(1002)".to_string(),
+                room_id: "room-2".to_string(),
+                room_name: "卧室".to_string(),
+            },
+        ],
+        device_index: 1,
+        logs: VecDeque::new(),
+        active_tab: 1,
+        log_scroll_offset: 0,
+        input_mode: false,
+        input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
+        prop_dialog: None,
+        account_action_dialog: None,
+        account_list_state: ListState::default(),
+        device_list_state: ListState::default(),
+        local_transport_fetching: false,
+        local_transport_refresh_generation: 0,
+        local_transport_refresh_device_id: None,
+        local_transport_force_refresh_pending: false,
+        local_transport_tx,
+        local_transport_rx,
+        auth_flow_generation: 0,
+        auth_flow_tx,
+        auth_flow_rx,
+        offline_account_uids: HashSet::new(),
+        boot_state: BootState::Ready,
+        boot_spinner_index: 0,
+        bootstrap_generation: 0,
+        bootstrap_pending: None,
+        bootstrap_tx,
+        bootstrap_rx,
+        property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        auto_subscribe_device_status: true,
+        settings_selected: 0,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    assert!(terminal_has_reversed_cell(&terminal));
+}
+
+#[test]
+fn draw_devices_scrolls_to_keep_active_row_visible() {
+    let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
+    let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
+    let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
+    let devices = (0..12)
+        .map(|idx| Device {
+            did: format!("dev-{idx}"),
+            name: format!("dev{idx}"),
+            model: "xiaomi.wifispeaker.lx04".to_string(),
+            online: true,
+
+            home_id: format!("cache-account:10{idx:02}"),
+            home_name: format!("acc{idx}(10{idx:02})"),
+            room_id: format!("room-{idx}"),
+            room_name: "客厅".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let mut app = TuiApp {
+        home_dir: PathBuf::from("."),
+        auth_state: default_auth(),
+        accounts: Vec::new(),
+        account_index: 0,
+        devices,
+        device_index: 10,
+        logs: VecDeque::new(),
+        active_tab: 1,
+        log_scroll_offset: 0,
+        input_mode: false,
+        input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
+        prop_dialog: None,
+        account_action_dialog: None,
+        account_list_state: ListState::default(),
+        device_list_state: ListState::default(),
+        local_transport_fetching: false,
+        local_transport_refresh_generation: 0,
+        local_transport_refresh_device_id: None,
+        local_transport_force_refresh_pending: false,
+        local_transport_tx,
+        local_transport_rx,
+        auth_flow_generation: 0,
+        auth_flow_tx,
+        auth_flow_rx,
+        offline_account_uids: HashSet::new(),
+        boot_state: BootState::Ready,
+        boot_spinner_index: 0,
+        bootstrap_generation: 0,
+        bootstrap_pending: None,
+        bootstrap_tx,
+        bootstrap_rx,
+        property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        auto_subscribe_device_status: true,
+        settings_selected: 0,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    assert!(text.contains("dev10"), "{text}");
+    assert!(!text.contains("dev0"), "{text}");
+}
+
+#[test]
+fn draw_devices_tab_uses_local_cache_when_device_list_is_empty() {
+    let home = make_temp_dir("tui-devices-tab-cache-fallback");
+    let mit_dir = home.join(".mit");
+    fs::create_dir_all(&mit_dir).unwrap();
+    fs::write(
+        mit_dir.join("auth.json"),
+        serde_json::to_string_pretty(&json!({
+            "accounts": [
+                persisted_auth_account_json("1001", "账号A", "union-a", "uuid-a", "device-a", "state-a", "token-a", "refresh-a", 1)
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(mit_dir.join("accounts").join("1001")).unwrap();
+    fs::write(
+        mit_dir.join("accounts").join("1001").join("devices.json"),
+        serde_json::to_string_pretty(&json!({
+            "devices": [
+                {
+                    "did": "dev-cache-1",
+                    "name": "cached-speaker",
+                    "model": "xiaomi.wifispeaker.lx04",
+                    "online": false,
+                    "homeId": "cache-account:1001",
+                    "homeName": "账号A(1001)",
+                    "roomId": "",
+                    "roomName": ""
+                }
+            ],
+            "categories": {
+                "xiaomi.wifispeaker.lx04": "音箱"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (bootstrap_tx, bootstrap_rx) = mpsc::channel::<BootstrapMessage>();
+    let (local_transport_tx, local_transport_rx) = mpsc::channel::<LocalTransportRefreshMessage>();
+    let (auth_flow_tx, auth_flow_rx) = mpsc::channel::<AuthFlowMessage>();
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "tui-cache-tab-account",
+        "deviceId": "mico.tui-cache-tab-account",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 1,
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }));
+    let mut app = TuiApp {
+        home_dir: home.clone(),
+        auth_state: default_auth(),
+        accounts: vec![account],
+        account_index: 0,
+        devices: Vec::new(),
+        device_index: 0,
+        logs: VecDeque::new(),
+        active_tab: 1,
+        log_scroll_offset: 0,
+        input_mode: false,
+        input: String::new(),
+        device_search_cursor: 0,
+        search_inputs: Default::default(),
+        search_cursors: [0; 3],
+        prop_dialog: None,
+        account_action_dialog: None,
+        account_list_state: ListState::default(),
+        device_list_state: ListState::default(),
+        local_transport_fetching: false,
+        local_transport_refresh_generation: 0,
+        local_transport_refresh_device_id: None,
+        local_transport_force_refresh_pending: false,
+        local_transport_tx,
+        local_transport_rx,
+        auth_flow_generation: 0,
+        auth_flow_tx,
+        auth_flow_rx,
+        offline_account_uids: HashSet::new(),
+        boot_state: BootState::Ready,
+        boot_spinner_index: 0,
+        bootstrap_generation: 0,
+        bootstrap_pending: None,
+        bootstrap_tx,
+        bootstrap_rx,
+        property_cache: Arc::new(PropertyCache::new()),
+        language: Language::Chinese,
+        auto_subscribe_device_status: true,
+        settings_selected: 0,
+    };
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    assert!(text.contains("cached-speaker"), "text: {text}");
+    assert_eq!(
+        app.devices.len(),
+        1,
+        "logs={:?} bootstrap_pending={:?}",
+        app.logs,
+        app.bootstrap_pending
+    );
+    assert_eq!(app.devices[0].did, "dev-cache-1");
+    assert_eq!(app.devices[0].home_name, "账号A(1001)");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn prop_dialog_operation_records_s_shortcut_opens_selector_and_footer_mentions_it() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 1,
+        name: "Power".to_string(),
+        format: "bool".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(ToggleItem {
+        prop: PropItem {
+            siid: 2,
+            piid: 2,
+            name: "Energy".to_string(),
+            format: "uint16".to_string(),
+            writable: false,
+            value_options: Vec::new(),
+        },
+        value: json!(17),
+    });
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}},
+            {"key": "2.2", "response": {"code": 0, "result": [{"time": 60, "value": "[17]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    dialog.selected = 0;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.replace(' ', "").contains("S:选择记录"), "{text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    assert!(app
+        .prop_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.editing));
+}
+
+#[test]
+fn prop_dialog_operation_records_footer_shows_date_shortcuts_and_picker_opens() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.language = Language::English;
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("D: Date"), "{text}");
+    assert!(text.contains("C: Clear"), "{text}");
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let picker_text = terminal_text(&terminal);
+    assert!(picker_text.contains("Date Range"), "{picker_text}");
+    assert!(!picker_text.contains("Select Start"), "{picker_text}");
+    assert!(!picker_text.contains("Cancel"), "{picker_text}");
+}
+
+#[test]
+fn logs_tab_slash_focuses_search_and_filters_visible_rows() {
+    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['s', 'y', 'n', 'c'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("beta sync done"), "{text}");
+    assert!(!text.contains("alpha boot complete"), "{text}");
+}
+
+#[test]
+fn logs_tab_search_mode_c_keeps_typing_into_query() {
+    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert_eq!(app.search_query(), "c");
+    assert_eq!(app.logs.len(), 2);
+}
+
+#[test]
+fn logs_tab_search_highlights_matching_text() {
+    let mut app = logs_tab_test_app(vec!["mqtt connected"]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    for ch in ['m', 'q', 't', 't'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(terminal_has_yellow_background_substring(&terminal, "mqtt"));
+}
+
+#[test]
+fn prop_dialog_operation_records_date_picker_sets_and_clears_filter() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items.push(raw_device_logs_item(json!({
+        "requests": [
+            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}}
+        ]
+    })));
+    dialog.active_tab = PropDialogTab::Logs;
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .unwrap();
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    let logs = app
+        .prop_dialog
+        .as_ref()
+        .unwrap()
+        .items
+        .last()
+        .unwrap()
+        .value
+        .clone();
+    assert!(logs.get("date_filter").is_some(), "{logs}");
+    assert!(!app.prop_dialog.as_ref().unwrap().editing);
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    let logs = &app
+        .prop_dialog
+        .as_ref()
+        .unwrap()
+        .items
+        .last()
+        .unwrap()
+        .value;
+    assert!(logs.get("date_filter").is_none(), "{logs}");
+}
+
+#[test]
+fn logs_tab_c_clears_log_buffer_and_scroll_offset() {
+    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
+    app.log_scroll_offset = 7;
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert!(app.logs.is_empty());
+    assert_eq!(app.log_scroll_offset, 0);
+}
+
+#[test]
+fn logs_tab_renders_timestamp_before_each_log_line() {
+    let mut app = logs_tab_test_app(vec!["mqtt connected"]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let text = terminal_text(&terminal);
+    let line = text
+        .lines()
+        .find(|line| line.contains("mqtt connected"))
+        .unwrap_or_else(|| panic!("{text}"));
+    let prefix = line
+        .split("mqtt connected")
+        .next()
+        .unwrap_or_default()
+        .trim_start();
+    assert_clock_timestamp_prefix(prefix, &text);
+}
+
+#[test]
+fn logs_tab_mouse_wheel_scrolls_to_older_entries() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = terminal_text(&terminal);
+    assert!(before.contains("log-29"), "{before}");
+    assert!(!before.contains("log-00"), "{before}");
+
+    for _ in 0..20 {
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = terminal_text(&terminal);
+    assert!(after.contains("log-00"), "{after}");
+    assert!(!after.contains("log-29"), "{after}");
+}
+
+#[test]
+fn logs_tab_new_log_does_not_shift_scrolled_view_window() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    app.log_scroll_offset = 5;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-24"),
+        "{before}"
+    );
+
+    app.log(format!("inserted {}", "x".repeat(160)));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-24"),
+        "{after}"
+    );
+    assert!(
+        !top_log_line(&terminal, terminal_area).contains("inserted"),
+        "{after}"
+    );
+}
+
+#[test]
+fn logs_tab_new_log_does_not_shift_selected_view_window() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    super::clear_selection_state();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-29"),
+        "{before}"
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: log_message_start_column(),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: log_message_start_column().saturating_add(6),
+            row: log_first_row(terminal_area),
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+
+    app.log("new selected-anchor log");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = terminal_text(&terminal);
+    assert!(
+        top_log_line(&terminal, terminal_area).contains("log-29"),
+        "{after}"
+    );
+    assert!(
+        !top_log_line(&terminal, terminal_area).contains("new selected-anchor log"),
+        "{after}"
+    );
+
+    super::clear_selection_state();
+}
+
+#[test]
+fn logs_tab_overflow_renders_scrollbar_thumb_that_moves() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02}"))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let before = log_scrollbar_thumb_row(&terminal, terminal_area)
+        .unwrap_or_else(|| panic!("{}", terminal_text(&terminal)));
+
+    for _ in 0..20 {
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            terminal_area,
+        )
+        .unwrap();
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let after = log_scrollbar_thumb_row(&terminal, terminal_area)
+        .unwrap_or_else(|| panic!("{}", terminal_text(&terminal)));
+    assert!(after > before, "before={before} after={after}");
+}
+
+#[test]
+fn logs_tab_leaves_blank_margin_before_scrollbar() {
+    let logs = (0..30)
+        .map(|idx| format!("log-{idx:02} {}", "x".repeat(90)))
+        .collect::<Vec<_>>();
+    let mut app = logs_tab_test_app(logs.iter().map(String::as_str).collect());
+    app.language = Language::English;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
+        super::split_main_layout(terminal_area);
+    let [_search_area, _search_border_area, list_area] =
+        super::searchable_main_layout(content_area);
+    let margin_x = list_area
+        .x
+        .saturating_add(list_area.width.saturating_sub(2));
+    let scrollbar_x = list_area
+        .x
+        .saturating_add(list_area.width.saturating_sub(1));
+    let first_log_row = list_area.y;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(margin_x, first_log_row)].symbol(), " ");
+    assert_eq!(
+        buffer[(scrollbar_x, first_log_row)].symbol(),
+        super::LOG_SCROLLBAR_THUMB
+    );
+}
+
+#[test]
+fn mijia_raw_requests_hide_successful_empty_results() {
+    let entries = super::visible_mijia_raw_request_entries(vec![
+        json!({
+            "key": "2.1",
+            "response": {
+                "code": 0,
+                "message": "ok",
+                "result": []
+            }
+        }),
+        json!({
+            "key": "2.2",
+            "response": {
+                "code": 0,
+                "message": "ok",
+                "result": [{"value": "[true]"}]
+            }
+        }),
+        json!({
+            "key": "2.3",
+            "response": {
+                "code": -8,
+                "message": "invalid params",
+                "result": null
+            }
+        }),
+    ]);
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["key"], "2.2");
+    assert_eq!(entries[1]["key"], "2.3");
 }

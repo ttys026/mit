@@ -1,64 +1,5 @@
-// Auto-split from the former monolithic tui.rs. Shares the `tests` module
-// scope (imports + helpers) of mod.rs via include!; do not add `use` here.
-
-#[test]
-fn collect_readable_props_filters_by_format_and_access() {
-    let spec = json!({
-        "services": [
-            {
-                "iid": 2,
-                "properties": [
-                    {
-                        "iid": 1,
-                        "description": "Power",
-                        "format": "bool",
-                        "access": ["read", "write"]
-                    },
-                    {
-                        "iid": 2,
-                        "description": "Volume",
-                        "format": "uint8",
-                        "access": ["read", "write"]
-                    },
-                    {
-                        "iid": 4,
-                        "description": "Mode",
-                        "format": "string",
-                        "access": ["read"]
-                    },
-                    {
-                        "iid": 3,
-                        "description": "ReadOnly",
-                        "format": "bool",
-                        "access": ["read"]
-                    }
-                ]
-            }
-        ]
-    });
-    let props = collect_readable_props(&spec, Language::Chinese);
-    assert_eq!(props.len(), 4);
-    assert_eq!(props[0].siid, 2);
-    assert_eq!(props[0].piid, 1);
-    assert_eq!(props[0].name, "Power");
-    assert_eq!(props[0].format, "bool");
-    assert!(props[0].writable);
-    assert_eq!(props[1].siid, 2);
-    assert_eq!(props[1].piid, 2);
-    assert_eq!(props[1].name, "Volume");
-    assert_eq!(props[1].format, "uint8");
-    assert!(props[1].writable);
-    assert_eq!(props[2].siid, 2);
-    assert_eq!(props[2].piid, 4);
-    assert_eq!(props[2].name, "Mode");
-    assert_eq!(props[2].format, "string");
-    assert!(!props[2].writable);
-    assert_eq!(props[3].siid, 2);
-    assert_eq!(props[3].piid, 3);
-    assert_eq!(props[3].name, "ReadOnly");
-    assert_eq!(props[3].format, "bool");
-    assert!(!props[3].writable);
-}
+// Auto-split: shares the `tests` module scope (imports + helpers) of
+// mod.rs via include!; do not add `use` here.
 
 #[test]
 fn devices_tab_slash_focuses_search_and_filters_visible_rows() {
@@ -91,37 +32,32 @@ fn devices_tab_slash_focuses_search_and_filters_visible_rows() {
 }
 
 #[test]
-fn devices_search_escape_blurs_and_restores_number_shortcuts() {
-    let mut app = devices_tab_test_app(vec![test_device(
-        "dev-kitchen",
-        "kitchen plug",
-        "Kitchen",
-        "A(1001)",
-    )]);
+fn accounts_tab_slash_focuses_search_and_filters_visible_rows() {
+    let mut app = accounts_tab_test_app(vec![
+        test_account_with("1001", "Kitchen Account", "cn"),
+        test_account_with("2002", "Bedroom Account", "sg"),
+    ]);
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
     handle_key(
         &mut app,
         crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
     )
     .unwrap();
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    assert_eq!(app.active_tab, 1);
+    for ch in ['b', 'e', 'd'] {
+        handle_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
 
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .unwrap();
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    assert_eq!(app.active_tab, 2);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("Bedroom Account"), "{text}");
+    assert!(!text.contains("Kitchen Account"), "{text}");
+    assert_eq!(app.accounts.len(), 2);
 }
 
 #[test]
@@ -605,153 +541,6 @@ fn devices_search_matches_room_name_device_name_and_category_only() {
 }
 
 #[test]
-fn accounts_tab_slash_focuses_search_and_filters_visible_rows() {
-    let mut app = accounts_tab_test_app(vec![
-        test_account_with("1001", "Kitchen Account", "cn"),
-        test_account_with("2002", "Bedroom Account", "sg"),
-    ]);
-    app.language = Language::English;
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    for ch in ['b', 'e', 'd'] {
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-        )
-        .unwrap();
-    }
-
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    let text = terminal_text(&terminal);
-    assert!(text.contains("Bedroom Account"), "{text}");
-    assert!(!text.contains("Kitchen Account"), "{text}");
-    assert_eq!(app.accounts.len(), 2);
-}
-
-#[test]
-fn accounts_search_matches_region_nickname_and_uid() {
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-
-    for query in ["sg", "Bedroom Account", "2002"] {
-        let mut app = accounts_tab_test_app(vec![
-            test_account_with("1001", "Kitchen Account", "cn"),
-            test_account_with("2002", "Bedroom Account", "sg"),
-        ]);
-        app.language = Language::English;
-        app.input = query.to_string();
-
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let text = terminal_text(&terminal);
-        assert!(
-            text.contains("Bedroom Account"),
-            "query={query} text={text}"
-        );
-        assert!(
-            !text.contains("Kitchen Account"),
-            "query={query} text={text}"
-        );
-    }
-}
-
-#[test]
-fn logs_tab_slash_focuses_search_and_filters_visible_rows() {
-    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
-    app.language = Language::English;
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    for ch in ['s', 'y', 'n', 'c'] {
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-        )
-        .unwrap();
-    }
-
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    let text = terminal_text(&terminal);
-    assert!(text.contains("beta sync done"), "{text}");
-    assert!(!text.contains("alpha boot complete"), "{text}");
-}
-
-#[test]
-fn logs_tab_search_mode_c_keeps_typing_into_query() {
-    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
-
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
-    )
-    .unwrap();
-
-    assert_eq!(app.search_query(), "c");
-    assert_eq!(app.logs.len(), 2);
-}
-
-#[test]
-fn logs_tab_search_highlights_matching_text() {
-    let mut app = logs_tab_test_app(vec!["mqtt connected"]);
-    app.language = Language::English;
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    for ch in ['m', 'q', 't', 't'] {
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-        )
-        .unwrap();
-    }
-
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    assert!(terminal_has_yellow_background_substring(&terminal, "mqtt"));
-}
-
-#[test]
-fn account_and_logs_search_bars_render_with_bottom_border() {
-    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
-    let [_tabs_area, content_area, _status_gap_area, _status_bar_area] =
-        super::split_main_layout(terminal_area);
-
-    for mut app in [
-        accounts_tab_test_app(vec![test_account_with("1001", "Kitchen Account", "cn")]),
-        logs_tab_test_app(vec!["visible log line"]),
-    ] {
-        app.language = Language::English;
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-
-        let text = terminal_text(&terminal);
-        let lines = text.lines().collect::<Vec<_>>();
-        let search_row = content_area.y as usize;
-        let border_row = content_area.y.saturating_add(1) as usize;
-        assert!(lines[search_row].contains("/ Search:"), "{text}");
-        assert!(!lines[search_row].starts_with("│"), "{text}");
-        assert!(lines[border_row].contains("─"), "{text}");
-        assert!(!lines[border_row].contains("Search"), "{text}");
-    }
-}
-
-#[test]
 fn search_query_ellipsizes_at_beginning_without_wrapping() {
     let mut app = accounts_tab_test_app(vec![test_account_with("1001", "Kitchen Account", "cn")]);
     app.language = Language::English;
@@ -1034,117 +823,4 @@ fn search_queries_are_persisted_per_tab_when_switching_tabs() {
     let text = terminal_text(&terminal);
     assert!(text.contains("mqtt connected"), "{text}");
     assert!(!text.contains("bootstrap complete"), "{text}");
-}
-
-#[test]
-fn log_selection_clears_when_search_changes_visible_content() {
-    let mut app = logs_tab_test_app(vec!["alpha boot complete", "beta sync done"]);
-    app.language = Language::English;
-    let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    super::clear_selection_state();
-
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    handle_mouse(
-        &mut app,
-        crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: log_message_start_column(),
-            row: log_first_row(terminal_area),
-            modifiers: KeyModifiers::NONE,
-        },
-        terminal_area,
-    )
-    .unwrap();
-    handle_mouse(
-        &mut app,
-        crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: log_message_start_column().saturating_add(4),
-            row: log_first_row(terminal_area),
-            modifiers: KeyModifiers::NONE,
-        },
-        terminal_area,
-    )
-    .unwrap();
-    assert!(super::selected_surface().is_some());
-
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    for ch in "sync".chars() {
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-        )
-        .unwrap();
-    }
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    let text = terminal_text(&terminal);
-
-    assert!(text.contains("beta sync done"), "{text}");
-    assert!(!text.contains("alpha boot complete"), "{text}");
-    assert!(super::selected_surface().is_none());
-}
-
-#[test]
-fn prop_dialog_operation_records_date_picker_sets_and_clears_filter() {
-    let mut app = app_with_single_readonly_prop_dialog();
-    let dialog = app.prop_dialog.as_mut().unwrap();
-    dialog.items.push(raw_device_logs_item(json!({
-        "requests": [
-            {"key": "2.1", "response": {"code": 0, "result": [{"time": 0, "value": "[true]", "uid": "1001"}]}}
-        ]
-    })));
-    dialog.active_tab = PropDialogTab::Logs;
-
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .unwrap();
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
-    )
-    .unwrap();
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .unwrap();
-
-    let logs = app
-        .prop_dialog
-        .as_ref()
-        .unwrap()
-        .items
-        .last()
-        .unwrap()
-        .value
-        .clone();
-    assert!(logs.get("date_filter").is_some(), "{logs}");
-    assert!(!app.prop_dialog.as_ref().unwrap().editing);
-
-    handle_key(
-        &mut app,
-        crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
-    )
-    .unwrap();
-    let logs = &app
-        .prop_dialog
-        .as_ref()
-        .unwrap()
-        .items
-        .last()
-        .unwrap()
-        .value;
-    assert!(logs.get("date_filter").is_none(), "{logs}");
 }

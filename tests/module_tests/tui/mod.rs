@@ -721,9 +721,19 @@ fn env_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 // ---- Per-feature test files (share this module's imports + helpers) ----
+
+// ---- Per-feature test files (share this module's imports + helpers) ----
+
+// ---- Per-feature test files (share this module's imports + helpers) ----
+include!("account_login.rs");
 include!("account.rs");
 include!("device_list.rs");
-include!("prop_dialog.rs");
+include!("device_sync.rs");
+include!("cloud_mips.rs");
+include!("prop_collect.rs");
+include!("prop_editing.rs");
+include!("prop_actions.rs");
+include!("prop_render.rs");
 include!("operation_record.rs");
 include!("statistics.rs");
 include!("logs.rs");
@@ -731,4 +741,3 @@ include!("search.rs");
 include!("footer.rs");
 include!("render.rs");
 include!("events.rs");
-include!("misc.rs");
