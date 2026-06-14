@@ -88,7 +88,7 @@ fn prop_dialog_action_tab_does_not_inherit_operation_record_loading_state() {
 #[test]
 fn prop_dialog_operation_records_render_subtabs_and_table() {
     let mut app = app_with_single_readonly_prop_dialog();
-    app.accounts = vec![test_account()];
+    app.accounts = vec![test_account_with_mijia()];
     let dialog = app.prop_dialog.as_mut().unwrap();
     dialog.account_uid = "1001".to_string();
     dialog.items[0].prop = PropItem {
@@ -175,7 +175,7 @@ fn prop_dialog_operation_records_render_subtabs_and_table() {
 #[test]
 fn prop_dialog_operation_records_dropdown_selects_active_key() {
     let mut app = app_with_single_readonly_prop_dialog();
-    app.accounts = vec![test_account()];
+    app.accounts = vec![test_account_with_mijia()];
     let dialog = app.prop_dialog.as_mut().unwrap();
     dialog.account_uid = "1001".to_string();
     dialog.items[0].prop = PropItem {
@@ -799,7 +799,7 @@ fn prop_dialog_operation_records_body_click_changes_active_row() {
 fn prop_dialog_operation_records_load_more_row_triggers_by_click_without_dialog_refreshing() {
     let mut app = app_with_single_readonly_prop_dialog();
     app.language = Language::English;
-    app.accounts = vec![test_account()];
+    app.accounts = vec![test_account_with_mijia()];
     let dialog = app.prop_dialog.as_mut().unwrap();
     dialog.items[0].prop = PropItem {
         siid: 2,
@@ -863,7 +863,7 @@ fn prop_dialog_operation_records_load_more_row_triggers_by_click_without_dialog_
 #[test]
 fn prop_dialog_operation_records_selector_click_opens_and_selects() {
     let mut app = app_with_single_readonly_prop_dialog();
-    app.accounts = vec![test_account()];
+    app.accounts = vec![test_account_with_mijia()];
     let dialog = app.prop_dialog.as_mut().unwrap();
     dialog.account_uid = "1001".to_string();
     dialog.items[0].prop = PropItem {

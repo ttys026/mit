@@ -39,6 +39,7 @@ fn stale_keypress_uses_recent_pingresp_as_mqtt_response_timer() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
     let (_tx, rx) = mpsc::channel();
     let now = Instant::now();
@@ -110,6 +111,7 @@ fn stale_keypress_refreshes_open_prop_editor() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
     let (_tx, rx) = mpsc::channel();
     let now = Instant::now();
@@ -289,6 +291,7 @@ fn stale_mouse_click_inside_prop_dialog_does_not_refresh() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
     let (_tx, rx) = mpsc::channel();
     let now = Instant::now();

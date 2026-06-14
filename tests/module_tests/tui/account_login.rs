@@ -185,7 +185,7 @@ fn parse_auth_login_output_line_accepts_json_event_and_plain_url() {
 #[test]
 fn prop_dialog_operation_records_user_column_expands_to_nickname() {
     let mut app = app_with_single_readonly_prop_dialog();
-    app.accounts = vec![test_account_with("1001", "VeryLongOperatorName", "cn")];
+    app.accounts = vec![test_account_with_mijia_for("1001", "VeryLongOperatorName", "cn")];
     let dialog = app.prop_dialog.as_mut().unwrap();
     dialog.items[0].prop = PropItem {
         siid: 2,

@@ -145,7 +145,7 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
     TuiApp {
         home_dir: PathBuf::from("."),
         auth_state: default_auth(),
-        accounts: Vec::new(),
+        accounts: vec![test_account_with_mijia()],
         account_index: 0,
         devices: Vec::new(),
         device_index: 0,
@@ -190,6 +190,7 @@ fn app_with_single_readonly_prop_dialog() -> TuiApp {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -507,6 +508,43 @@ fn test_account() -> crate::storage::AuthAccount {
         "refreshToken": "refresh-a",
         "expiresTs": 32503680000_u64,
         "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }))
+}
+
+fn test_account_with_mijia() -> crate::storage::AuthAccount {
+    test_account_with_mijia_for("1001", "账号A", "cn")
+}
+
+fn test_account_with_mijia_for(
+    uid: &str,
+    nickname: &str,
+    region: &str,
+) -> crate::storage::AuthAccount {
+    normalize_account(json!({
+        "xiaomi": {
+            "region": region,
+            "redirectUri": "http://127.0.0.1:8000/login_redirect",
+            "uuid": format!("uuid-{uid}"),
+            "deviceId": format!("device-{uid}"),
+            "state": format!("state-{uid}"),
+            "accessToken": format!("token-{uid}"),
+            "refreshToken": format!("refresh-{uid}"),
+            "expiresTs": 32503680000_u64
+        },
+        "mijia": {
+            "ua": "test-ua",
+            "deviceId": format!("device-{uid}"),
+            "serviceToken": "test-service-token",
+            "userId": uid,
+            "cUserId": uid,
+            "ssecurity": "test-ssecurity",
+            "passToken": "test-pass-token",
+            "passO": "",
+            "expireTime": 32503680000_u64,
+            "saveTime": 0
+        },
+        "user": {"uid": uid, "nickname": nickname, "icon": "", "unionId": format!("union-{uid}")},
+        "version": 2
     }))
 }
 

@@ -75,52 +75,27 @@ fn prop_dialog_statistics_tab_renders_controls_and_bar_chart() {
     assert!(stats_text.contains(&expected_range), "{stats_text}");
     assert!(compact.contains("值↑时间→"), "{stats_text}");
     assert!(stats_text.contains("01-01"), "{stats_text}");
-    assert!(stats_text.contains("2.5"), "{stats_text}");
-    let chart_title_position =
-        terminal_find_substring_position(&terminal, "值").expect("chart title rendered");
-    let first_value_position =
-        terminal_find_substring_position(&terminal, "1.25").expect("bar value label rendered");
-    let first_bar_position =
-        terminal_find_substring_position(&terminal, "█").expect("bar rendered");
-    let second_value_position =
-        terminal_find_substring_position(&terminal, "2.5").expect("second bar value rendered");
-    let second_time_position =
-        terminal_find_substring_position(&terminal, "01-02").expect("second time label rendered");
-    let first_time_position = terminal_find_substring_position_in_area(
-        &terminal,
-        "01-01",
-        ratatui::layout::Rect::new(0, 6, 120, 16),
-    )
-    .expect("first chart time label rendered");
+    let chart_area = ratatui::layout::Rect::new(0, 6, 120, 18);
+    // Y axis upper bound is max value * 1.1 (2.5 * 1.1 = 2.75).
+    assert!(stats_text.contains("2.75"), "{stats_text}");
+    // Per-bar value labels are not drawn anymore; the value is in the tooltip.
     assert!(
-        first_bar_position.0 >= chart_title_position.0.saturating_add(3),
+        terminal_find_substring_position_in_area(&terminal, "1.25", chart_area).is_none(),
         "{stats_text}"
     );
-    assert!(
-        first_time_position.0 > chart_title_position.0.saturating_add(15),
-        "{stats_text}"
-    );
-    let buffer = terminal.backend().buffer();
-    assert_eq!(
-        buffer[(
-            first_value_position.0,
-            first_value_position.1.saturating_add(1)
-        )]
-            .symbol(),
-        "█",
-        "{stats_text}"
-    );
-    assert_eq!(
-        second_value_position
-            .0
-            .saturating_mul(2)
-            .saturating_add(super::display_width("2.5")),
-        second_time_position
-            .0
-            .saturating_mul(2)
-            .saturating_add(super::display_width("01-02")),
-        "{stats_text}"
-    );
+    let first_bar_position = terminal_find_substring_position_in_area(&terminal, "█", chart_area)
+        .expect("bar rendered");
+    let first_time_position =
+        terminal_find_substring_position_in_area(&terminal, "01-01", chart_area)
+            .expect("first chart time label rendered");
+    let last_time_position =
+        terminal_find_substring_position_in_area(&terminal, "01-08", chart_area)
+            .expect("last chart time label rendered");
+    // Bars and labels are left-aligned: the first bar sits in the left portion
+    // of the chart, just right of the Y axis, not centered.
+    assert!(first_bar_position.0 < 30, "{stats_text}");
+    assert!(first_time_position.0 < last_time_position.0, "{stats_text}");
+    assert_eq!(first_time_position.1, last_time_position.1, "{stats_text}");
     assert!(!stats_text.contains("\"requests\""), "{stats_text}");
 }
 
@@ -217,15 +192,22 @@ fn prop_dialog_statistics_tallest_bar_keeps_value_label_headroom() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let stats_text = terminal_text(&terminal);
     let chart_area = ratatui::layout::Rect::new(0, 6, 100, 16);
-    let title_position =
-        terminal_find_substring_position_in_area(&terminal, "值", chart_area).unwrap();
-    let max_label_position =
-        terminal_find_substring_position_in_area(&terminal, "10", chart_area).unwrap();
-
-    assert!(
-        max_label_position.1 > title_position.1.saturating_add(2),
-        "{stats_text}"
-    );
+    // The Y axis tops out at max * 1.1 (10 * 1.1 = 11), so the tallest bar never
+    // reaches the very top of the plot: there is headroom above it.
+    let top_tick_position =
+        terminal_find_substring_position_in_area(&terminal, "11", chart_area).expect("y axis max");
+    let buffer = terminal.backend().buffer();
+    let mut top_bar_row = None;
+    'rows: for y in chart_area.y..chart_area.y.saturating_add(chart_area.height) {
+        for x in 0..buffer.area.width {
+            if buffer[(x, y)].symbol() == "█" {
+                top_bar_row = Some(y);
+                break 'rows;
+            }
+        }
+    }
+    let top_bar_row = top_bar_row.expect("bar rendered");
+    assert!(top_bar_row > top_tick_position.1, "{stats_text}");
 }
 
 #[test]
@@ -274,8 +256,10 @@ fn prop_dialog_statistics_zero_value_renders_baseline_marker() {
         .saturating_add(super::display_width("01-02") / 2);
     let buffer = terminal.backend().buffer();
 
+    // The x labels sit one row below the axis baseline, so the zero-bar marker
+    // is two rows above its time label.
     assert_eq!(
-        buffer[(zero_marker_column, zero_label_position.1.saturating_sub(1))].symbol(),
+        buffer[(zero_marker_column, zero_label_position.1.saturating_sub(2))].symbol(),
         "▁",
         "{stats_text}"
     );
@@ -378,7 +362,7 @@ fn prop_dialog_statistics_chart_points_use_range_endpoint_labels_for_month_and_y
 }
 
 #[test]
-fn prop_dialog_statistics_month_labels_stride_when_dense() {
+fn prop_dialog_statistics_month_labels_collapse_to_at_most_five() {
     let start = Date::from_calendar_date(2026, Month::January, 1).unwrap();
     let end = Date::from_calendar_date(2026, Month::January, 31).unwrap();
     let mut app = app_with_single_readonly_prop_dialog();
@@ -416,10 +400,9 @@ fn prop_dialog_statistics_month_labels_stride_when_dense() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let stats_text = terminal_text(&terminal);
     let chart_area = ratatui::layout::Rect::new(0, 6, 90, 16);
-    let visible_labels = [
-        "01-01", "01-04", "01-07", "01-10", "01-13", "01-16", "01-19", "01-22", "01-25", "01-28",
-        "01-31",
-    ];
+    // 31 daily labels cannot all fit, so they collapse to five evenly spaced
+    // labels including both endpoints (req 3).
+    let visible_labels = ["01-01", "01-09", "01-16", "01-24", "01-31"];
     let positions = visible_labels
         .iter()
         .map(|label| {
@@ -428,16 +411,16 @@ fn prop_dialog_statistics_month_labels_stride_when_dense() {
         })
         .collect::<Vec<_>>();
 
-    assert!(
-        terminal_find_substring_position_in_area(&terminal, "01-02", chart_area).is_none(),
-        "{stats_text}"
-    );
-    assert!(
-        terminal_find_substring_position_in_area(&terminal, "01-03", chart_area).is_none(),
-        "{stats_text}"
-    );
+    // Intermediate days are dropped, not crammed in.
+    for dropped in ["01-02", "01-04", "01-07", "01-13", "01-20"] {
+        assert!(
+            terminal_find_substring_position_in_area(&terminal, dropped, chart_area).is_none(),
+            "{dropped} should be hidden\n{stats_text}"
+        );
+    }
     for pair in positions.windows(2) {
         assert_eq!(pair[0].1, pair[1].1, "{stats_text}");
+        // Comfortable spacing between labels: label width plus a gap.
         assert!(
             pair[1].0 >= pair[0].0.saturating_add("01-01".len() as u16 + 1),
             "{stats_text}"
@@ -740,6 +723,149 @@ fn prop_dialog_statistics_date_picker_mouse_click_selects_date() {
     assert_eq!(
         super::json_i64(date_filter.get("time_end")),
         Some(super::date_end_timestamp(end))
+    );
+}
+
+#[test]
+fn prop_dialog_statistics_chart_click_shows_crosshair_tooltip_and_click_away_clears() {
+    let start = Date::from_calendar_date(2026, Month::January, 1).unwrap();
+    let end = start.saturating_add(TimeDuration::days(2));
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {
+                "key": "2.2",
+                "response": {
+                    "code": 0,
+                    "result": [
+                        {"time": super::date_start_timestamp(start), "value": 5.0}
+                    ]
+                }
+            }
+        ],
+        "ui": {"period": "week"},
+        "date_filter": {
+            "time_start": super::date_start_timestamp(start),
+            "time_end": super::date_end_timestamp(end)
+        }
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let chart_area = ratatui::layout::Rect::new(0, 6, 120, 18);
+    let bar_position = terminal_find_substring_position_in_area(&terminal, "█", chart_area)
+        .expect("bar rendered");
+
+    // Clicking a bar selects it (crosshair + tooltip).
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: bar_position.0,
+            row: bar_position.1,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert_eq!(
+        app.prop_dialog.as_ref().unwrap().statistics_selected_bar,
+        Some(0)
+    );
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let tooltip_text = terminal_text(&terminal);
+    let compact = tooltip_text.replace(' ', "");
+    assert!(compact.contains("日期:01-01"), "{tooltip_text}");
+    assert!(compact.contains("Energy:5"), "{tooltip_text}");
+    // The selected bar is highlighted by a crosshair background band.
+    assert_eq!(
+        terminal.backend().buffer()[(bar_position.0, bar_position.1)].bg,
+        Color::DarkGray,
+        "{tooltip_text}"
+    );
+
+    // Clicking an empty area of the chart clears the crosshair + tooltip.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 110,
+            row: bar_position.1,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert_eq!(
+        app.prop_dialog.as_ref().unwrap().statistics_selected_bar,
+        None
+    );
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let cleared_text = terminal_text(&terminal);
+    assert!(!cleared_text.replace(' ', "").contains("日期:01-01"), "{cleared_text}");
+}
+
+#[test]
+fn prop_dialog_statistics_period_menu_closes_on_click_away() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    let dialog = app.prop_dialog.as_mut().unwrap();
+    dialog.items[0].prop = PropItem {
+        siid: 2,
+        piid: 2,
+        name: "Energy".to_string(),
+        format: "float".to_string(),
+        writable: false,
+        value_options: Vec::new(),
+    };
+    dialog.items.push(raw_device_statistics_item(json!({
+        "requests": [
+            {"key": "2.2", "response": {"code": 0, "result": [{"time": 0, "value": 1.0}]}}
+        ],
+        "ui": {"period": "week"}
+    })));
+    dialog.active_tab = PropDialogTab::Statistics;
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
+    )
+    .unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(
+        super::statistics_period_menu_is_open(app.prop_dialog.as_ref().unwrap()),
+        "period menu should be open"
+    );
+
+    // Clicking outside the dropdown closes it (generic click-away).
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(
+        !super::statistics_period_menu_is_open(app.prop_dialog.as_ref().unwrap()),
+        "period menu should be closed after click-away"
     );
 }
 

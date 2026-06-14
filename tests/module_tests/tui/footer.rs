@@ -433,6 +433,7 @@ fn footer_text_matches_requested_status_copy() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
     assert_eq!(
         super::footer_text(&app),
@@ -510,6 +511,7 @@ fn clicking_esc_operation_in_footer_matches_escape_behavior() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     };
     let mut app = test_app_with_prop_dialog(dialog);
 

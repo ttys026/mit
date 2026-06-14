@@ -12,22 +12,22 @@ use crate::tui::shared::{
 use crate::tui::{
     action_param_row_layouts, action_param_rows_for_dialog,
     format_prop_dialog_action_list_item_line, format_prop_dialog_list_item_line,
-    fullscreen_dialog_inner_area, lang_str, operation_record_date_filter_area,
-    operation_record_date_filter_label, operation_record_date_picker_calendar_area,
-    operation_record_date_picker_popup_area, operation_record_date_picker_state,
-    operation_record_dropdown_area, operation_record_menu_is_open,
-    operation_record_selected_request_index, operation_record_selector_height,
-    operation_record_selector_label, operation_record_tab_titles,
+    format_statistics_value, fullscreen_dialog_inner_area, lang_str,
+    operation_record_date_filter_area, operation_record_date_filter_label,
+    operation_record_date_picker_calendar_area, operation_record_date_picker_popup_area,
+    operation_record_date_picker_state, operation_record_dropdown_area,
+    operation_record_menu_is_open, operation_record_selected_request_index,
+    operation_record_selector_height, operation_record_selector_label, operation_record_tab_titles,
     operation_records_active_visual_index, operation_records_table_lines,
     prop_dialog_active_tab_is_loading, prop_dialog_indices_for_tab, prop_dialog_title,
     prop_edit_textarea_area, prop_editor_header_lines, prop_editor_layout,
     push_message_cli_preview_line, push_message_command_area, render_textarea_widget,
-    single_line_textarea, statistics_chart_points, statistics_current_key_label,
-    statistics_date_filter_area, statistics_date_filter_label, statistics_date_picker_state,
-    statistics_dropdown_area, statistics_key_menu_is_open, statistics_period_area,
-    statistics_period_dropdown_area, statistics_period_label, statistics_period_menu_is_open,
-    statistics_period_options, statistics_selector_height, statistics_selector_label,
-    statistics_tab_titles, textarea_visual_height, top_bottom_borders,
+    single_line_textarea, statistics_chart_layout, statistics_chart_points,
+    statistics_current_key_label, statistics_date_filter_area, statistics_date_filter_label,
+    statistics_date_picker_state, statistics_dropdown_area, statistics_key_menu_is_open,
+    statistics_period_area, statistics_period_dropdown_area, statistics_period_label,
+    statistics_period_menu_is_open, statistics_period_options, statistics_selector_height,
+    statistics_selector_label, statistics_tab_titles, textarea_visual_height, top_bottom_borders,
     visible_prop_dialog_tab_titles, visible_prop_dialog_tabs, AccountActionDialog, PropDialogTab,
     StatisticsChartPoint, TuiApp,
 };
@@ -319,12 +319,21 @@ pub(crate) fn draw_prop_dialog(
                 sections[0],
             );
             if dialog.active_tab == PropDialogTab::Logs {
+                let list_area = sections[1];
+                if !prop_dialog_account_has_mijia(app.accounts.as_slice(), &dialog.account_uid) {
+                    draw_mijia_login_prompt(
+                        frame,
+                        list_area,
+                        app.language,
+                        lang_str(app.language, "操作记录", "operation records"),
+                    );
+                    return;
+                }
                 let style = if prop_dialog_active_tab_is_loading(dialog) {
                     Style::default().add_modifier(Modifier::DIM)
                 } else {
                     Style::default()
                 };
-                let list_area = sections[1];
                 let selector_height = operation_record_selector_height(dialog);
                 let (selector_area, body_area) = if selector_height == 0 {
                     (None, list_area)
@@ -457,12 +466,21 @@ pub(crate) fn draw_prop_dialog(
                 return;
             }
             if dialog.active_tab == PropDialogTab::Statistics {
+                let list_area = sections[1];
+                if !prop_dialog_account_has_mijia(app.accounts.as_slice(), &dialog.account_uid) {
+                    draw_mijia_login_prompt(
+                        frame,
+                        list_area,
+                        app.language,
+                        lang_str(app.language, "统计数据", "statistics"),
+                    );
+                    return;
+                }
                 let style = if prop_dialog_active_tab_is_loading(dialog) {
                     Style::default().add_modifier(Modifier::DIM)
                 } else {
                     Style::default()
                 };
-                let list_area = sections[1];
                 let selector_height = statistics_selector_height(dialog);
                 let (selector_area, body_area) = if selector_height == 0 {
                     (None, list_area)
@@ -541,12 +559,16 @@ pub(crate) fn draw_prop_dialog(
                 }
                 match statistics_chart_points(dialog, app.language) {
                     Ok(points) => {
+                        let selected_bar = dialog.statistics_selected_bar;
+                        let key_label = statistics_current_key_label(dialog, app.language);
                         draw_statistics_bar_chart(
                             frame,
                             body_area,
                             points.as_slice(),
                             style,
                             app.language,
+                            selected_bar,
+                            key_label.as_str(),
                         );
                     }
                     Err(message) => {
@@ -886,12 +908,46 @@ fn draw_operation_record_date_picker(
     frame.render_widget(calendar, calendar_area);
 }
 
+/// Whether the account owning the dialog's device has Mijia credentials. The
+/// Statistics and Logs tabs read from the Mijia cloud, so without them we prompt
+/// the user to log in rather than showing an error.
+fn prop_dialog_account_has_mijia(
+    accounts: &[crate::storage::AuthAccount],
+    account_uid: &str,
+) -> bool {
+    accounts
+        .iter()
+        .find(|account| account.user.uid == account_uid)
+        .is_some_and(|account| crate::mijia_api::is_mijia_auth_present(account.mijia.as_ref()))
+}
+
+/// Render the "log in to Mijia first" prompt shown in the Statistics / Logs tabs
+/// when the current account has no Mijia credentials.
+fn draw_mijia_login_prompt(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    lang: crate::storage::Language,
+    activity: &str,
+) {
+    let message = match lang {
+        crate::storage::Language::Chinese => {
+            format!("请先登录米家后查看{activity}。\n\n运行：mit auth login mijia")
+        }
+        crate::storage::Language::English => {
+            format!("Log in to Mijia to view {activity}.\n\nRun: mit auth login mijia")
+        }
+    };
+    frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), area);
+}
+
 fn draw_statistics_bar_chart(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     points: &[StatisticsChartPoint],
     style: Style,
     lang: crate::storage::Language,
+    selected_bar: Option<usize>,
+    key_label: &str,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -906,291 +962,263 @@ fn draw_statistics_bar_chart(
             .style(style),
         area,
     );
-    if points.is_empty() || area.width < 8 || area.height < 6 {
+    let Some(layout) = statistics_chart_layout(area, points) else {
         return;
-    }
+    };
 
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    if inner.width == 0 || inner.height < 3 {
-        return;
-    }
-    let horizontal_padding = 3.min(inner.width.saturating_sub(1) / 2);
-    let vertical_padding = 1.min(inner.height.saturating_sub(1) / 2);
-    let plot_area = Rect::new(
-        inner.x.saturating_add(horizontal_padding),
-        inner.y.saturating_add(vertical_padding),
-        inner
-            .width
-            .saturating_sub(horizontal_padding.saturating_mul(2)),
-        inner
-            .height
-            .saturating_sub(vertical_padding.saturating_mul(2)),
-    );
-    if plot_area.width == 0 || plot_area.height < 3 {
-        return;
-    }
-
-    let point_count = points.len();
-    let plot_width = plot_area.width as usize;
-    let gap = if point_count <= 1 {
-        0
-    } else if plot_width >= point_count.saturating_add(point_count.saturating_sub(1) * 2) {
-        2
-    } else if plot_width >= point_count.saturating_add(point_count.saturating_sub(1)) {
-        1
-    } else {
-        0
-    };
-    let max_visible_points = if gap == 0 {
-        plot_width.max(1)
-    } else {
-        (plot_width.saturating_add(gap) / (gap + 1)).max(1)
-    };
-    let visible_count = points.len().min(max_visible_points);
-    if visible_count == 0 {
-        return;
-    }
-    let total_gap = if visible_count > 1 {
-        gap.saturating_mul(visible_count - 1)
-    } else {
-        0
-    };
-    let bar_width =
-        ((plot_area.width as usize).saturating_sub(total_gap) / visible_count).clamp(1, 7);
-    let slot_width = bar_width.saturating_add(if visible_count > 1 { gap } else { 0 });
-    let group_width = bar_width
-        .saturating_mul(visible_count)
-        .saturating_add(total_gap);
-    let group_offset = (plot_area.width as usize).saturating_sub(group_width) / 2;
-    let group_x = plot_area
-        .x
-        .saturating_add(group_offset.min(u16::MAX as usize) as u16);
-    let time_row = plot_area
-        .y
-        .saturating_add(plot_area.height.saturating_sub(1));
-    let bar_top = plot_area.y.saturating_add(1);
-    if time_row <= bar_top {
-        return;
-    }
-    let bar_height = time_row.saturating_sub(bar_top);
-    let bar_bottom = time_row.saturating_sub(1);
-    let max_value = points
-        .iter()
-        .filter_map(|point| point.value.is_finite().then_some(point.value.max(0.0)))
-        .fold(0.0_f64, f64::max)
-        .max(0.0);
-    let y_axis_max = if max_value > 0.0 {
-        max_value * 1.1
-    } else {
-        1.0
-    };
-    let value_style = style.fg(Color::Green);
+    let axis_style = style.fg(Color::DarkGray);
     let bar_style = style.fg(Color::Blue);
     let label_style = style.fg(Color::Blue);
-    let bar_text = "█".repeat(bar_width);
-    let zero_bar_text = "▁".repeat(bar_width);
-    let time_label_visible = chart_striped_label_visibility(
-        points,
-        visible_count,
-        slot_width,
-        group_x,
-        bar_width as u16,
-        plot_area,
-        |point| point.label.as_str(),
+    let bounds_height = layout
+        .x_label_row
+        .saturating_sub(layout.value_label_row)
+        .saturating_add(1);
+    // Time labels share the otherwise-empty label row, so they may reach into
+    // the left padding to stay centered under their bars (req 5: even spacing).
+    let time_label_left = layout.axis_col.saturating_sub(layout.y_label_width);
+    let time_bounds = Rect::new(
+        time_label_left,
+        layout.value_label_row,
+        layout.plot_right.saturating_sub(time_label_left),
+        bounds_height,
     );
-    let value_label_visible = chart_value_label_visibility(
-        points,
-        visible_count,
-        group_x,
-        slot_width,
-        bar_width as u16,
-        plot_area,
-    );
-    let buffer = frame.buffer_mut();
-    for (index, point) in points.iter().take(visible_count).enumerate() {
-        let x = group_x
-            .saturating_add((index.saturating_mul(slot_width)).min(u16::MAX as usize) as u16);
-        if x >= plot_area.x.saturating_add(plot_area.width) {
-            break;
+
+    let time_label_visible =
+        chart_time_label_visibility(points, layout.visible_count, layout.slot_width as usize);
+
+    let plot_width = layout.plot_right.saturating_sub(layout.first_bar_x) as usize;
+    let x_axis_line = "─".repeat(plot_width);
+    let bar_text = "█".repeat(layout.bar_width as usize);
+    let zero_bar_text = "▁".repeat(layout.bar_width as usize);
+
+    {
+        let buffer = frame.buffer_mut();
+        // Y axis: vertical line + corner, then ticks and their value labels.
+        for row in layout.bar_top..layout.axis_row {
+            buffer.set_stringn(layout.axis_col, row, "│", 1, axis_style);
         }
-        let width = bar_width.min(
-            plot_area
-                .x
-                .saturating_add(plot_area.width)
-                .saturating_sub(x) as usize,
+        buffer.set_stringn(layout.axis_col, layout.axis_row, "└", 1, axis_style);
+        // X axis baseline.
+        buffer.set_stringn(
+            layout.first_bar_x,
+            layout.axis_row,
+            x_axis_line.as_str(),
+            plot_width,
+            axis_style,
         );
-        if width == 0 {
-            continue;
+        for i in 0..layout.y_tick_count {
+            let row = layout.y_tick_row(i);
+            if i > 0 {
+                buffer.set_stringn(layout.axis_col, row, "┤", 1, axis_style);
+            }
+            let text = format_statistics_value(layout.y_tick_value(i));
+            let width = display_width(text.as_str()).min(layout.y_label_width) as usize;
+            if width > 0 {
+                let label_x = layout.axis_col.saturating_sub(width as u16);
+                buffer.set_stringn(
+                    label_x,
+                    row,
+                    display_truncate_pad(text.as_str(), width),
+                    width,
+                    label_style,
+                );
+            }
         }
-        let value = if point.value.is_finite() {
-            point.value.max(0.0)
-        } else {
-            0.0
-        };
-        let scaled_height = if value <= 0.0 {
-            0
-        } else {
-            ((value / y_axis_max) * f64::from(bar_height))
-                .floor()
-                .max(1.0)
-                .min(f64::from(bar_height)) as u16
-        };
-        for row_offset in 0..scaled_height {
-            buffer.set_stringn(
-                x,
-                bar_bottom.saturating_sub(row_offset),
-                bar_text.as_str(),
-                width,
-                bar_style,
-            );
-        }
-        if scaled_height == 0 {
-            buffer.set_stringn(x, bar_bottom, zero_bar_text.as_str(), width, bar_style);
-        }
-        let value_row = if scaled_height == 0 {
-            bar_bottom
-        } else {
-            bar_bottom.saturating_sub(scaled_height)
-        };
-        if value_label_visible.get(index).copied().unwrap_or(false) {
-            draw_centered_chart_text(
-                buffer,
-                point.text_value.as_str(),
-                x,
-                width as u16,
-                value_row,
-                plot_area,
-                value_style,
-            );
-        }
-        if time_label_visible.get(index).copied().unwrap_or(false) {
-            draw_centered_chart_text(
-                buffer,
-                point.label.as_str(),
-                x,
-                width as u16,
-                time_row,
-                plot_area,
-                label_style,
-            );
+
+        // Bars (left-aligned) with value and time labels.
+        for (index, point) in points.iter().take(layout.visible_count).enumerate() {
+            let x = layout.bar_x(index);
+            if x >= layout.plot_right {
+                break;
+            }
+            let width =
+                (layout.bar_width as usize).min(layout.plot_right.saturating_sub(x) as usize);
+            if width == 0 {
+                continue;
+            }
+            let value = if point.value.is_finite() {
+                point.value.max(0.0)
+            } else {
+                0.0
+            };
+            let scaled_height = if value <= 0.0 {
+                0
+            } else {
+                ((value / layout.y_axis_max) * f64::from(layout.bar_height))
+                    .floor()
+                    .max(1.0)
+                    .min(f64::from(layout.bar_height)) as u16
+            };
+            for row_offset in 0..scaled_height {
+                buffer.set_stringn(
+                    x,
+                    layout.bar_bottom.saturating_sub(row_offset),
+                    bar_text.as_str(),
+                    width,
+                    bar_style,
+                );
+            }
+            if scaled_height == 0 {
+                buffer.set_stringn(
+                    x,
+                    layout.bar_bottom,
+                    zero_bar_text.as_str(),
+                    width,
+                    bar_style,
+                );
+            }
+            if time_label_visible.get(index).copied().unwrap_or(false) {
+                draw_centered_chart_text(
+                    buffer,
+                    point.label.as_str(),
+                    x,
+                    width as u16,
+                    layout.x_label_row,
+                    time_bounds,
+                    label_style,
+                );
+            }
         }
     }
+
+    draw_statistics_chart_crosshair(
+        frame,
+        area,
+        &layout,
+        points,
+        selected_bar,
+        lang,
+        key_label,
+        style,
+    );
 }
 
-fn chart_striped_label_visibility(
+/// Draw the click-to-inspect crosshair (a bar-wide vertical band) over the
+/// selected bar plus a tooltip with its date and value.
+#[allow(clippy::too_many_arguments)]
+fn draw_statistics_chart_crosshair(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    layout: &crate::tui::StatisticsChartLayout,
+    points: &[StatisticsChartPoint],
+    selected_bar: Option<usize>,
+    lang: crate::storage::Language,
+    key_label: &str,
+    style: Style,
+) {
+    let Some(index) = selected_bar.filter(|index| *index < layout.visible_count) else {
+        return;
+    };
+    let Some(point) = points.get(index) else {
+        return;
+    };
+    let x = layout.bar_x(index);
+    let width = (layout.bar_width).min(layout.plot_right.saturating_sub(x));
+    if width == 0 {
+        return;
+    }
+
+    {
+        let buffer = frame.buffer_mut();
+        for row in layout.bar_top..=layout.bar_bottom {
+            for col in x..x.saturating_add(width) {
+                if col < layout.plot_right {
+                    buffer[(col, row)].set_bg(Color::DarkGray);
+                }
+            }
+        }
+    }
+
+    let line1 = format!("{}: {}", lang_str(lang, "日期", "Date"), point.label);
+    let line2 = format!("{key_label}: {}", point.text_value);
+    let inner_left = area.x.saturating_add(1);
+    let inner_right = area.x.saturating_add(area.width).saturating_sub(1);
+    let inner_top = area.y.saturating_add(1);
+    let inner_bottom = area.y.saturating_add(area.height).saturating_sub(1);
+    if inner_right <= inner_left || inner_bottom <= inner_top {
+        return;
+    }
+    let avail_w = inner_right.saturating_sub(inner_left);
+    let content_w = display_width(line1.as_str())
+        .max(display_width(line2.as_str()))
+        .min(avail_w.saturating_sub(2));
+    if content_w == 0 {
+        return;
+    }
+    let tooltip_w = content_w.saturating_add(2);
+    let tooltip_h = 4u16.min(inner_bottom.saturating_sub(inner_top));
+    if tooltip_h < 3 {
+        return;
+    }
+
+    // Prefer placing the tooltip to the right of the bar, fall back to the left.
+    let mut tx = x.saturating_add(width).saturating_add(1);
+    if tx.saturating_add(tooltip_w) > inner_right {
+        tx = x.saturating_sub(tooltip_w.saturating_add(1));
+    }
+    tx = tx.clamp(inner_left, inner_right.saturating_sub(tooltip_w));
+    let mut ty = layout.bar_top;
+    if ty.saturating_add(tooltip_h) > inner_bottom {
+        ty = inner_bottom.saturating_sub(tooltip_h);
+    }
+    ty = ty.max(inner_top);
+
+    let tooltip_area = Rect::new(tx, ty, tooltip_w, tooltip_h);
+    frame.render_widget(Clear, tooltip_area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(display_truncate_pad(line1.as_str(), content_w as usize)),
+            Line::from(display_truncate_pad(line2.as_str(), content_w as usize)),
+        ])
+        .block(Block::default().borders(all_borders()))
+        .style(style),
+        tooltip_area,
+    );
+}
+
+/// Decide which bars get an X-axis (time) label. When every label fits with at
+/// least one blank column between neighbours they are all shown; otherwise the
+/// labels collapse to at most five, evenly distributed and including both ends,
+/// so they stay readable instead of bunching up (req 3).
+fn chart_time_label_visibility(
     points: &[StatisticsChartPoint],
     visible_count: usize,
     slot_width: usize,
-    group_x: u16,
-    bar_width: u16,
-    bounds: Rect,
-    text: impl Fn(&StatisticsChartPoint) -> &str,
 ) -> Vec<bool> {
+    const MAX_COLLAPSED_LABELS: usize = 5;
     let mut visible = vec![false; visible_count];
     if visible_count == 0 || slot_width == 0 {
+        return visible;
+    }
+    if visible_count == 1 {
+        visible[0] = true;
         return visible;
     }
     let max_label_width = points
         .iter()
         .take(visible_count)
-        .map(|point| display_width(text(point)) as usize)
+        .map(|point| display_width(point.label.as_str()) as usize)
         .max()
         .unwrap_or(0);
-    let stride = max_label_width
-        .saturating_add(1)
-        .saturating_add(slot_width.saturating_sub(1))
-        .checked_div(slot_width)
-        .unwrap_or(1)
+    // Smallest index step that keeps a blank column between adjacent labels.
+    let min_stride = max_label_width
+        .saturating_add(2)
+        .div_ceil(slot_width.max(1))
         .max(1);
-    let mut intervals: Vec<(usize, u16, u16)> = Vec::new();
-    for index in (0..visible_count).step_by(stride) {
-        let Some((start, width)) = chart_centered_text_bounds(
-            text(&points[index]),
-            chart_bar_x(group_x, slot_width, index),
-            bar_width,
-            bounds,
-        ) else {
-            continue;
-        };
-        let end = start.saturating_add(width as u16);
-        if intervals
-            .last()
-            .is_none_or(|(_, _, prev_end)| *prev_end < start)
-        {
-            visible[index] = true;
-            intervals.push((index, start, end));
-        }
+    if min_stride <= 1 {
+        // Everything fits: label every bar.
+        visible.iter_mut().for_each(|flag| *flag = true);
+        return visible;
     }
-    if visible_count > 1 {
-        let last_index = visible_count - 1;
-        if !visible[last_index] {
-            if let Some((start, width)) = chart_centered_text_bounds(
-                text(&points[last_index]),
-                chart_bar_x(group_x, slot_width, last_index),
-                bar_width,
-                bounds,
-            ) {
-                let end = start.saturating_add(width as u16);
-                while intervals
-                    .last()
-                    .is_some_and(|(_, interval_start, interval_end)| {
-                        *interval_start <= end && start <= *interval_end
-                    })
-                {
-                    if let Some((index, _, _)) = intervals.pop() {
-                        visible[index] = false;
-                    }
-                }
-                if intervals
-                    .last()
-                    .is_none_or(|(_, _, prev_end)| *prev_end < start)
-                {
-                    visible[last_index] = true;
-                }
-            }
-        }
+    // Collapsed: spread out at most five labels (and never more than fit).
+    let max_fit = (visible_count - 1) / min_stride + 1;
+    let count = max_fit.clamp(2, MAX_COLLAPSED_LABELS);
+    for j in 0..count {
+        let index =
+            ((j as f64) * ((visible_count - 1) as f64) / ((count - 1) as f64)).round() as usize;
+        visible[index.min(visible_count - 1)] = true;
     }
     visible
-}
-
-fn chart_value_label_visibility(
-    points: &[StatisticsChartPoint],
-    visible_count: usize,
-    group_x: u16,
-    slot_width: usize,
-    bar_width: u16,
-    bounds: Rect,
-) -> Vec<bool> {
-    let mut visible = vec![false; visible_count];
-    let mut last_end = bounds.x;
-    for (index, point) in points.iter().take(visible_count).enumerate() {
-        if !point.value.is_finite() || point.value <= 0.0 {
-            continue;
-        }
-        let Some((start, width)) = chart_centered_text_bounds(
-            point.text_value.as_str(),
-            chart_bar_x(group_x, slot_width, index),
-            bar_width,
-            bounds,
-        ) else {
-            continue;
-        };
-        let end = start.saturating_add(width as u16);
-        if start >= last_end {
-            visible[index] = true;
-            last_end = end;
-        }
-    }
-    visible
-}
-
-fn chart_bar_x(group_x: u16, slot_width: usize, index: usize) -> u16 {
-    group_x.saturating_add((index.saturating_mul(slot_width)).min(u16::MAX as usize) as u16)
 }
 
 fn draw_centered_chart_text(

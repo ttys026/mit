@@ -77,6 +77,7 @@ fn prop_dialog_applies_cached_mips_property_updates() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
     app.property_cache
         .set_property("dev-1".to_string(), 2, 1, json!(true));
@@ -113,6 +114,7 @@ fn process_cloud_mips_messages_logs_messages_and_errors() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     };
     let mut app = test_app_with_prop_dialog(dialog);
     let (tx, rx) = mpsc::channel();
@@ -208,6 +210,7 @@ fn refresh_cloud_mips_listeners_logs_when_no_eligible_device_groups() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
 
     app.refresh_cloud_mips_listeners();

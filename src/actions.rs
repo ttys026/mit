@@ -100,10 +100,12 @@ pub fn device_statistics(
 }
 
 fn require_mijia(account: &AuthAccount) -> Result<&crate::storage::MijiaAuth> {
-    account
-        .mijia
-        .as_ref()
-        .ok_or_else(|| anyhow!("账号 {} 未登录米家，无法获取历史数据", account.user.uid))
+    account.mijia.as_ref().ok_or_else(|| {
+        anyhow!(
+            "账号 {} 未登录米家，请先运行 mit auth login mijia 登录米家",
+            account.user.uid
+        )
+    })
 }
 
 fn remove_dir_all_if_exists(path: &Path) -> Result<()> {

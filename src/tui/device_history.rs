@@ -1457,6 +1457,278 @@ pub(in crate::tui) fn format_statistics_date_label(date: Date, period: Statistic
     }
 }
 
+/// Resolved geometry of the statistics bar chart. Computed once from the chart
+/// area + data and shared between rendering (`draw_statistics_bar_chart`) and
+/// mouse hit-testing (`handle_statistics_mouse`) so the crosshair, tooltip and
+/// click targets always line up with what is drawn. All fields are absolute
+/// terminal cell coordinates.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tui) struct StatisticsChartLayout {
+    /// Column of the vertical Y-axis line.
+    pub(in crate::tui) axis_col: u16,
+    /// Row of the horizontal X-axis baseline.
+    pub(in crate::tui) axis_row: u16,
+    /// X of the first (leftmost) bar; bars are left-aligned from here.
+    pub(in crate::tui) first_bar_x: u16,
+    /// Exclusive right edge of the plotting region.
+    pub(in crate::tui) plot_right: u16,
+    /// Reserved row above the bars for value labels / tallest-bar headroom.
+    pub(in crate::tui) value_label_row: u16,
+    /// Topmost row a full-height bar reaches (also the top Y tick row).
+    pub(in crate::tui) bar_top: u16,
+    /// Bottommost bar row (the row directly above the axis baseline).
+    pub(in crate::tui) bar_bottom: u16,
+    /// Number of rows available for a full-height bar.
+    pub(in crate::tui) bar_height: u16,
+    /// Width of a single bar, in cells.
+    pub(in crate::tui) bar_width: u16,
+    /// Bar width plus the inter-bar gap (one bar's horizontal stride).
+    pub(in crate::tui) slot_width: u16,
+    /// Row where the X-axis (time) labels are drawn.
+    pub(in crate::tui) x_label_row: u16,
+    /// Columns reserved on the left for the Y-axis value labels.
+    pub(in crate::tui) y_label_width: u16,
+    /// Number of Y-axis ticks drawn (3..=5, fewer only on tiny charts).
+    pub(in crate::tui) y_tick_count: usize,
+    /// Upper bound of the Y axis: the largest bar value times 1.1.
+    pub(in crate::tui) y_axis_max: f64,
+    /// Number of bars actually drawn (clamped down when the area is narrow).
+    pub(in crate::tui) visible_count: usize,
+}
+
+impl StatisticsChartLayout {
+    /// X of the bar at `index` (left-aligned, stride = `slot_width`).
+    pub(in crate::tui) fn bar_x(&self, index: usize) -> u16 {
+        self.first_bar_x.saturating_add(
+            (index.saturating_mul(self.slot_width as usize)).min(u16::MAX as usize) as u16,
+        )
+    }
+
+    /// Value represented by Y tick `i` (0 = baseline, last = `y_axis_max`).
+    pub(in crate::tui) fn y_tick_value(&self, i: usize) -> f64 {
+        if self.y_tick_count <= 1 {
+            return self.y_axis_max;
+        }
+        self.y_axis_max * (i as f64) / ((self.y_tick_count - 1) as f64)
+    }
+
+    /// Row of Y tick `i` (0 = axis baseline, last = `bar_top`).
+    pub(in crate::tui) fn y_tick_row(&self, i: usize) -> u16 {
+        if self.y_tick_count <= 1 {
+            return self.axis_row;
+        }
+        let span = self.axis_row.saturating_sub(self.bar_top) as f64;
+        let offset = (span * (i as f64) / ((self.y_tick_count - 1) as f64)).round() as u16;
+        self.axis_row.saturating_sub(offset)
+    }
+
+    /// Map a clicked column to the nearest visible bar, if it lands on the
+    /// plotting region (gaps snap to the bar on their left). Columns left of
+    /// the first bar or right of the last bar return `None` (a click-away).
+    pub(in crate::tui) fn bar_index_at(&self, column: u16) -> Option<usize> {
+        if self.visible_count == 0 || self.slot_width == 0 || column < self.first_bar_x {
+            return None;
+        }
+        let index = (column.saturating_sub(self.first_bar_x) / self.slot_width) as usize;
+        (index < self.visible_count).then_some(index)
+    }
+}
+
+/// Compute the chart geometry for `area` (the bordered chart box) and `points`.
+/// Returns `None` when the area is too small to host a meaningful chart, in
+/// which case the caller draws just the bordered frame.
+pub(in crate::tui) fn statistics_chart_layout(
+    area: Rect,
+    points: &[StatisticsChartPoint],
+) -> Option<StatisticsChartLayout> {
+    if points.is_empty() || area.width < 8 || area.height < 7 {
+        return None;
+    }
+    // Inside the border.
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    // Padding so neither the axes nor the labels sit flush against the frame.
+    const PAD_LEFT: u16 = 1;
+    const PAD_RIGHT: u16 = 2;
+    const PAD_TOP: u16 = 1;
+    let padded = Rect::new(
+        inner.x.saturating_add(PAD_LEFT),
+        inner.y.saturating_add(PAD_TOP),
+        inner.width.saturating_sub(PAD_LEFT + PAD_RIGHT),
+        inner.height.saturating_sub(PAD_TOP),
+    );
+    // Vertical bands (top → bottom): value labels, bars, axis baseline, x labels.
+    if padded.width < 4 || padded.height < 4 {
+        return None;
+    }
+    let x_label_row = padded.y.saturating_add(padded.height - 1);
+    let axis_row = x_label_row.saturating_sub(1);
+    let value_label_row = padded.y;
+    let bar_top = padded.y.saturating_add(1);
+    let bar_bottom = axis_row.saturating_sub(1);
+    if bar_bottom < bar_top {
+        return None;
+    }
+    let bar_height = bar_bottom - bar_top + 1;
+
+    let max_value = points
+        .iter()
+        .filter_map(|point| point.value.is_finite().then_some(point.value.max(0.0)))
+        .fold(0.0_f64, f64::max)
+        .max(0.0);
+    let y_axis_max = if max_value > 0.0 {
+        max_value * 1.1
+    } else {
+        1.0
+    };
+
+    // 3..=5 Y ticks, scaled to the available height (req 6).
+    let y_tick_count = ((bar_height as usize) / 4 + 2)
+        .clamp(3, 5)
+        .min(bar_height as usize + 1)
+        .max(2);
+    let mut y_label_width = 0u16;
+    for i in 0..y_tick_count {
+        let frac = if y_tick_count <= 1 {
+            1.0
+        } else {
+            i as f64 / (y_tick_count - 1) as f64
+        };
+        let label = format_statistics_value(y_axis_max * frac);
+        y_label_width = y_label_width.max(display_width(label.as_str()));
+    }
+
+    let axis_col = padded.x.saturating_add(y_label_width);
+    let plot_left = axis_col.saturating_add(1);
+    let plot_right = padded.x.saturating_add(padded.width);
+    if plot_right <= plot_left {
+        return None;
+    }
+    let plot_width = (plot_right - plot_left) as usize;
+
+    // Bar sizing, left-aligned (req 4).
+    let point_count = points.len();
+    let gap = if point_count <= 1 {
+        0
+    } else if plot_width >= point_count.saturating_add(point_count.saturating_sub(1) * 2) {
+        2
+    } else if plot_width >= point_count.saturating_add(point_count.saturating_sub(1)) {
+        1
+    } else {
+        0
+    };
+    let max_visible_points = if gap == 0 {
+        plot_width.max(1)
+    } else {
+        (plot_width.saturating_add(gap) / (gap + 1)).max(1)
+    };
+    let visible_count = point_count.min(max_visible_points);
+    if visible_count == 0 {
+        return None;
+    }
+    let total_gap = if visible_count > 1 {
+        gap.saturating_mul(visible_count - 1)
+    } else {
+        0
+    };
+    let bar_width = (plot_width.saturating_sub(total_gap) / visible_count).clamp(1, 7) as u16;
+    let slot_width = bar_width.saturating_add(if visible_count > 1 { gap as u16 } else { 0 });
+
+    Some(StatisticsChartLayout {
+        axis_col,
+        axis_row,
+        first_bar_x: plot_left,
+        plot_right,
+        value_label_row,
+        bar_top,
+        bar_bottom,
+        bar_height,
+        bar_width,
+        slot_width,
+        x_label_row,
+        y_label_width,
+        y_tick_count,
+        y_axis_max,
+        visible_count,
+    })
+}
+
+/// The chart (body) area inside the statistics tab — the region below the
+/// selector row. Mirrors the layout used while rendering so mouse hit-testing
+/// and drawing stay in sync.
+pub(in crate::tui) fn statistics_chart_area(
+    terminal_area: Rect,
+    dialog: &PropDialog,
+) -> Option<Rect> {
+    let list_area = fullscreen_dialog_list_area(terminal_area)?;
+    let selector_height = statistics_selector_height(dialog);
+    if selector_height == 0 {
+        return Some(list_area);
+    }
+    let stats_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(selector_height), Constraint::Min(1)])
+        .split(list_area);
+    Some(stats_sections[1])
+}
+
+/// The list region (below the tab bar) of the fullscreen prop dialog — the area
+/// the Logs/Statistics dropdowns and selectors are laid out within.
+pub(in crate::tui) fn fullscreen_dialog_list_area(terminal_area: Rect) -> Option<Rect> {
+    let inner = fullscreen_dialog_inner_area(terminal_area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(inner);
+    Some(sections[1])
+}
+
+/// Rect of the open statistics key-selector dropdown, if any. Used for
+/// click-away dismissal.
+pub(in crate::tui) fn statistics_key_menu_dropdown_area(
+    terminal_area: Rect,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    let list_area = fullscreen_dialog_list_area(terminal_area)?;
+    statistics_dropdown_area(list_area, dialog, lang)
+}
+
+/// Rect of the open statistics period-selector dropdown, if any.
+pub(in crate::tui) fn statistics_period_menu_dropdown_area(
+    terminal_area: Rect,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    let list_area = fullscreen_dialog_list_area(terminal_area)?;
+    let selector_height = statistics_selector_height(dialog).min(list_area.height);
+    let selector_area = Rect::new(list_area.x, list_area.y, list_area.width, selector_height);
+    let selector_row_area = Rect::new(
+        selector_area.x,
+        selector_area.y,
+        selector_area.width,
+        selector_area.height.min(2),
+    );
+    statistics_period_dropdown_area(list_area, selector_row_area, dialog, lang)
+}
+
+/// Rect of the open operation-record key dropdown, if any.
+pub(in crate::tui) fn operation_record_menu_dropdown_area(
+    terminal_area: Rect,
+    dialog: &PropDialog,
+    lang: Language,
+) -> Option<Rect> {
+    let list_area = fullscreen_dialog_list_area(terminal_area)?;
+    operation_record_dropdown_area(list_area, dialog, lang)
+}
+
 pub(in crate::tui) fn operation_record_request_is_loading_more(request: &Value) -> bool {
     request
         .get("pagination")
@@ -1744,6 +2016,10 @@ pub(in crate::tui) enum StatisticsMouseAction {
     SelectKey(usize),
     SelectPeriod(usize),
     SetDate(Date),
+    /// Click landed on a chart bar: show the crosshair + tooltip for it.
+    SelectBar(usize),
+    /// Click-away inside the chart: hide the crosshair + tooltip.
+    ClearBar,
     Consume,
 }
 
@@ -2015,10 +2291,38 @@ pub(in crate::tui) fn handle_statistics_mouse(
                     StatisticsMouseAction::Consume
                 }
             } else {
-                return false;
+                // Click landed in the chart body: select the bar under the
+                // cursor (crosshair + tooltip) or clear it on a click-away.
+                let Ok(points) = statistics_chart_points(dialog, app.language) else {
+                    // No chart drawn (error / unsupported message): leave the
+                    // click to text selection.
+                    return false;
+                };
+                let Some(body_area) = statistics_chart_area(terminal_area, dialog) else {
+                    return false;
+                };
+                match statistics_chart_layout(body_area, points.as_slice()) {
+                    Some(layout)
+                        if mouse.row >= layout.value_label_row
+                            && mouse.row <= layout.x_label_row =>
+                    {
+                        match layout.bar_index_at(mouse.column) {
+                            Some(index) => StatisticsMouseAction::SelectBar(index),
+                            None => StatisticsMouseAction::ClearBar,
+                        }
+                    }
+                    _ => StatisticsMouseAction::ClearBar,
+                }
             }
         }
     };
+
+    // Any interaction other than picking a bar dismisses the crosshair/tooltip.
+    if !matches!(action, StatisticsMouseAction::SelectBar(_)) {
+        if let Some(dialog) = app.prop_dialog.as_mut() {
+            dialog.statistics_selected_bar = None;
+        }
+    }
 
     match action {
         StatisticsMouseAction::OpenKey => app.open_statistics_key_menu(),
@@ -2041,7 +2345,12 @@ pub(in crate::tui) fn handle_statistics_mouse(
             app.set_statistics_date_picker_cursor(date);
             app.select_statistics_date();
         }
-        StatisticsMouseAction::Consume => {}
+        StatisticsMouseAction::SelectBar(index) => {
+            if let Some(dialog) = app.prop_dialog.as_mut() {
+                dialog.statistics_selected_bar = Some(index);
+            }
+        }
+        StatisticsMouseAction::ClearBar | StatisticsMouseAction::Consume => {}
     }
     true
 }
@@ -2377,6 +2686,7 @@ impl TuiApp {
                     set_statistics_period(dialog, period);
                 }
             }
+            dialog.statistics_selected_bar = None;
             dialog.editing = false;
             dialog.edit_buffer.clear();
             dialog.edit_cursor = statistics_selected_request_index(dialog);
@@ -2459,6 +2769,7 @@ impl TuiApp {
                 set_statistics_date_filter_value(value, period, state.cursor);
                 should_refresh = true;
             }
+            dialog.statistics_selected_bar = None;
             dialog.editing = false;
             dialog.edit_buffer.clear();
             dialog.edit_cursor = statistics_selected_request_index(dialog);
@@ -2482,6 +2793,7 @@ impl TuiApp {
                     should_refresh = true;
                 }
             }
+            dialog.statistics_selected_bar = None;
             dialog.editing = false;
             dialog.edit_buffer.clear();
             dialog.edit_cursor = statistics_selected_request_index(dialog);

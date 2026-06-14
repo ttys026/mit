@@ -94,9 +94,12 @@ fn strict_auth_reads_accounts_and_rejects_bad_shapes() {
     assert_eq!(auth_with_accounts.accounts.len(), 1);
     assert_eq!(auth_with_accounts.accounts[0].user.uid, "1001");
 
+    // A version-1 (flat) account is migrated to version 2: the Xiaomi fields are
+    // wrapped into `xiaomi`, the version is bumped, and `mijia` becomes null.
     let legacy_flat_accounts = normalize_auth(json!({
         "accounts": [
             {
+                "version": 1,
                 "region": "cn",
                 "redirectUri": "https://127.0.0.1:8000/login_redirect",
                 "uuid": "uuid-a",
@@ -106,7 +109,14 @@ fn strict_auth_reads_accounts_and_rejects_bad_shapes() {
         ]
     }))
     .unwrap();
-    assert!(legacy_flat_accounts.accounts.is_empty());
+    assert_eq!(legacy_flat_accounts.accounts.len(), 1);
+    let migrated = &legacy_flat_accounts.accounts[0];
+    assert_eq!(migrated.version, CURRENT_AUTH_VERSION);
+    assert_eq!(migrated.user.uid, "1001");
+    let xiaomi = migrated.xiaomi.as_ref().expect("xiaomi auth migrated");
+    assert_eq!(xiaomi.access_token, "token-a");
+    assert_eq!(xiaomi.uuid, "uuid-a");
+    assert!(migrated.mijia.is_none());
 
     assert!(normalize_auth(json!({
         "accounts": [],
@@ -122,6 +132,44 @@ fn strict_auth_reads_accounts_and_rejects_bad_shapes() {
     .unwrap_err()
     .to_string()
     .contains("auth.accounts"));
+}
+
+#[test]
+fn auth_v1_flat_account_migrates_to_v2_nested_on_write() {
+    let auth = normalize_auth(json!({
+        "accounts": [
+            {
+                "version": 1,
+                "region": "cn",
+                "redirectUri": "http://127.0.0.1:8000/login_redirect",
+                "uuid": "uuid-a",
+                "deviceId": "mico.a",
+                "state": "state-a",
+                "accessToken": "token-a",
+                "refreshToken": "refresh-a",
+                "expiresTs": 111,
+                "user": { "uid": "1001", "nickname": "账号A" }
+            }
+        ]
+    }))
+    .unwrap();
+    let path = temp_test_path("auth-v1-migrate");
+
+    write_auth(&path, &auth).unwrap();
+
+    let persisted: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let account = persisted["accounts"].as_array().unwrap()[0].as_object().unwrap();
+    // Version bumped, Xiaomi fields nested, Mijia null, flat fields gone.
+    assert_eq!(account["version"], json!(CURRENT_AUTH_VERSION));
+    assert_eq!(account["mijia"], Value::Null);
+    assert_eq!(account["xiaomi"]["accessToken"], json!("token-a"));
+    assert_eq!(account["xiaomi"]["deviceId"], json!("mico.a"));
+    assert_eq!(account["xiaomi"]["expiresTs"], json!(111));
+    assert!(!account.contains_key("accessToken"));
+    assert!(!account.contains_key("deviceId"));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir(path.parent().unwrap());
 }
 
 #[test]

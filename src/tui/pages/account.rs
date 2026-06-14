@@ -272,6 +272,7 @@ impl TuiApp {
                 edit_error: None,
                 refreshing: false,
                 refresh_rx: None,
+                statistics_selected_bar: None,
             });
             self.log(message);
         } else {

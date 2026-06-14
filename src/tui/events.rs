@@ -450,6 +450,122 @@ pub(in crate::tui) fn settings_confirm_lines(
     lines
 }
 
+/// A non-fullscreen overlay (centered dialog, dropdown menu, or date picker)
+/// that should be dismissed when the user clicks outside of it.
+#[derive(Clone, Copy)]
+enum ClickAwayOverlay {
+    AccountAction,
+    StatisticsKeyMenu,
+    StatisticsPeriodMenu,
+    StatisticsDatePicker,
+    OperationRecordMenu,
+    OperationRecordDatePicker,
+}
+
+/// Bounding rect of the account action popup for the given variant. The push
+/// message popup is a touch taller when layered over the (fullscreen) prop
+/// dialog, mirroring the renderer.
+fn account_action_popup_area(
+    dialog: &AccountActionDialog,
+    over_prop_dialog: bool,
+    terminal_area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    match dialog {
+        AccountActionDialog::Menu { .. } => centered_rect(48, 34, terminal_area),
+        AccountActionDialog::PushMessage { .. } if over_prop_dialog => {
+            centered_rect(74, 46, terminal_area)
+        }
+        AccountActionDialog::Reauth { .. }
+        | AccountActionDialog::PushMessage { .. }
+        | AccountActionDialog::SettingsConfirm { .. } => centered_rect(74, 42, terminal_area),
+    }
+}
+
+/// The topmost dismissible overlay currently open and the rect that counts as
+/// "inside" it. Clicks outside this rect dismiss the overlay.
+fn active_click_away_overlay(
+    app: &TuiApp,
+    terminal_area: ratatui::layout::Rect,
+) -> Option<(ClickAwayOverlay, ratatui::layout::Rect)> {
+    if let Some(dialog) = app.account_action_dialog.as_ref() {
+        let area = account_action_popup_area(dialog, app.prop_dialog.is_some(), terminal_area);
+        return Some((ClickAwayOverlay::AccountAction, area));
+    }
+    let dialog = app.prop_dialog.as_ref()?;
+    if statistics_date_picker_is_open(dialog) {
+        return Some((
+            ClickAwayOverlay::StatisticsDatePicker,
+            operation_record_date_picker_popup_area(terminal_area),
+        ));
+    }
+    if operation_record_date_picker_is_open(dialog) {
+        return Some((
+            ClickAwayOverlay::OperationRecordDatePicker,
+            operation_record_date_picker_popup_area(terminal_area),
+        ));
+    }
+    if statistics_key_menu_is_open(dialog) {
+        if let Some(area) = statistics_key_menu_dropdown_area(terminal_area, dialog, app.language) {
+            return Some((ClickAwayOverlay::StatisticsKeyMenu, area));
+        }
+    }
+    if statistics_period_menu_is_open(dialog) {
+        if let Some(area) =
+            statistics_period_menu_dropdown_area(terminal_area, dialog, app.language)
+        {
+            return Some((ClickAwayOverlay::StatisticsPeriodMenu, area));
+        }
+    }
+    if operation_record_menu_is_open(dialog) {
+        if let Some(area) = operation_record_menu_dropdown_area(terminal_area, dialog, app.language)
+        {
+            return Some((ClickAwayOverlay::OperationRecordMenu, area));
+        }
+    }
+    None
+}
+
+/// Close the given overlay, mirroring its keyboard (Esc) dismissal semantics.
+fn close_click_away_overlay(app: &mut TuiApp, overlay: ClickAwayOverlay) {
+    match overlay {
+        ClickAwayOverlay::AccountAction => match app.account_action_dialog.as_ref() {
+            Some(AccountActionDialog::Reauth { .. }) => app.dismiss_reauth_dialog(),
+            Some(AccountActionDialog::PushMessage {
+                return_to_menu_selected,
+                ..
+            }) => {
+                let selected = *return_to_menu_selected;
+                app.account_action_dialog = Some(AccountActionDialog::Menu { selected });
+            }
+            _ => app.account_action_dialog = None,
+        },
+        ClickAwayOverlay::StatisticsKeyMenu | ClickAwayOverlay::StatisticsPeriodMenu => {
+            app.close_statistics_menu()
+        }
+        ClickAwayOverlay::StatisticsDatePicker => app.close_statistics_date_picker(),
+        ClickAwayOverlay::OperationRecordMenu => app.close_operation_record_menu(),
+        ClickAwayOverlay::OperationRecordDatePicker => app.close_operation_record_date_picker(),
+    }
+}
+
+/// Generic click-away handling: if a non-fullscreen overlay (dialog, dropdown,
+/// or date picker) is open and the click lands outside it, dismiss it and
+/// consume the event. Returns `true` when the click was handled.
+pub(in crate::tui) fn handle_overlay_click_away(
+    app: &mut TuiApp,
+    mouse: MouseEvent,
+    terminal_area: ratatui::layout::Rect,
+) -> bool {
+    let Some((overlay, area)) = active_click_away_overlay(app, terminal_area) else {
+        return false;
+    };
+    if rect_contains(area, mouse.column, mouse.row) {
+        return false;
+    }
+    close_click_away_overlay(app, overlay);
+    true
+}
+
 pub(in crate::tui) fn handle_mouse(
     app: &mut TuiApp,
     mouse: MouseEvent,
@@ -483,6 +599,11 @@ pub(in crate::tui) fn handle_mouse(
 
     if left_down && click_outside_selected_range(mouse) {
         clear_selection_state();
+    }
+    // Click-away closes any open non-fullscreen overlay (dialog, dropdown, or
+    // date picker) before any in-overlay handling runs.
+    if left_down && handle_overlay_click_away(app, mouse, terminal_area) {
+        return Ok(());
     }
     if (left_down || scroll_up || scroll_down)
         && handle_operation_record_mouse(app, mouse, terminal_area)

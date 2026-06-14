@@ -1338,6 +1338,10 @@ struct PropDialog {
     edit_error: Option<String>,
     refreshing: bool,
     refresh_rx: Option<Receiver<PropDialogRefreshMessage>>,
+    /// Index of the statistics bar the user clicked, used to render the
+    /// crosshair + tooltip. Cleared on click-away or when the chart data
+    /// changes (period/key/date change, tab switch).
+    statistics_selected_bar: Option<usize>,
 }
 
 #[derive(Clone, Debug)]

@@ -36,6 +36,7 @@ fn prop_dialog_footer_refresh_shows_props_loading_effect() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
     app.language = Language::English;
     let terminal_area = ratatui::layout::Rect::new(0, 0, 100, 24);
@@ -455,6 +456,7 @@ fn prop_dialog_does_not_force_black_popup_background() {
             status: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -552,6 +554,7 @@ fn prop_dialog_refresh_starts_background_worker() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -649,6 +652,7 @@ fn prop_dialog_r_key_starts_background_refresh() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -754,6 +758,7 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
             edit_error: None,
             refreshing: true,
             refresh_rx: Some(refresh_rx),
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -909,6 +914,7 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1006,6 +1012,7 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1124,6 +1131,7 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1217,6 +1225,7 @@ fn prop_dialog_visible_tabs_hide_empty_categories_and_keep_order() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     };
 
     assert_eq!(
@@ -1273,6 +1282,7 @@ fn prop_dialog_visible_tab_titles_are_renumbered_one_based() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     };
 
     assert_eq!(
@@ -1306,6 +1316,7 @@ fn prop_dialog_visible_tab_titles_empty_when_no_actions_or_properties() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     };
 
     assert_eq!(
@@ -1346,6 +1357,7 @@ fn prop_dialog_visible_tab_titles_actions_only_renumber_from_one() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     };
 
     assert_eq!(
@@ -1393,6 +1405,7 @@ fn prop_dialog_visible_tab_titles_readonly_only_renumber_from_one() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     };
 
     assert_eq!(
@@ -1453,6 +1466,7 @@ fn prop_dialog_mouse_tab_hit_testing_uses_visible_tabs_when_first_hidden() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
 
     let terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
@@ -1527,6 +1541,7 @@ fn prop_dialog_keyboard_tab_cycles_over_visible_tabs_when_middle_hidden() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
 
     handle_key(
@@ -1588,6 +1603,7 @@ fn prop_dialog_hidden_active_tab_is_normalized_before_render() {
         edit_error: None,
         refreshing: false,
         refresh_rx: None,
+        statistics_selected_bar: None,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1688,6 +1704,7 @@ fn clicking_active_prop_dialog_item_executes_it() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -1817,6 +1834,7 @@ fn prop_dialog_actions_tab_renders_action_items() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2042,6 +2060,7 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2160,6 +2179,7 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2291,6 +2311,7 @@ fn draw_edit_mode_shows_visible_input_cursor() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),
@@ -2390,6 +2411,7 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
             edit_error: None,
             refreshing: false,
             refresh_rx: None,
+            statistics_selected_bar: None,
         }),
         account_action_dialog: None,
         account_list_state: ListState::default(),

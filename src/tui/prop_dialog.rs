@@ -1079,6 +1079,7 @@ impl TuiApp {
                 PropDialogTab::Logs | PropDialogTab::Statistics => {}
             }
             dialog.active_tab = target;
+            dialog.statistics_selected_bar = None;
             // Reset active index to 0 when switching tabs
             match target {
                 PropDialogTab::Writable => dialog.writable_selected = 0,
@@ -1778,6 +1779,7 @@ impl TuiApp {
             edit_error: None,
             refreshing: false,
             refresh_rx: Some(raw_rx),
+            statistics_selected_bar: None,
         });
         self.log(format!(
             "opened property dialog for {} ({})",

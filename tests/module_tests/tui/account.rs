@@ -270,6 +270,51 @@ fn escaping_push_message_dialog_restores_previous_menu_selection() {
 }
 
 #[test]
+fn account_action_menu_closes_on_click_away() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.prop_dialog = None;
+    app.account_action_dialog = Some(AccountActionDialog::Menu { selected: 0 });
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+
+    // A click outside the centered popup dismisses it.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(app.account_action_dialog.is_none());
+}
+
+#[test]
+fn account_action_menu_click_inside_keeps_open() {
+    let mut app = app_with_single_readonly_prop_dialog();
+    app.prop_dialog = None;
+    app.account_action_dialog = Some(AccountActionDialog::Menu { selected: 0 });
+    let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+    let popup = super::centered_rect(48, 34, terminal_area);
+
+    // A click inside the popup does not dismiss it.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: popup.x + popup.width / 2,
+            row: popup.y + popup.height / 2,
+            modifiers: KeyModifiers::NONE,
+        },
+        terminal_area,
+    )
+    .unwrap();
+    assert!(app.account_action_dialog.is_some());
+}
+
+#[test]
 fn preview_push_command_masks_long_params() {
     assert_eq!(
         format_preview_push_command("1001", "hellooo"),

@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_REGION: &str = "cn";
 pub const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8000/login_redirect";
 
+/// Current on-disk schema version for `auth.json` accounts. Version 1 stored the
+/// Xiaomi credentials as flat fields on each account; version 2 nests them under
+/// an `xiaomi` object and adds an optional `mijia` object. Accounts read at an
+/// older version are migrated to this version (see [`normalize_account_ref`]).
+pub const CURRENT_AUTH_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Language {
@@ -517,6 +523,15 @@ fn normalize_account_ref(value: &Value, allow_flat_xiaomi: bool) -> AuthAccount 
         .cloned()
         .unwrap_or_default();
 
+    // Legacy (version < 2) accounts stored the Xiaomi credentials as flat fields
+    // on the account itself. Migrate them by wrapping those fields into `xiaomi`;
+    // such accounts never had Mijia credentials, so `mijia` becomes null.
+    let stored_version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let allow_flat_xiaomi = allow_flat_xiaomi || stored_version < CURRENT_AUTH_VERSION;
+
     let xiaomi = object
         .get("xiaomi")
         .and_then(normalize_xiaomi_auth_ref)
@@ -531,7 +546,7 @@ fn normalize_account_ref(value: &Value, allow_flat_xiaomi: bool) -> AuthAccount 
     let xiaomi_values = xiaomi.clone().unwrap_or_default();
 
     AuthAccount {
-        version: 1,
+        version: CURRENT_AUTH_VERSION,
         xiaomi,
         mijia,
         user: UserProfile {
