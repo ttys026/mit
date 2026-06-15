@@ -44,6 +44,7 @@ fn bare_root_prints_command_summary() {
             "- stats：查看设备统计数据（米家统计）",
             "- cache：清理缓存（保留登录）",
             "- reset：重置全部数据（删除 ~/.mit）",
+            "- update：检查并升级到最新版本",
             "- tui：启动全屏 TUI 控制台",
             "",
             "运行 `mit --help` 查看完整帮助。",

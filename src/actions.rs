@@ -17,6 +17,94 @@ use crate::storage::{save_auth, AuthAccount, AuthState};
 /// Mijia data type used to query property operation records.
 pub const PROP_DATA_TYPE: &str = "prop";
 
+/// GitHub repository slug (`owner/name`) used for the homepage link and update checks.
+pub const GITHUB_REPO: &str = "ttys026/mit";
+
+/// GitHub repository homepage URL.
+pub fn github_home_url() -> String {
+    format!("https://github.com/{GITHUB_REPO}")
+}
+
+/// URL of the install script that `mit update` shells out to in order to upgrade.
+pub fn install_script_url() -> String {
+    format!("https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh")
+}
+
+/// Query the GitHub API for the latest published release tag (e.g. `v1.2.0`).
+///
+/// Blocking call; callers in the TUI run it on a background thread so the event
+/// loop never stalls on the network.
+pub fn latest_release_tag() -> Result<String> {
+    // `MIT_GITHUB_API_BASE` lets tests point the lookup at a mock server.
+    let base = std::env::var("MIT_GITHUB_API_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string());
+    let url = format!("{base}/repos/{GITHUB_REPO}/releases/latest");
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(url)
+        // GitHub rejects API requests without a User-Agent.
+        .header("User-Agent", concat!("mit/", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .send()?;
+    let status = response.status();
+    // Capture rate-limit headers before `text()` consumes the response.
+    let remaining = header_value(response.headers(), "x-ratelimit-remaining");
+    let reset = header_value(response.headers(), "x-ratelimit-reset")
+        .and_then(|value| value.parse::<i64>().ok());
+    let text = response.text()?;
+    if !status.is_success() {
+        let code = status.as_u16();
+        // 403/429 with no remaining budget means we hit GitHub's unauthenticated
+        // 60-requests/hour limit; say so plainly with a retry hint.
+        if (code == 403 || code == 429) && remaining.as_deref() == Some("0") {
+            return Err(anyhow!(
+                "GitHub 检查更新已达限流上限（未登录每小时 60 次）{}",
+                rate_limit_retry_hint(reset)
+            ));
+        }
+        return Err(anyhow!(
+            "检查更新失败: status={} body={}",
+            code,
+            text.trim()
+        ));
+    }
+    let payload: Value = serde_json::from_str(&text)?;
+    payload
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty())
+        .ok_or_else(|| anyhow!("GitHub 未返回 tag_name"))
+}
+
+fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+}
+
+/// Turn an `x-ratelimit-reset` epoch into a "retry in ~N minutes" hint.
+fn rate_limit_retry_hint(reset_epoch: Option<i64>) -> String {
+    let Some(reset) = reset_epoch else {
+        return "，请稍后重试".to_string();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    let minutes = ((reset - now) + 59) / 60; // round up
+    if minutes > 1 {
+        format!("，请约 {minutes} 分钟后重试")
+    } else {
+        "，请稍后重试".to_string()
+    }
+}
+
 /// Remove `uid` from the auth state (including a matching pending login),
 /// persist the change, and delete the account's cache directory under `mit_dir`.
 /// Returns the updated, persisted [`AuthState`].

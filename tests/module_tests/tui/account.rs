@@ -76,6 +76,9 @@ fn push_message_dialog_shows_cursor_and_moves_with_left_right() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -171,6 +174,9 @@ fn push_message_dialog_submits_text_for_selected_account_uid() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -250,6 +256,9 @@ fn escaping_push_message_dialog_restores_previous_menu_selection() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -377,6 +386,9 @@ fn push_message_action_opens_input_dialog() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -445,6 +457,9 @@ fn push_message_cursor_row_stays_stable_when_typing_first_char() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -511,6 +526,9 @@ fn selected_push_message_textarea_text_uses_selection_background() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     super::clear_selection_state();
@@ -639,6 +657,9 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -715,6 +736,9 @@ fn account_action_menu_mouse_wheel_changes_selected_item() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let area = ratatui::layout::Rect::new(0, 0, 80, 24);
     let popup = super::centered_rect(48, 34, area);
@@ -807,6 +831,9 @@ fn clicking_selected_account_action_executes_it() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let area = ratatui::layout::Rect::new(0, 0, 80, 24);
     let popup = super::centered_rect(48, 34, area);

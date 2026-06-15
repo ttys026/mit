@@ -210,6 +210,9 @@ fn dragging_beyond_last_log_still_copies_all_logs() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let _guard = env_guard();
@@ -354,6 +357,9 @@ fn dragging_logs_text_autocopies_selection() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let _guard = env_guard();

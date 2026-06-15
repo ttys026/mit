@@ -149,6 +149,9 @@ fn add_account_port_conflict_shows_error_dialog_without_quitting_tui() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -276,6 +279,9 @@ fn process_auth_flow_completion_closes_reauth_dialog() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.auth_flow_tx
@@ -338,6 +344,9 @@ fn failed_auth_flow_shows_port_8000_hint_in_reauth_dialog() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.auth_flow_tx

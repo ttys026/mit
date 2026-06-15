@@ -289,6 +289,9 @@ impl TuiApp {
                 AccountActionDialog::Reauth { .. } => None,
                 AccountActionDialog::PushMessage { .. } => None,
                 AccountActionDialog::SettingsConfirm { .. } => None,
+                AccountActionDialog::UpdateAvailable { .. }
+                | AccountActionDialog::UpdateRunning { .. }
+                | AccountActionDialog::UpdateFinished { .. } => None,
             })
             .ok_or_else(|| anyhow!("账号操作菜单未打开"))?;
         let uid = self.current_uid().unwrap_or("-").to_string();

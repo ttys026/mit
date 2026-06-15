@@ -102,6 +102,9 @@ fn mouse_click_is_ignored_while_prop_editing() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_mouse(
@@ -163,6 +166,9 @@ fn number_shortcuts_switch_tabs() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -282,6 +288,9 @@ fn clicking_prop_edit_textarea_moves_cursor_to_clicked_character() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -490,6 +499,9 @@ fn writable_bool_prop_enters_selector_editor_before_execution() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -603,6 +615,9 @@ fn writable_bool_prop_selector_highlights_current_option_in_green() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -717,6 +732,9 @@ fn writable_enum_prop_enters_selector_editor_before_execution() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -831,6 +849,9 @@ fn clicking_writable_bool_prop_selector_option_updates_selection() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -950,6 +971,9 @@ fn prop_edit_mode_moves_cursor_with_left_right() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -1121,6 +1145,9 @@ fn prop_dialog_number_shortcuts_switch_tabs() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -1275,6 +1302,9 @@ fn draw_property_dialog_shows_writable_and_read_only_sections() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1376,6 +1406,9 @@ fn prop_dialog_number_shortcuts_respect_hidden_actions_tab() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(

@@ -131,6 +131,9 @@ fn action_param_edit_supports_tab_and_click_focus_switch() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -252,6 +255,9 @@ fn action_param_textarea_row_focus_updates_cursor_and_input() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -370,6 +376,9 @@ fn clicking_action_param_textarea_moves_cursor_to_clicked_character() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -486,6 +495,9 @@ fn action_param_edit_mode_shows_action_title_not_property_title() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -602,6 +614,9 @@ fn action_bool_param_uses_selector_editor() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -730,6 +745,9 @@ fn action_enum_param_uses_selector_editor() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -848,6 +866,9 @@ fn action_bool_param_without_readable_prop_still_uses_selector_editor() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -965,6 +986,9 @@ fn action_enum_param_without_readable_prop_still_uses_selector_editor() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -1090,6 +1114,9 @@ fn action_enum_param_selector_highlights_current_option_in_green() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -1211,6 +1238,9 @@ fn clicking_action_enum_param_selector_option_updates_selection() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -1358,6 +1388,9 @@ fn clicking_action_editor_cli_command_does_not_copy_on_single_click() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1490,6 +1523,9 @@ fn action_param_textarea_refocus_moves_cursor_to_end() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -1620,6 +1656,9 @@ fn dragging_action_editor_cli_command_copies_preview_and_shows_badge() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1771,6 +1810,9 @@ fn action_param_textarea_grows_height_when_value_wraps() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();

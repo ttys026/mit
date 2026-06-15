@@ -92,6 +92,9 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(

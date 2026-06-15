@@ -185,11 +185,6 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             frame.render_stateful_widget(List::new(items), list_area, &mut app.device_list_state);
         }
         3 => {
-            let selected = Some(
-                app.settings_selected_index()
-                    .min(SETTINGS_ITEM_COUNT.saturating_sub(1)),
-            );
-            app.device_list_state.select(selected);
             let [header_area, list_area] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -203,9 +198,28 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 Language::Chinese => "语言 / Language: 中文",
                 Language::English => "Language / 语言: English",
             };
-            let rows = [
+            // Combined item: shows the running version and checks for updates on Enter.
+            let version_label = {
+                let prefix = lang_str(app.language, "当前版本", "Current Version");
+                let separator = lang_str(app.language, "：", ": ");
+                let status = app.update_check_status.clone().unwrap_or_else(|| {
+                    lang_str(app.language, "回车检查更新", "press Enter to check for updates")
+                        .to_string()
+                });
+                let (open, close) = match app.language {
+                    Language::Chinese => ("（", "）"),
+                    Language::English => (" (", ")"),
+                };
+                format!(
+                    "{prefix}{separator}v{}{open}{status}{close}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            };
+            let action_labels = [
                 lang_label.to_string(),
                 auto_subscribe_device_status_label(app.language, app.auto_subscribe_device_status),
+                version_label,
+                lang_str(app.language, "在 GitHub 查看", "View on GitHub").to_string(),
                 lang_str(
                     app.language,
                     "重置设备缓存（重新同步设备）",
@@ -220,17 +234,22 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 .to_string(),
             ];
             let selected_idx = app.settings_selected_index();
-            let items = rows
-                .iter()
-                .enumerate()
-                .map(|(idx, row)| {
-                    let mut item = ListItem::new(row.clone());
-                    if idx == selected_idx {
-                        item = item.style(active_row_style());
+            app.device_list_state
+                .select(Some(settings_row_for_action(selected_idx)));
+            let items: Vec<ListItem> = settings_rows()
+                .into_iter()
+                .map(|row| match row {
+                    SettingsRow::Separator => ListItem::new("─".repeat(list_area.width as usize))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    SettingsRow::Action(action_idx) => {
+                        let mut item = ListItem::new(action_labels[action_idx].clone());
+                        if action_idx == selected_idx {
+                            item = item.style(active_row_style());
+                        }
+                        item
                     }
-                    item
                 })
-                .collect::<Vec<_>>();
+                .collect();
             frame.render_stateful_widget(List::new(items), list_area, &mut app.device_list_state);
         }
         _ => {
@@ -459,6 +478,79 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                             Block::default()
                                 .borders(top_bottom_borders())
                                 .title(lang_str(app.language, "确认操作", "Confirm Action")),
+                        )
+                        .wrap(Wrap { trim: true }),
+                    popup,
+                );
+            }
+            AccountActionDialog::UpdateAvailable { latest } => {
+                let popup = centered_rect(60, 30, frame.area());
+                frame.render_widget(Clear, popup);
+                let body = [
+                    format!("{}: {latest}", lang_str(app.language, "发现新版本", "New version")),
+                    format!(
+                        "{}: v{}",
+                        lang_str(app.language, "当前版本", "Current"),
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    String::new(),
+                    lang_str(
+                        app.language,
+                        "Enter 立即升级 / Esc 取消",
+                        "Enter to update now / Esc to cancel",
+                    )
+                    .to_string(),
+                ];
+                frame.render_widget(
+                    Paragraph::new(body.join("\n"))
+                        .block(
+                            Block::default()
+                                .borders(all_borders())
+                                .title(lang_str(app.language, "更新", "Update")),
+                        )
+                        .wrap(Wrap { trim: true }),
+                    popup,
+                );
+            }
+            AccountActionDialog::UpdateRunning { latest, lines, .. } => {
+                let popup = centered_rect(72, 50, frame.area());
+                frame.render_widget(Clear, popup);
+                let mut body = vec![
+                    format!(
+                        "{} {latest}…",
+                        lang_str(app.language, "正在升级到", "Updating to")
+                    ),
+                    indeterminate_bar(app.boot_spinner_index, 28),
+                    String::new(),
+                ];
+                body.extend(lines.iter().cloned());
+                frame.render_widget(
+                    Paragraph::new(body.join("\n"))
+                        .block(
+                            Block::default()
+                                .borders(all_borders())
+                                .title(lang_str(app.language, "正在升级", "Updating")),
+                        )
+                        .wrap(Wrap { trim: true }),
+                    popup,
+                );
+            }
+            AccountActionDialog::UpdateFinished { success, message } => {
+                let popup = centered_rect(60, 30, frame.area());
+                frame.render_widget(Clear, popup);
+                let icon = if *success { "✅" } else { "❌" };
+                let hint = if *success {
+                    lang_str(app.language, "正在重启…", "restarting…")
+                } else {
+                    lang_str(app.language, "按 Esc 关闭", "Press Esc to close")
+                };
+                let body = [format!("{icon} {message}"), String::new(), hint.to_string()];
+                frame.render_widget(
+                    Paragraph::new(body.join("\n"))
+                        .block(
+                            Block::default()
+                                .borders(top_bottom_borders())
+                                .title(lang_str(app.language, "升级结果", "Update Result")),
                         )
                         .wrap(Wrap { trim: true }),
                     popup,
@@ -765,4 +857,24 @@ pub(in crate::tui) fn core_color_to_ratatui(color: ratatui_core::style::Color) -
         ratatui_core::style::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
         ratatui_core::style::Color::Indexed(n) => Color::Indexed(n),
     }
+}
+
+/// A bouncing indeterminate progress bar, e.g. `[░░▮▮▮▮░░░░░░]`, animated by
+/// `frame_index` (which advances each render frame while an upgrade runs).
+fn indeterminate_bar(frame_index: usize, width: usize) -> String {
+    let width = width.max(4);
+    let block = (width / 5).max(3);
+    let span = width - block;
+    let cycle = span * 2;
+    let phase = if cycle == 0 { 0 } else { frame_index % cycle };
+    let pos = if phase <= span { phase } else { cycle - phase };
+    let mut bar = String::with_capacity(width);
+    for cell in 0..width {
+        bar.push(if cell >= pos && cell < pos + block {
+            '▮'
+        } else {
+            '░'
+        });
+    }
+    format!("[{bar}]")
 }

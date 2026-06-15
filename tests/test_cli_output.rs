@@ -316,6 +316,7 @@ fn bare_root_uses_chinese_summary_by_default() {
             "- stats：查看设备统计数据（米家统计）",
             "- cache：清理缓存（保留登录）",
             "- reset：重置全部数据（删除 ~/.mit）",
+            "- update：检查并升级到最新版本",
             "- tui：启动全屏 TUI 控制台",
             "",
             "运行 `mit --help` 查看完整帮助。",
@@ -942,4 +943,54 @@ fn write_partial_failure_auth_fixture(home: &std::path::Path) {
 "#,
     )
     .unwrap();
+}
+
+#[test]
+fn update_check_text_reports_newer_version() {
+    let server = MockMicoServer::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["update", "--check"])
+        .env("MIT_GITHUB_API_BASE", server.base_url())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("发现新版本 v9.9.9"), "stdout was: {stdout}");
+}
+
+#[test]
+fn update_json_reports_latest_release() {
+    let server = MockMicoServer::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "update"])
+        .env("MIT_GITHUB_API_BASE", server.base_url())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["type"], "updateCheck");
+    assert_eq!(value["latest"], "v9.9.9");
+    assert_eq!(value["upToDate"], false);
+}
+
+#[test]
+fn update_check_reports_rate_limit_clearly() {
+    let server = MockMicoServer::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["update", "--check"])
+        .env("MIT_GITHUB_API_BASE", format!("{}/ratelimited", server.base_url()))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("限流"), "stderr was: {stderr}");
 }

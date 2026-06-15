@@ -21,7 +21,7 @@ pub use commands::{
 };
 use commands::{
     handle_auth_logout, handle_cache, handle_devices, handle_logs, handle_props, handle_push,
-    handle_reset, handle_stats, handle_tui,
+    handle_reset, handle_stats, handle_tui, handle_update,
 };
 use login::{run_mijia_login, run_xiaomi_login};
 
@@ -56,6 +56,8 @@ pub enum RootCommand {
     Cache(CacheArgs),
     #[command(about = "重置全部数据（删除 ~/.mit）")]
     Reset(ResetArgs),
+    #[command(about = "检查并升级到最新版本")]
+    Update(UpdateArgs),
     #[command(about = "启动全屏 TUI 控制台")]
     Tui(TuiArgs),
 }
@@ -284,6 +286,12 @@ pub struct ResetArgs {
     pub yes: bool,
 }
 
+#[derive(Clone, Debug, Args, Default)]
+pub struct UpdateArgs {
+    #[arg(long, help = "只检查最新版本，不执行升级")]
+    pub check: bool,
+}
+
 fn parse_non_empty_text(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -418,6 +426,7 @@ pub fn run(args: Cli) -> Result<()> {
         Some(RootCommand::Stats(args)) => handle_stats(output_mode, args),
         Some(RootCommand::Cache(args)) => handle_cache(output_mode, args),
         Some(RootCommand::Reset(args)) => handle_reset(output_mode, args),
+        Some(RootCommand::Update(args)) => handle_update(output_mode, args),
         Some(RootCommand::Tui(args)) => handle_tui(output_mode, args),
         None => show_help(output_mode),
     }

@@ -92,6 +92,9 @@ fn clicking_footer_does_not_copy_status_line() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let _guard = env_guard();
@@ -164,6 +167,9 @@ fn footer_leaves_blank_rows_above_and_below_status_text() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -231,6 +237,9 @@ fn selected_footer_keeps_dim_style() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     handle_mouse(
@@ -310,6 +319,9 @@ fn footer_copied_badge_is_bold_and_expires_after_one_second() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let line = super::footer_line(&app, 10_999);
@@ -387,6 +399,9 @@ fn footer_text_matches_requested_status_copy() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     assert_eq!(
@@ -617,6 +632,9 @@ fn clicking_non_operation_footer_text_has_no_effect() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let terminal_area = ratatui::layout::Rect::new(0, 0, 100, 24);
@@ -682,6 +700,9 @@ fn dragging_selected_text_shows_footer_copied_badge() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let _guard = env_guard();

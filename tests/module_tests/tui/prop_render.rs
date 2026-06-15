@@ -157,6 +157,9 @@ fn opening_prop_dialog_failure_shows_offline_instead_of_quitting() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -275,6 +278,9 @@ fn opening_prop_dialog_uses_device_account_instead_of_selected_account() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -382,6 +388,9 @@ fn devices_tab_enter_opens_prop_dialog_and_p_does_not() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -481,6 +490,9 @@ fn prop_dialog_does_not_force_black_popup_background() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -579,6 +591,9 @@ fn prop_dialog_refresh_starts_background_worker() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.request_prop_dialog_refresh();
@@ -677,6 +692,9 @@ fn prop_dialog_r_key_starts_background_refresh() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_key(
@@ -783,6 +801,9 @@ fn process_prop_dialog_loading_handles_refresh_when_not_loading() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     // Replace channel with one that already has a completed refresh payload.
@@ -939,6 +960,9 @@ fn process_prop_dialog_loading_preserves_selected_index_after_load() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.process_prop_dialog_loading();
@@ -1037,6 +1061,9 @@ fn prop_dialog_is_fullscreen_and_hides_schema_identifiers() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -1156,6 +1183,9 @@ fn prop_dialog_tab_switch_shows_active_subtab_only() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -1729,6 +1759,9 @@ fn clicking_active_prop_dialog_item_executes_it() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_mouse(
@@ -1859,6 +1892,9 @@ fn prop_dialog_actions_tab_renders_action_items() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1920,6 +1956,9 @@ fn draw_does_not_render_command_bar() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2085,6 +2124,9 @@ fn readonly_tab_omits_type_marker_and_sorts_short_to_long() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -2204,6 +2246,9 @@ fn mouse_scroll_moves_selection_inside_prop_dialog() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     handle_mouse(
@@ -2336,6 +2381,9 @@ fn draw_edit_mode_shows_visible_input_cursor() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2436,6 +2484,9 @@ fn draw_edit_mode_wraps_long_input_across_two_lines() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();

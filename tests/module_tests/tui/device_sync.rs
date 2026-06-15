@@ -190,6 +190,9 @@ fn process_background_messages_logs_local_transport_refresh_errors() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     local_transport_tx
@@ -379,6 +382,9 @@ fn process_bootstrap_failure_logs_error_and_keeps_tui_ready() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -463,6 +469,9 @@ fn sync_command_keeps_ui_ready_while_background_sync_runs() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.start_manual_sync();
@@ -554,6 +563,9 @@ fn process_bootstrap_message_applies_refreshed_auth_state() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -653,6 +665,9 @@ fn process_bootstrap_failure_applies_refreshed_auth_state() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -907,6 +922,9 @@ fn devices_tab_r_starts_background_sync() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -973,6 +991,9 @@ fn devices_tab_s_no_longer_starts_background_sync() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let quit = handle_key(
@@ -1089,6 +1110,9 @@ fn start_bootstrap_without_current_account_enters_ready_state() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.start_bootstrap();
@@ -1155,6 +1179,9 @@ fn request_local_transport_refresh_skips_account_after_session_warm() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.request_local_transport_refresh(false);
@@ -1221,6 +1248,9 @@ fn request_local_transport_refresh_force_rewarms_same_account() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.request_local_transport_refresh(true);
@@ -1298,6 +1328,9 @@ fn request_local_transport_refresh_queues_on_account_switch_while_fetching() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.request_local_transport_refresh(false);
@@ -1384,6 +1417,9 @@ fn process_bootstrap_message_marks_app_ready_after_success() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -1474,6 +1510,9 @@ fn process_bootstrap_message_ignores_stale_results_when_not_pending() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -1553,6 +1592,9 @@ fn process_bootstrap_message_ignores_stale_results_for_wrong_generation() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -1635,6 +1677,9 @@ fn process_bootstrap_message_rewarms_local_transport_when_snapshot_missing() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -1720,6 +1765,9 @@ fn request_local_transport_refresh_force_queues_when_fetching() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.request_local_transport_refresh(true);
@@ -1809,6 +1857,9 @@ fn start_bootstrap_creates_local_credentials_snapshot_without_restart() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.start_bootstrap();
@@ -2012,6 +2063,9 @@ fn start_bootstrap_uses_cached_devices_immediately_while_syncing_in_background()
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.start_bootstrap();
@@ -2116,6 +2170,9 @@ fn process_bootstrap_message_preserves_selected_device_did_when_present() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     bootstrap_tx
@@ -2192,6 +2249,9 @@ fn process_background_messages_clears_local_transport_refresh_device_id_on_error
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     local_transport_tx
@@ -2303,6 +2363,9 @@ fn sync_failure_uses_cached_devices_without_quitting() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.start_manual_sync();
@@ -2389,6 +2452,9 @@ fn sync_downloads_missing_specs_and_enriches_cached_devices_file() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     app.start_manual_sync();
@@ -2531,6 +2597,9 @@ fn clicking_refresh_operation_in_footer_triggers_sync() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let terminal_area = ratatui::layout::Rect::new(0, 0, 100, 24);

@@ -724,6 +724,20 @@ fn route(
             "result": true
         })
         .into(),
+        ("GET", path) if path.ends_with("/releases/latest") => {
+            if path.contains("ratelimited") {
+                MockResponse {
+                    status: "403 Forbidden",
+                    body: json!({ "message": "API rate limit exceeded for 1.2.3.4" }),
+                    headers: vec![
+                        ("x-ratelimit-remaining".to_string(), "0".to_string()),
+                        ("x-ratelimit-reset".to_string(), "9999999999".to_string()),
+                    ],
+                }
+            } else {
+                json!({ "tag_name": "v9.9.9" }).into()
+            }
+        }
         _ => json!({
             "code": 404,
             "message": format!("unexpected route: {} {}", request.method, request.path)

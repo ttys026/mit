@@ -1195,6 +1195,9 @@ fn draw_devices_selected_row_uses_reversed_style() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -1260,6 +1263,9 @@ fn draw_devices_scrolls_to_keep_active_row_visible() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
 
@@ -1362,6 +1368,9 @@ fn draw_devices_tab_uses_local_cache_when_device_list_is_empty() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

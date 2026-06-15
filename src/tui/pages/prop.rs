@@ -865,6 +865,10 @@ pub(crate) fn draw_prop_dialog(
                 }
             }
             AccountActionDialog::SettingsConfirm { .. } => {}
+            // Upgrade dialogs are drawn by the main frame, not layered over a prop dialog.
+            AccountActionDialog::UpdateAvailable { .. }
+            | AccountActionDialog::UpdateRunning { .. }
+            | AccountActionDialog::UpdateFinished { .. } => {}
         }
     }
 }

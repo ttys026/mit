@@ -142,6 +142,56 @@ pub(in crate::cli) fn handle_reset(output_mode: OutputMode, args: ResetArgs) -> 
     Ok(())
 }
 
+pub(in crate::cli) fn handle_update(output_mode: OutputMode, args: UpdateArgs) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = crate::actions::latest_release_tag()?;
+    // Release tags are `vX.Y.Z`; compare against the bare cargo version.
+    let up_to_date = latest.trim_start_matches('v') == current;
+
+    match output_mode {
+        OutputMode::Text if up_to_date => println!("✅ 已是最新版本 v{current}"),
+        OutputMode::Text => println!("发现新版本 {latest}（当前 v{current}）"),
+        OutputMode::Json => print_json(&UpdateCheckOutput {
+            kind: "updateCheck",
+            current,
+            latest: latest.as_str(),
+            up_to_date,
+        })?,
+    }
+
+    // `--check`, JSON mode, or already-current: report only, never run the installer.
+    if args.check || up_to_date || output_mode == OutputMode::Json {
+        return Ok(());
+    }
+
+    println!("正在通过安装脚本升级…");
+    run_install_script()?;
+    println!("✅ 升级完成，请重新运行 mit 验证版本。");
+    Ok(())
+}
+
+/// Shell out to the project's install script to upgrade in place.
+#[cfg(not(target_os = "windows"))]
+fn run_install_script() -> Result<()> {
+    let command = format!("curl -sSfL {} | sh", crate::actions::install_script_url());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .status()?;
+    if !status.success() {
+        bail!("安装脚本执行失败（退出码 {:?}）", status.code());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_install_script() -> Result<()> {
+    bail!(
+        "Windows 暂不支持自动升级，请访问 {} 手动下载最新版本",
+        crate::actions::github_home_url()
+    );
+}
+
 pub(in crate::cli) fn handle_devices(output_mode: OutputMode, args: DevicesArgs) -> Result<()> {
     let Some(command) = args.command else {
         return show_subcommand_help(output_mode, "devices");
@@ -337,6 +387,16 @@ struct CacheCleanOutput {
 struct ResetOutput {
     #[serde(rename = "type")]
     kind: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckOutput<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    current: &'a str,
+    latest: &'a str,
+    up_to_date: bool,
 }
 
 pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> Result<()> {

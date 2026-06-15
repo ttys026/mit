@@ -123,6 +123,33 @@ pub(in crate::tui) fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
                 ],
                 None,
             ),
+            AccountActionDialog::UpdateAvailable { .. } => build_footer_segments(
+                &[
+                    (
+                        lang_str(lang, "Enter: 升级", "Enter: Update"),
+                        FooterOperation::Enter,
+                    ),
+                    (
+                        lang_str(lang, "Esc: 取消", "Esc: Cancel"),
+                        FooterOperation::Back,
+                    ),
+                ],
+                None,
+            ),
+            AccountActionDialog::UpdateRunning { .. } => build_footer_segments(
+                &[(
+                    lang_str(lang, "Esc/q: 取消升级", "Esc/q: Cancel"),
+                    FooterOperation::Back,
+                )],
+                None,
+            ),
+            AccountActionDialog::UpdateFinished { .. } => build_footer_segments(
+                &[(
+                    lang_str(lang, "Esc: 关闭", "Esc: Close"),
+                    FooterOperation::Back,
+                )],
+                None,
+            ),
         };
     }
 

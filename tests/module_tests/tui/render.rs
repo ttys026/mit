@@ -66,6 +66,9 @@ fn draw_shows_loading_splash_while_boot_loading() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -119,6 +122,9 @@ fn copy_status_badge_uses_chinese_text_and_expires_in_one_second() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
 
     let line = super::footer_line(&app, 10_999);
@@ -172,6 +178,9 @@ fn copy_status_badge_uses_blue_style() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let line = super::footer_line(&app, 10_999);
     assert_eq!(line.spans[1].style.fg, Some(Color::Blue));
@@ -264,6 +273,9 @@ fn draw_accounts_selected_row_uses_reversed_style() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
@@ -336,6 +348,9 @@ fn draw_accounts_scrolls_to_keep_active_row_visible() {
         language: Language::Chinese,
         auto_subscribe_device_status: true,
         settings_selected: 0,
+        update_check_rx: None,
+        update_check_status: None,
+        install_rx: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
 

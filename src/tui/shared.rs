@@ -417,6 +417,9 @@ pub(crate) fn selection_snapshot_for_mouse(
             }
             AccountActionDialog::SettingsConfirm { .. } => {}
             AccountActionDialog::Menu { .. } => {}
+            AccountActionDialog::UpdateAvailable { .. }
+            | AccountActionDialog::UpdateRunning { .. }
+            | AccountActionDialog::UpdateFinished { .. } => {}
         }
     }
 

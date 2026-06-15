@@ -124,14 +124,56 @@ pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 4] {
     }
 }
 const STATUS_BAR_MARGIN_TOP: u16 = 1;
-const SETTINGS_ITEM_COUNT: usize = 4;
+const SETTINGS_ITEM_COUNT: usize = 6;
+/// Action indices that get a divider line drawn immediately before them, splitting
+/// the list into groups: (leading) | toggles | version/links | destructive resets.
+const SETTINGS_SEPARATORS: [usize; 3] = [0, 2, 4];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsAction {
     ToggleLanguage,
     ToggleAutoSubscribeDeviceStatus,
+    VersionAndCheckUpdate,
+    ViewGithub,
     ClearCacheKeepAuth,
     ResetAll,
+}
+
+/// A row in the rendered settings list: a selectable action or a group divider.
+/// Only [`SettingsRow::Action`] rows participate in selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum SettingsRow {
+    Separator,
+    Action(usize),
+}
+
+/// Ordered render rows for the settings list: each action interleaved with the
+/// group dividers from [`SETTINGS_SEPARATORS`] (which includes a leading divider).
+pub(in crate::tui) fn settings_rows() -> Vec<SettingsRow> {
+    let mut rows = Vec::with_capacity(SETTINGS_ITEM_COUNT + SETTINGS_SEPARATORS.len());
+    for action in 0..SETTINGS_ITEM_COUNT {
+        if SETTINGS_SEPARATORS.contains(&action) {
+            rows.push(SettingsRow::Separator);
+        }
+        rows.push(SettingsRow::Action(action));
+    }
+    rows
+}
+
+/// Settings action index at a render-row, or `None` for a padding/divider row.
+pub(in crate::tui) fn settings_action_for_row(row: usize) -> Option<usize> {
+    match settings_rows().get(row) {
+        Some(SettingsRow::Action(action)) => Some(*action),
+        _ => None,
+    }
+}
+
+/// Render-row index for a settings action, accounting for padding and divider rows.
+pub(in crate::tui) fn settings_row_for_action(action: usize) -> usize {
+    settings_rows()
+        .iter()
+        .position(|row| matches!(row, SettingsRow::Action(found) if *found == action))
+        .unwrap_or(action)
 }
 
 pub(in crate::tui) fn lang_str(lang: Language, zh: &'static str, en: &'static str) -> &'static str {
@@ -170,6 +212,12 @@ fn readonly_prop_detail_command(dialog: &PropDialog) -> Option<String> {
 struct LocalTransportRefreshMessage {
     generation: u64,
     error: Option<String>,
+}
+
+/// Result of a background GitHub "check update" request: `Ok(tag)` is the latest
+/// release tag (e.g. `v1.2.0`), `Err` is a human-readable failure message.
+struct UpdateCheckMessage {
+    latest: std::result::Result<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,7 +278,36 @@ pub fn run(default_uid: Option<&str>) -> Result<()> {
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.backend_mut().execute(DisableMouseCapture)?;
     terminal.show_cursor()?;
+
+    // After a successful in-app upgrade, relaunch into the freshly installed binary.
+    if result.is_ok()
+        && matches!(
+            app.account_action_dialog,
+            Some(AccountActionDialog::UpdateFinished { success: true, .. })
+        )
+    {
+        return restart_into_new_binary();
+    }
     result
+}
+
+/// Replace the current process with a fresh invocation of the (just-upgraded)
+/// binary, preserving the original arguments.
+fn restart_into_new_binary() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    println!("正在重启 mit…");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // `exec` only returns if it fails to replace the process image.
+        Err(std::process::Command::new(exe).args(args).exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(exe).args(args).spawn()?;
+        std::process::exit(0);
+    }
 }
 
 fn run_loop(
@@ -245,11 +322,27 @@ fn run_loop(
         if boot_was_loading && !matches!(app.boot_state, BootState::Loading) {
             drain_pending_input_events()?;
         }
-        if matches!(app.boot_state, BootState::Loading) {
+        if matches!(app.boot_state, BootState::Loading)
+            || matches!(
+                app.account_action_dialog,
+                Some(AccountActionDialog::UpdateRunning { .. })
+            )
+        {
+            // Advance the spinner/indeterminate progress bar each frame.
             app.boot_spinner_index = app.boot_spinner_index.wrapping_add(1);
         }
 
         terminal.draw(|frame| draw(frame, app))?;
+
+        // A successful upgrade replaced the binary on disk; show the confirmation
+        // briefly, then exit the loop so `run` can relaunch into the new version.
+        if matches!(
+            app.account_action_dialog,
+            Some(AccountActionDialog::UpdateFinished { success: true, .. })
+        ) {
+            thread::sleep(Duration::from_millis(900));
+            return Ok(());
+        }
 
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -322,6 +415,12 @@ struct TuiApp {
     language: Language,
     auto_subscribe_device_status: bool,
     settings_selected: usize,
+    /// Receiver for an in-flight background "check update" request, if one is running.
+    update_check_rx: Option<Receiver<UpdateCheckMessage>>,
+    /// Latest "check update" outcome shown next to the Settings item, if any.
+    update_check_status: Option<String>,
+    /// Receiver for output/result of the in-flight in-app upgrade, if one is running.
+    install_rx: Option<Receiver<InstallMessage>>,
 }
 
 impl TuiApp {
@@ -384,6 +483,9 @@ impl TuiApp {
             language: settings.language,
             auto_subscribe_device_status: settings.auto_subscribe_device_status,
             settings_selected: 0,
+            update_check_rx: None,
+            update_check_status: None,
+            install_rx: None,
         })
     }
 
@@ -655,6 +757,29 @@ impl TuiApp {
 
     fn process_background_messages(&mut self) {
         self.process_cloud_mips_messages();
+        let mut update_check_results = Vec::new();
+        if let Some(rx) = &self.update_check_rx {
+            while let Ok(message) = rx.try_recv() {
+                update_check_results.push(message.latest);
+            }
+        }
+        if !update_check_results.is_empty() {
+            // The worker sends exactly one message then exits; stop polling once received.
+            self.update_check_rx = None;
+        }
+        for latest in update_check_results {
+            self.apply_update_check_result(latest);
+        }
+
+        let mut install_messages = Vec::new();
+        if let Some(rx) = &self.install_rx {
+            while let Ok(message) = rx.try_recv() {
+                install_messages.push(message);
+            }
+        }
+        for message in install_messages {
+            self.apply_install_message(message);
+        }
         while let Ok(message) = self.bootstrap_rx.try_recv() {
             match message {
                 BootstrapMessage::Ready {
@@ -951,7 +1076,9 @@ impl TuiApp {
         match self.settings_selected_index() {
             0 => SettingsAction::ToggleLanguage,
             1 => SettingsAction::ToggleAutoSubscribeDeviceStatus,
-            2 => SettingsAction::ClearCacheKeepAuth,
+            2 => SettingsAction::VersionAndCheckUpdate,
+            3 => SettingsAction::ViewGithub,
+            4 => SettingsAction::ClearCacheKeepAuth,
             _ => SettingsAction::ResetAll,
         }
     }
@@ -967,6 +1094,14 @@ impl TuiApp {
         match action {
             SettingsAction::ClearCacheKeepAuth => self.purge_devices_cache_keep_auth(),
             SettingsAction::ResetAll => self.reset_all_settings(),
+            SettingsAction::VersionAndCheckUpdate => {
+                self.start_update_check();
+                Ok(())
+            }
+            SettingsAction::ViewGithub => {
+                self.open_github_page(&crate::actions::github_home_url());
+                Ok(())
+            }
             SettingsAction::ToggleLanguage => {
                 self.language = match self.language {
                     Language::Chinese => Language::English,
@@ -1025,13 +1160,131 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Open a GitHub page in the browser.
+    #[cfg(not(test))]
+    fn open_github_page(&mut self, url: &str) {
+        match open_url_in_browser(url) {
+            Ok(()) => self.log(format!("已在浏览器打开 GitHub 页面：{url}")),
+            Err(error) => self.log(format!("打开 GitHub 页面失败：{error}")),
+        }
+    }
+
+    /// Test stub: never launch a real browser, just record the intent.
+    #[cfg(test)]
+    fn open_github_page(&mut self, url: &str) {
+        self.log(format!("已在浏览器打开 GitHub 页面：{url}"));
+    }
+
+    /// Kick off a background GitHub release lookup; the result is applied in
+    /// [`Self::process_background_messages`] so the event loop never blocks on it.
+    fn start_update_check(&mut self) {
+        self.update_check_status =
+            Some(lang_str(self.language, "检查中…", "Checking…").to_string());
+        self.log(lang_str(self.language, "正在检查更新…", "Checking for updates…").to_string());
+        let (tx, rx) = mpsc::channel();
+        self.update_check_rx = Some(rx);
+        thread::spawn(move || {
+            let latest = crate::actions::latest_release_tag().map_err(|error| error.to_string());
+            let _ = tx.send(UpdateCheckMessage { latest });
+        });
+    }
+
+    fn apply_update_check_result(&mut self, latest: std::result::Result<String, String>) {
+        match latest {
+            Ok(latest) => {
+                let current = env!("CARGO_PKG_VERSION");
+                // Tags are published as `vX.Y.Z`; compare against the bare cargo version.
+                // The version is already shown in the combined label, so the status
+                // here stays terse and only spells out the new version when newer.
+                if latest.trim_start_matches('v') == current {
+                    self.update_check_status =
+                        Some(lang_str(self.language, "已是最新", "up to date").to_string());
+                    self.log(format!("检查更新：已是最新版本（{latest}）"));
+                } else {
+                    self.update_check_status = Some(format!(
+                        "{} {latest}",
+                        lang_str(self.language, "发现新版本", "update available")
+                    ));
+                    self.log(format!("检查更新：发现新版本 {latest}（当前 v{current}）"));
+                    // Offer the in-app upgrade unless another dialog is already open.
+                    if self.account_action_dialog.is_none() {
+                        self.account_action_dialog =
+                            Some(AccountActionDialog::UpdateAvailable { latest });
+                    }
+                }
+            }
+            Err(error) => {
+                // Call out rate limiting specifically; the full reason goes to the log.
+                let rate_limited =
+                    error.contains("限流") || error.to_lowercase().contains("rate limit");
+                let label = if rate_limited {
+                    lang_str(self.language, "检查失败（限流）", "failed (rate limited)")
+                } else {
+                    lang_str(self.language, "检查失败", "check failed")
+                };
+                self.update_check_status = Some(label.to_string());
+                self.log(format!("检查更新失败：{error}"));
+            }
+        }
+    }
+
+    /// Confirm the upgrade: spawn the install script (in its own process group so
+    /// it can be cancelled) and switch the dialog to its running state.
+    fn start_update_install(&mut self, latest: String) {
+        self.log(format!("开始升级到 {latest}…"));
+        let (tx, rx) = mpsc::channel();
+        let pid = spawn_install(tx);
+        self.install_rx = Some(rx);
+        self.account_action_dialog = Some(AccountActionDialog::UpdateRunning {
+            latest,
+            lines: Vec::new(),
+            pid,
+        });
+    }
+
+    /// Cancel an in-flight upgrade: kill the install process group, discard its
+    /// pending result, and close the dialog.
+    fn cancel_update_install(&mut self, pid: Option<u32>) {
+        if let Some(pid) = pid {
+            kill_process_group(pid);
+        }
+        // Drop the receiver so the worker's final message is ignored, not re-shown.
+        self.install_rx = None;
+        self.account_action_dialog = None;
+        self.log("已取消升级".to_string());
+    }
+
+    fn apply_install_message(&mut self, message: InstallMessage) {
+        match message {
+            InstallMessage::Line(line) => {
+                if let Some(AccountActionDialog::UpdateRunning { lines, .. }) =
+                    &mut self.account_action_dialog
+                {
+                    lines.push(line);
+                    // Keep only the most recent lines so the dialog stays compact.
+                    const MAX_LINES: usize = 6;
+                    if lines.len() > MAX_LINES {
+                        lines.drain(0..lines.len() - MAX_LINES);
+                    }
+                }
+            }
+            InstallMessage::Done { success, message } => {
+                self.install_rx = None;
+                self.log(format!("升级结束：{message}"));
+                self.account_action_dialog =
+                    Some(AccountActionDialog::UpdateFinished { success, message });
+            }
+        }
+    }
+
     fn execute_selected_settings_action(&mut self) -> Result<()> {
         let action = self.selected_settings_action();
         match action {
-            SettingsAction::ToggleLanguage | SettingsAction::ToggleAutoSubscribeDeviceStatus => {
-                self.execute_settings_action(action)
-            }
-            _ => {
+            SettingsAction::ToggleLanguage
+            | SettingsAction::ToggleAutoSubscribeDeviceStatus
+            | SettingsAction::VersionAndCheckUpdate
+            | SettingsAction::ViewGithub => self.execute_settings_action(action),
+            SettingsAction::ClearCacheKeepAuth | SettingsAction::ResetAll => {
                 self.account_action_dialog = Some(AccountActionDialog::SettingsConfirm { action });
                 Ok(())
             }
@@ -1362,6 +1615,161 @@ enum AccountActionDialog {
     SettingsConfirm {
         action: SettingsAction,
     },
+    /// A newer release was found; prompt the user to upgrade in place.
+    UpdateAvailable {
+        latest: String,
+    },
+    /// The install script is running; `lines` holds its most recent output and
+    /// `pid` is the install process-group leader so a cancel can signal it.
+    UpdateRunning {
+        latest: String,
+        lines: Vec<String>,
+        pid: Option<u32>,
+    },
+    /// The upgrade finished (or failed); `message` is the outcome shown to the user.
+    UpdateFinished {
+        success: bool,
+        message: String,
+    },
+}
+
+/// A message from the background install thread to the UI: a line of script
+/// output, or the terminal result once the script exits.
+enum InstallMessage {
+    Line(String),
+    Done { success: bool, message: String },
+}
+
+/// Remove ANSI/CSI escape sequences (and stray control bytes like `\r`) from a
+/// line so colored script output renders as plain text in the TUI dialog.
+pub(in crate::tui) fn strip_ansi(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\u{1b}' => {
+                i += 1;
+                if i < chars.len() && chars[i] == '[' {
+                    i += 1;
+                    // CSI params/intermediates run until a final byte in 0x40..=0x7e.
+                    while i < chars.len() && !('\u{40}'..='\u{7e}').contains(&chars[i]) {
+                        i += 1;
+                    }
+                }
+                i += 1; // skip the final byte (or the lone char after a bare ESC)
+            }
+            ch if ch.is_control() => i += 1,
+            ch => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Spawn the install script in its own process group, streaming each output line
+/// over `tx` and a final [`InstallMessage::Done`] from background threads. Returns
+/// the process-group id so the UI can cancel it. The whole pipeline's stderr is
+/// merged into stdout so the dialog shows everything the script prints.
+#[cfg(not(test))]
+fn spawn_install(tx: Sender<InstallMessage>) -> Option<u32> {
+    use std::io::{BufRead, BufReader};
+    let command = format!(
+        "{{ curl -sSfL {} | sh ; }} 2>&1",
+        crate::actions::install_script_url()
+    );
+    let mut builder = std::process::Command::new("sh");
+    builder
+        .arg("-c")
+        .arg(&command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    // Install over the running binary (the script honours INSTALL_DIR verbatim) so
+    // the post-update restart picks up the new version — including for dev builds,
+    // where current_exe lives under target/ rather than a system bin dir.
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        builder.env("INSTALL_DIR", dir);
+    }
+    // Own process group so a cancel can signal the whole pipeline (curl + sh), not
+    // just the outer shell.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
+    }
+    let mut child = match builder.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = tx.send(InstallMessage::Done {
+                success: false,
+                message: format!("无法启动安装脚本：{error}"),
+            });
+            return None;
+        }
+    };
+    let pid = child.id();
+    // Stream output on its own thread.
+    if let Some(stdout) = child.stdout.take() {
+        let line_tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                // The script prints colored output; strip ANSI so the dialog stays readable.
+                let _ = line_tx.send(InstallMessage::Line(strip_ansi(&line)));
+            }
+        });
+    }
+    // Detect completion via the child's exit status, NOT stdout EOF — a backgrounded
+    // grandchild can hold the pipe open long after the install finishes.
+    thread::spawn(move || {
+        let done = match child.wait() {
+            Ok(status) if status.success() => InstallMessage::Done {
+                success: true,
+                message: "升级完成".to_string(),
+            },
+            Ok(status) => InstallMessage::Done {
+                success: false,
+                message: format!("安装脚本退出码 {:?}", status.code()),
+            },
+            Err(error) => InstallMessage::Done {
+                success: false,
+                message: format!("等待安装脚本失败：{error}"),
+            },
+        };
+        let _ = tx.send(done);
+    });
+    Some(pid)
+}
+
+/// Test stub: never spawn a real installer; simulate a quick successful upgrade.
+#[cfg(test)]
+fn spawn_install(tx: Sender<InstallMessage>) -> Option<u32> {
+    let _ = tx.send(InstallMessage::Line("[test] running install".to_string()));
+    let _ = tx.send(InstallMessage::Done {
+        success: true,
+        message: "升级完成（测试）".to_string(),
+    });
+    None
+}
+
+/// Send `SIGKILL` to an install process group (leader pid == its group id).
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // Safety: a bare `kill(2)`; a negative pid targets the whole process group.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
 }
 
 #[cfg(test)]

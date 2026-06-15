@@ -306,6 +306,28 @@ pub(in crate::tui) fn handle_key(
                 KeyCode::Enter if app.confirm_settings_action()? => return Ok(true),
                 _ => {}
             },
+            Some(AccountActionDialog::UpdateAvailable { latest }) => match key.code {
+                KeyCode::Esc => app.account_action_dialog = None,
+                KeyCode::Enter => app.start_update_install(latest),
+                _ => {}
+            },
+            // While the installer runs, Esc / q / Ctrl+C cancel the download and close it.
+            Some(AccountActionDialog::UpdateRunning { pid, .. }) => match key.code {
+                KeyCode::Esc => app.cancel_update_install(pid),
+                KeyCode::Char('c') | KeyCode::Char('C')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.cancel_update_install(pid)
+                }
+                KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'q') => {
+                    app.cancel_update_install(pid)
+                }
+                _ => {}
+            },
+            Some(AccountActionDialog::UpdateFinished { .. }) => match key.code {
+                KeyCode::Esc | KeyCode::Enter => app.account_action_dialog = None,
+                _ => {}
+            },
             None => {}
         }
         return Ok(false);
@@ -384,8 +406,11 @@ pub(in crate::tui) fn settings_action_label(
     match action {
         SettingsAction::ClearCacheKeepAuth => lang_str(lang, "重置设备缓存", "Reset Device Cache"),
         SettingsAction::ResetAll => lang_str(lang, "重置全部设置", "Reset All Settings"),
-        SettingsAction::ToggleLanguage | SettingsAction::ToggleAutoSubscribeDeviceStatus => {
-            unreachable!("Toggle settings have no confirm dialog")
+        SettingsAction::ToggleLanguage
+        | SettingsAction::ToggleAutoSubscribeDeviceStatus
+        | SettingsAction::VersionAndCheckUpdate
+        | SettingsAction::ViewGithub => {
+            unreachable!("This settings action has no confirm dialog")
         }
     }
 }
@@ -428,8 +453,11 @@ pub(in crate::tui) fn settings_confirm_lines(
             .to_string(),
             true,
         ),
-        SettingsAction::ToggleLanguage | SettingsAction::ToggleAutoSubscribeDeviceStatus => {
-            unreachable!("Toggle settings have no confirm dialog")
+        SettingsAction::ToggleLanguage
+        | SettingsAction::ToggleAutoSubscribeDeviceStatus
+        | SettingsAction::VersionAndCheckUpdate
+        | SettingsAction::ViewGithub => {
+            unreachable!("This settings action has no confirm dialog")
         }
     };
     let mut lines = vec![
@@ -475,6 +503,10 @@ fn account_action_popup_area(
         AccountActionDialog::PushMessage { .. } if over_prop_dialog => {
             centered_rect(74, 46, terminal_area)
         }
+        AccountActionDialog::UpdateAvailable { .. } => centered_rect(60, 30, terminal_area),
+        AccountActionDialog::UpdateRunning { .. } | AccountActionDialog::UpdateFinished { .. } => {
+            centered_rect(72, 50, terminal_area)
+        }
         AccountActionDialog::Reauth { .. }
         | AccountActionDialog::PushMessage { .. }
         | AccountActionDialog::SettingsConfirm { .. } => centered_rect(74, 42, terminal_area),
@@ -488,6 +520,10 @@ fn active_click_away_overlay(
     terminal_area: ratatui::layout::Rect,
 ) -> Option<(ClickAwayOverlay, ratatui::layout::Rect)> {
     if let Some(dialog) = app.account_action_dialog.as_ref() {
+        // The upgrade is mid-flight; a stray click outside shouldn't dismiss it.
+        if matches!(dialog, AccountActionDialog::UpdateRunning { .. }) {
+            return None;
+        }
         let area = account_action_popup_area(dialog, app.prop_dialog.is_some(), terminal_area);
         return Some((ClickAwayOverlay::AccountAction, area));
     }
@@ -1066,10 +1102,11 @@ pub(in crate::tui) fn handle_mouse(
                 if !left_click {
                     return Ok(());
                 }
-                let idx = app.device_list_state.offset().saturating_add(clicked_row);
-                if idx >= SETTINGS_ITEM_COUNT {
+                let row = app.device_list_state.offset().saturating_add(clicked_row);
+                // The separator row maps to no action; clicks on it are ignored.
+                let Some(idx) = settings_action_for_row(row) else {
                     return Ok(());
-                }
+                };
                 let selected_before = app.settings_selected_index();
                 app.select_settings_item(idx);
                 if idx == selected_before {
