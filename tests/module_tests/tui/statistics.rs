@@ -74,7 +74,19 @@ fn prop_dialog_statistics_tab_renders_controls_and_bar_chart() {
     );
     assert!(stats_text.contains(&expected_range), "{stats_text}");
     assert!(compact.contains("值↑时间→"), "{stats_text}");
-    assert!(stats_text.contains("01-01"), "{stats_text}");
+    // The x-axis labels render the bucket dates as *local* dates, so the exact day
+    // depends on the machine timezone (e.g. time_end 604799 is Jan 7 in UTC but Jan 8
+    // in UTC+8). Derive the first/last labels with the same helpers production uses so
+    // the assertions stay timezone-independent.
+    let first_label = super::format_statistics_date_label(
+        super::timestamp_to_local_date(0).expect("epoch local date"),
+        super::StatisticsPeriod::Week,
+    );
+    let last_label = super::format_statistics_date_label(
+        super::timestamp_to_local_date(604_799).expect("range-end local date"),
+        super::StatisticsPeriod::Week,
+    );
+    assert!(stats_text.contains(&first_label), "{stats_text}");
     let chart_area = ratatui::layout::Rect::new(0, 6, 120, 18);
     // Y axis upper bound is max value * 1.1 (2.5 * 1.1 = 2.75).
     assert!(stats_text.contains("2.75"), "{stats_text}");
@@ -86,10 +98,10 @@ fn prop_dialog_statistics_tab_renders_controls_and_bar_chart() {
     let first_bar_position = terminal_find_substring_position_in_area(&terminal, "█", chart_area)
         .expect("bar rendered");
     let first_time_position =
-        terminal_find_substring_position_in_area(&terminal, "01-01", chart_area)
+        terminal_find_substring_position_in_area(&terminal, first_label.as_str(), chart_area)
             .expect("first chart time label rendered");
     let last_time_position =
-        terminal_find_substring_position_in_area(&terminal, "01-08", chart_area)
+        terminal_find_substring_position_in_area(&terminal, last_label.as_str(), chart_area)
             .expect("last chart time label rendered");
     // Bars and labels are left-aligned: the first bar sits in the left portion
     // of the chart, just right of the Y axis, not centered.

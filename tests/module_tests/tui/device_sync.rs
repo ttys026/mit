@@ -49,9 +49,9 @@ fn stale_keypress_uses_recent_pingresp_as_mqtt_response_timer() {
             key: "test-runtime".to_string(),
             _handles: Vec::new(),
             rx,
-            last_mqtt_response_at: Some(now - Duration::from_secs(8)),
-            last_ping_req_at: Some(now - Duration::from_secs(9)),
-            last_ping_resp_at: Some(now - Duration::from_secs(8)),
+            last_mqtt_response_at: Some(now.checked_sub(Duration::from_secs(8)).unwrap_or(now)),
+            last_ping_req_at: Some(now.checked_sub(Duration::from_secs(9)).unwrap_or(now)),
+            last_ping_resp_at: Some(now.checked_sub(Duration::from_secs(8)).unwrap_or(now)),
         });
     }
 
@@ -121,9 +121,9 @@ fn stale_keypress_refreshes_open_prop_editor() {
             key: "test-runtime".to_string(),
             _handles: Vec::new(),
             rx,
-            last_mqtt_response_at: Some(now - Duration::from_secs(301)),
-            last_ping_req_at: Some(now - Duration::from_secs(301)),
-            last_ping_resp_at: Some(now - Duration::from_secs(301)),
+            last_mqtt_response_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
+            last_ping_req_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
+            last_ping_resp_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
         });
     }
 
@@ -304,9 +304,9 @@ fn stale_mouse_click_inside_prop_dialog_does_not_refresh() {
             key: "test-runtime".to_string(),
             _handles: Vec::new(),
             rx,
-            last_mqtt_response_at: Some(now - Duration::from_secs(301)),
-            last_ping_req_at: Some(now - Duration::from_secs(301)),
-            last_ping_resp_at: Some(now - Duration::from_secs(301)),
+            last_mqtt_response_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
+            last_ping_req_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
+            last_ping_resp_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
         });
     }
 

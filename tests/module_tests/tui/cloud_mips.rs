@@ -21,9 +21,9 @@ fn stale_keypress_skips_heartbeat_when_mips_disabled() {
             key: "test-runtime".to_string(),
             _handles: Vec::new(),
             rx,
-            last_mqtt_response_at: Some(now - Duration::from_secs(301)),
-            last_ping_req_at: Some(now - Duration::from_secs(301)),
-            last_ping_resp_at: Some(now - Duration::from_secs(301)),
+            last_mqtt_response_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
+            last_ping_req_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
+            last_ping_resp_at: Some(now.checked_sub(Duration::from_secs(301)).unwrap_or(now)),
         });
     }
 
