@@ -557,27 +557,37 @@ pub(crate) fn draw_prop_dialog(
                         );
                     }
                 }
-                match statistics_chart_points(dialog, app.language) {
-                    Ok(points) => {
-                        let selected_bar = dialog.statistics_selected_bar;
-                        let key_label = statistics_current_key_label(dialog, app.language);
-                        draw_statistics_bar_chart(
-                            frame,
-                            body_area,
-                            points.as_slice(),
-                            style,
-                            app.language,
-                            selected_bar,
-                            key_label.as_str(),
-                        );
-                    }
-                    Err(message) => {
-                        frame.render_widget(
-                            Paragraph::new(message)
-                                .wrap(Wrap { trim: false })
-                                .style(style),
-                            body_area,
-                        );
+                if prop_dialog_active_tab_is_loading(dialog) {
+                    let center_y = body_area.y + body_area.height / 2;
+                    let center_area = Rect::new(body_area.x, center_y, body_area.width, 1);
+                    frame.render_widget(
+                        Paragraph::new(lang_str(app.language, "加载中...", "Loading..."))
+                            .alignment(ratatui::layout::Alignment::Center),
+                        center_area,
+                    );
+                } else {
+                    match statistics_chart_points(dialog, app.language) {
+                        Ok(points) => {
+                            let selected_bar = dialog.statistics_selected_bar;
+                            let key_label = statistics_current_key_label(dialog, app.language);
+                            draw_statistics_bar_chart(
+                                frame,
+                                body_area,
+                                points.as_slice(),
+                                style,
+                                app.language,
+                                selected_bar,
+                                key_label.as_str(),
+                            );
+                        }
+                        Err(message) => {
+                            frame.render_widget(
+                                Paragraph::new(message)
+                                    .wrap(Wrap { trim: false })
+                                    .style(style),
+                                body_area,
+                            );
+                        }
                     }
                 }
                 if let Some(selector_area) = selector_area {
@@ -736,7 +746,7 @@ pub(crate) fn draw_prop_dialog(
         match dialog {
             AccountActionDialog::Menu { selected } => {
                 let popup = centered_rect(48, 34, frame.area());
-                let items = ["推送消息", "重新登录(小米)", "重新登录(米家)", "登出"]
+                let items = ["推送消息", "重新登录(小米: 设备列表/设备操作)", "重新登录(米家: 操作记录/能耗统计)", "登出"]
                     .iter()
                     .enumerate()
                     .map(|(idx, item)| {
@@ -985,9 +995,6 @@ fn draw_statistics_bar_chart(
 
     let time_label_visible =
         chart_time_label_visibility(points, layout.visible_count, layout.slot_width as usize);
-
-    let plot_width = layout.plot_right.saturating_sub(layout.first_bar_x) as usize;
-    let x_axis_line = "─".repeat(plot_width);
     let bar_text = "█".repeat(layout.bar_width as usize);
     let zero_bar_text = "▁".repeat(layout.bar_width as usize);
 
@@ -998,12 +1005,15 @@ fn draw_statistics_bar_chart(
             buffer.set_stringn(layout.axis_col, row, "│", 1, axis_style);
         }
         buffer.set_stringn(layout.axis_col, layout.axis_row, "└", 1, axis_style);
-        // X axis baseline.
+        // X axis baseline: start at axis_col+1 so it connects to the └ corner.
+        let x_axis_start = layout.axis_col.saturating_add(1);
+        let x_axis_width = layout.plot_right.saturating_sub(x_axis_start) as usize;
+        let x_axis_full = "─".repeat(x_axis_width);
         buffer.set_stringn(
-            layout.first_bar_x,
+            x_axis_start,
             layout.axis_row,
-            x_axis_line.as_str(),
-            plot_width,
+            x_axis_full.as_str(),
+            x_axis_width,
             axis_style,
         );
         for i in 0..layout.y_tick_count {

@@ -654,8 +654,8 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
     let text = terminal_text(&terminal);
     let compact = text.replace(' ', "");
     assert!(compact.contains("推送消息"), "{text}");
-    assert!(compact.contains("重新登录(小米)"), "{text}");
-    assert!(compact.contains("重新登录(米家)"), "{text}");
+    assert!(compact.contains("重新登录(小米:设备列表/设备操作)"), "{text}");
+    assert!(compact.contains("重新登录(米家:操作记录/能耗统计)"), "{text}");
     assert!(compact.contains("登出"), "{text}");
     assert!(!text.contains("view-device"));
 }

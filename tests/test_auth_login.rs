@@ -266,10 +266,6 @@ fn auth_login_mijia_subcommand_shows_qr_and_saves_mijia_auth() {
         "qr response: {qr_response}"
     );
     assert!(
-        qr_response.contains("href=\"") && qr_response.contains("/mijia/qr-login"),
-        "qr response: {qr_response}"
-    );
-    assert!(
         qr_response.contains("/mijia_login_status")
             && qr_response.contains("授权成功，可以关闭此页面")
             && qr_response.contains("本地登录服务已停止或超时"),

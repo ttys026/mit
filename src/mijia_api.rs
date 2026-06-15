@@ -512,7 +512,6 @@ pub fn mijia_qr_html(session: &MijiaLoginSession, status_path: &str) -> String {
 <p id=\"mit-login-status\">请使用米家 App 扫描二维码完成登录。</p>\
 <p id=\"mit-login-qr\"><img src=\"{}\" alt=\"米家登录二维码\"></p>\
 <p id=\"mit-login-note\">扫码确认后保持此页面和终端打开，mit 会自动保存米家登录凭据。</p>\
-<p id=\"mit-login-link\">如果二维码无法显示，可以<a href=\"{}\">打开登录页面</a>。<br><code>{}</code></p>\
 <script>(function(){{\
 var statusUrl={};\
 var startedAt=Date.now();\
@@ -521,8 +520,7 @@ var timeoutMs=130000;\
 var statusEl=document.getElementById('mit-login-status');\
 var qrEl=document.getElementById('mit-login-qr');\
 var noteEl=document.getElementById('mit-login-note');\
-var linkEl=document.getElementById('mit-login-link');\
-function hideLoginDetails(){{if(qrEl)qrEl.style.display='none';if(noteEl)noteEl.style.display='none';if(linkEl)linkEl.style.display='none';}}\
+function hideLoginDetails(){{if(qrEl)qrEl.style.display='none';if(noteEl)noteEl.style.display='none';}}\
 function showSuccess(message){{hideLoginDetails();statusEl.className='';statusEl.textContent=message||'授权成功，可以关闭此页面。';}}\
 function showError(message){{hideLoginDetails();statusEl.className='error';statusEl.textContent=message;}}\
 function timedOut(){{return Date.now()-startedAt>timeoutMs;}}\
@@ -544,8 +542,6 @@ setTimeout(poll,1000);\
 setTimeout(poll,1000);\
 }})();</script>",
         escape_html(session.qr_url.as_str()),
-        escape_html(session.login_url.as_str()),
-        escape_html(session.login_url.as_str()),
         status_path_json
     )
 }

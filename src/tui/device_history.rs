@@ -1603,7 +1603,7 @@ pub(in crate::tui) fn statistics_chart_layout(
     }
 
     let axis_col = padded.x.saturating_add(y_label_width);
-    let plot_left = axis_col.saturating_add(1);
+    let plot_left = axis_col.saturating_add(2);
     let plot_right = padded.x.saturating_add(padded.width);
     if plot_right <= plot_left {
         return None;

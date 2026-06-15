@@ -310,8 +310,8 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 let popup = centered_rect(48, 34, frame.area());
                 let items = [
                     lang_str(app.language, "推送消息", "Push Message"),
-                    lang_str(app.language, "重新登录(小米)", "Relogin (Xiaomi)"),
-                    lang_str(app.language, "重新登录(米家)", "Relogin (Mijia)"),
+                    lang_str(app.language, "重新登录(小米: 设备列表/设备操作)", "Relogin (Xiaomi: Device List / Device Control)"),
+                    lang_str(app.language, "重新登录(米家: 操作记录/能耗统计)", "Relogin (Mijia: Action History / Energy Stats)"),
                     lang_str(app.language, "退出登录", "Logout"),
                 ]
                 .iter()
