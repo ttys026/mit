@@ -34,6 +34,8 @@ use login::{run_mijia_login, run_xiaomi_login};
 pub struct Cli {
     #[arg(long, global = true, help = "使用 JSON 格式输出")]
     pub json: bool,
+    #[arg(long, global = true, help = "输出诊断日志（含 LAN/云通道选择原因）")]
+    pub verbose: bool,
     #[command(subcommand)]
     pub command: Option<RootCommand>,
 }
@@ -416,6 +418,7 @@ fn arg_expects_value(arg: &clap::Arg) -> bool {
 }
 
 pub fn run(args: Cli) -> Result<()> {
+    crate::mico_api::set_verbose_logging(args.verbose);
     let output_mode = OutputMode::from_json_flag(args.json);
     match args.command {
         Some(RootCommand::Auth(args)) => handle_auth(output_mode, args),

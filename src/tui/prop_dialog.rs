@@ -668,13 +668,17 @@ pub(in crate::tui) fn prop_dialog_title(dialog: &PropDialog, lang: Language) -> 
     } else {
         dialog.device_name.as_str()
     };
+    // Detail line: show how this device is currently reached (LAN vs Cloud).
+    let channel = crate::mico_api::device_link_channel(&dialog.device_did);
+    let base = format!(
+        "{dialog_title} · {} {}",
+        lang_str(lang, "通道", "via"),
+        channel.as_str()
+    );
     if prop_dialog_active_tab_is_loading(dialog) {
-        format!(
-            "{dialog_title} ({})",
-            lang_str(lang, "刷新中...", "Loading...")
-        )
+        format!("{base} ({})", lang_str(lang, "刷新中...", "Loading..."))
     } else {
-        dialog_title.to_string()
+        base
     }
 }
 
@@ -1669,6 +1673,9 @@ impl TuiApp {
                 let has_missing = cached_values.iter().any(|v| v.is_none());
                 if has_missing {
                     let client = MicoClient::new(&account)?;
+                    // Enable the LAN fast path for this device (reuses the cached
+                    // snapshot cred, probes ~200ms) before reading.
+                    let _ = client.prime_local_credential_for(&did);
                     let raw_values = client.get_props_batch(&query_refs)?;
                     let list = raw_values
                         .as_array()
@@ -1890,6 +1897,9 @@ impl TuiApp {
                         .map(|(_, siid, piid)| (device_did.as_str(), *siid, *piid))
                         .collect::<Vec<_>>();
                     let client = MicoClient::new(&account)?;
+                    // Re-attempt the LAN fast path on each refresh (R), so a
+                    // device that wasn't ready at startup can still go local.
+                    let _ = client.prime_local_credential_for(&device_did);
                     let values = client.get_props_batch(&query_refs)?;
                     let list = values
                         .as_array()

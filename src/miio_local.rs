@@ -66,7 +66,12 @@ impl MiioUdpClient {
             bail!("miio 响应头长度无效");
         }
         let decrypted = decrypt_payload(&self.token, &response_payload)?;
-        let value: Value = serde_json::from_slice(&decrypted)?;
+        // Some devices append a redundant trailing NUL after the JSON.
+        let mut end = decrypted.len();
+        while end > 0 && decrypted[end - 1] == 0 {
+            end -= 1;
+        }
+        let value: Value = serde_json::from_slice(&decrypted[..end])?;
         if value.get("error").is_some() {
             bail!("miio 返回错误响应: {}", value);
         }
@@ -179,7 +184,7 @@ pub fn encrypt_payload(token: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
     Ok(encrypted.to_vec())
 }
 
-fn decrypt_payload(token: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
+pub fn decrypt_payload(token: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
     let key = md5::compute(token).0;
     let mut iv_src = Vec::with_capacity(32);
     iv_src.extend_from_slice(&key);

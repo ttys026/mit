@@ -218,16 +218,21 @@ impl CallbackServer {
                 }
                 Err(e) => return Err(e.into()),
             };
-            stream.set_nonblocking(false)?;
-            let request = read_http_request(&mut stream)?;
+            let _ = stream.set_nonblocking(false);
+            let request = read_http_request(&mut stream);
+            if request.trim().is_empty() {
+                // Speculative/pre-connect socket, or a peer that closed before
+                // sending anything. Ignore it and keep waiting for the callback.
+                continue;
+            }
             let outcome = match parse_http_request_line(&request) {
                 Ok(request_line) => {
                     if request_line.method != "GET" {
-                        write_html_response(
+                        let _ = write_html_response(
                             &mut stream,
                             "405 Method Not Allowed",
                             "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>不支持的请求方法</p>",
-                        )?;
+                        );
                         None
                     } else if request_line.path == self.login_entry_path
                         && self.login_entry_path != self.callback_path
@@ -239,14 +244,14 @@ impl CallbackServer {
                         } else {
                             oauth_auth_url.to_string()
                         };
-                        write_redirect_response(&mut stream, "302 Found", &location)?;
+                        let _ = write_redirect_response(&mut stream, "302 Found", &location);
                         None
                     } else if request_line.path != self.callback_path {
-                        write_html_response(
+                        let _ = write_html_response(
                             &mut stream,
                             "404 Not Found",
                             "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>页面不存在</p>",
-                        )?;
+                        );
                         None
                     } else {
                         let callback_input = if request_line.query.is_empty() {
@@ -274,13 +279,15 @@ impl CallbackServer {
                         }
                     }
                 }
-                Err(error) => {
-                    write_html_response(
+                Err(_) => {
+                    // Malformed request from a stray client; respond best-effort
+                    // and keep waiting rather than aborting the login.
+                    let _ = write_html_response(
                         &mut stream,
                         "400 Bad Request",
                         "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>请求格式错误</p>",
-                    )?;
-                    return Err(error);
+                    );
+                    continue;
                 }
             };
 
@@ -291,11 +298,12 @@ impl CallbackServer {
             match outcome {
                 Ok((outcome, response_written)) => {
                     if !response_written {
-                        write_html_response(
+                        // Auth already succeeded; the page write is best-effort.
+                        let _ = write_html_response(
                             &mut stream,
                             "200 OK",
                             "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>授权成功，可以关闭此页面。</p>",
-                        )?;
+                        );
                     }
                     return Ok(outcome);
                 }
@@ -338,57 +346,69 @@ impl CallbackServer {
                 }
                 Err(e) => return Err(e.into()),
             };
-            stream.set_nonblocking(false)?;
-            let request = read_http_request(&mut stream)?;
+            let _ = stream.set_nonblocking(false);
+            let request = read_http_request(&mut stream);
+            if request.trim().is_empty() {
+                // Speculative/pre-connect socket, or a peer that closed before
+                // sending anything. Ignore it and keep serving the login page.
+                continue;
+            }
             let outcome = match parse_http_request_line(&request) {
                 Ok(request_line) => {
                     if request_line.method != "GET" {
-                        write_html_response(
+                        let _ = write_html_response(
                             &mut stream,
                             "405 Method Not Allowed",
                             "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>不支持的请求方法</p>",
-                        )?;
+                        );
                         None
                     } else if request_line.path == self.login_entry_path {
                         if let Some(page) = &login_page {
-                            write_html_response(&mut stream, "200 OK", page.html.as_str())?;
+                            let _ = write_html_response(&mut stream, "200 OK", page.html.as_str());
                         } else {
                             let page = start_mijia_qr_login(auth_state.clone(), None)?;
-                            write_html_response(&mut stream, "200 OK", page.html.as_str())?;
+                            let _ = write_html_response(&mut stream, "200 OK", page.html.as_str());
                             login_page = Some(page);
                         }
                         None
                     } else if request_line.path == MIJIA_LOGIN_STATUS_PATH {
                         match &login_page {
-                            Some(page) => write_mijia_login_status_response(&mut stream, page)?,
+                            // A failed status write (e.g. the poll connection
+                            // closed) is non-fatal; keep waiting for the scan.
+                            Some(page) => {
+                                write_mijia_login_status_response(&mut stream, page)
+                                    .unwrap_or_default()
+                            }
                             None => {
-                                write_json_response(
+                                let _ = write_json_response(
                                     &mut stream,
                                     "200 OK",
                                     &json!({
                                         "status": "pending",
                                         "message": "等待打开米家登录页面"
                                     }),
-                                )?;
+                                );
                                 None
                             }
                         }
                     } else {
-                        write_html_response(
+                        let _ = write_html_response(
                             &mut stream,
                             "404 Not Found",
                             "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>页面不存在</p>",
-                        )?;
+                        );
                         None
                     }
                 }
-                Err(error) => {
-                    write_html_response(
+                Err(_) => {
+                    // Malformed request from a stray client; respond best-effort
+                    // and keep waiting rather than aborting the login.
+                    let _ = write_html_response(
                         &mut stream,
                         "400 Bad Request",
                         "<!doctype html><meta charset=\"utf-8\"><title>mit</title><p>请求格式错误</p>",
-                    )?;
-                    return Err(error);
+                    );
+                    continue;
                 }
             };
 
@@ -736,20 +756,37 @@ fn fill_empty_user_profile(user: &mut UserProfile, profile: &UserProfile) {
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<String> {
+/// Per-connection read timeout. Browsers routinely open speculative/pre-connect
+/// sockets that send no data; without a bound, a single such socket accepted
+/// ahead of the real callback would block the accept loop forever. A genuine
+/// localhost request arrives within milliseconds, so this only ever fires for
+/// silent sockets.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read one HTTP request from the stream. Per-connection IO problems (timeouts,
+/// resets, peers that close without sending) are non-fatal: we return whatever
+/// we managed to read — possibly an empty string — and let the caller skip it
+/// rather than aborting the whole login.
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let _ = stream.set_read_timeout(Some(CALLBACK_READ_TIMEOUT));
     let mut data = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
-        let count = stream.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        data.extend_from_slice(&buffer[..count]);
-        if data.windows(4).any(|chunk| chunk == b"\r\n\r\n") || data.len() >= 16 * 1024 {
-            break;
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                data.extend_from_slice(&buffer[..count]);
+                if data.windows(4).any(|chunk| chunk == b"\r\n\r\n") || data.len() >= 16 * 1024 {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Read timeout (WouldBlock/TimedOut) or any other IO error: stop and
+            // use whatever we have. A silent socket simply yields an empty request.
+            Err(_) => break,
         }
     }
-    Ok(String::from_utf8_lossy(&data).into_owned())
+    String::from_utf8_lossy(&data).into_owned()
 }
 
 fn parse_http_request_line(request: &str) -> Result<HttpRequestLine> {

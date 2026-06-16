@@ -874,3 +874,75 @@ fn make_temp_home(prefix: &str) -> std::path::PathBuf {
     fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+#[test]
+fn device_link_channel_defaults_to_cloud_for_unknown_device() {
+    // A DID that was never discovered on the LAN nor primed into any credential
+    // cache resolves to the cloud channel.
+    assert_eq!(device_link_channel("99900011122233377"), MiotChannel::Cloud);
+}
+
+
+
+#[test]
+fn local_credential_cache_keys_include_parent_for_sub_device() {
+    assert_eq!(
+        local_credential_cache_keys("2045038922.s2"),
+        vec!["2045038922.s2".to_string(), "2045038922".to_string()]
+    );
+    assert_eq!(
+        local_credential_cache_keys("2045038922"),
+        vec!["2045038922".to_string()]
+    );
+}
+
+#[test]
+fn load_snapshot_credential_round_trips_persisted_snapshot() {
+    let _guard = env_guard();
+    let home = make_temp_home("local-credential-snapshot-reuse");
+    env::set_var("MIT_HOME", &home);
+
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "snapshot-reuse",
+        "deviceId": "mico.snapshot-reuse",
+        "accessToken": "token-a",
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }));
+    let client = MicoClient::new(&account).unwrap();
+
+    let mut creds = HashMap::new();
+    creds.insert(
+        "2000354985".to_string(),
+        LocalDeviceCredential {
+            did: "2000354985".to_string(),
+            name: "灯".to_string(),
+            model: "x.y.z".to_string(),
+            local_ip: "192.168.1.50".to_string(),
+            token: "00112233445566778899aabbccddeeff".to_string(),
+            source: LocalCredentialSource::Direct,
+        },
+    );
+    client.write_local_credentials_snapshot(&creds).unwrap();
+
+    // The CLI reuses the persisted snapshot the TUI wrote — without a cloud call.
+    let loaded = client
+        .load_snapshot_credential("2000354985")
+        .unwrap()
+        .expect("snapshot credential should be present");
+    assert_eq!(loaded.local_ip, "192.168.1.50");
+    assert_eq!(loaded.token, "00112233445566778899aabbccddeeff");
+
+    assert!(client
+        .load_snapshot_credential("404040404")
+        .unwrap()
+        .is_none());
+
+    // The TUI hydration path reads every device from the same snapshot.
+    let mut all = client.load_all_snapshot_credentials().unwrap();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].0, "2000354985");
+    assert_eq!(all[0].1.local_ip, "192.168.1.50");
+}

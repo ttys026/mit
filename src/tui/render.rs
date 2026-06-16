@@ -152,12 +152,16 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                         .get(device.model.as_str())
                         .map(String::as_str)
                         .unwrap_or("-");
-                    device_list_row(
+                    let mut row = device_list_row(
                         &device.name,
                         category,
                         &device.room_name,
                         account_label.as_str(),
-                    )
+                    );
+                    row.channel = crate::mico_api::device_link_channel(&device.did)
+                        .as_str()
+                        .to_string();
+                    row
                 })
                 .collect::<Vec<_>>();
             let columns =

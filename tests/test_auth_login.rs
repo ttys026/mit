@@ -746,6 +746,83 @@ fn auth_login_handles_chunked_callback_request() {
     let _ = fs::remove_dir_all(&test_home);
 }
 
+// Regression: browsers (especially on a fresh device) open speculative
+// pre-connect sockets that send no data, or stray/malformed requests. These must
+// not abort the login or block the accept loop — the real callback that follows
+// must still complete successfully.
+#[test]
+fn auth_login_survives_stray_preconnect_sockets() {
+    let _guard = auth_login_test_guard();
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-login-stray-preconnect");
+    let port = pick_free_port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/login_redirect");
+    let child = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "auth", "login"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_REDIRECT_URI", redirect_uri.as_str())
+        .env("MIT_MICO_BASE_URL", server.base_url())
+        .env("MIT_USER_PROFILE_URL", server.user_profile_url())
+        .env(
+            "MIT_MIJIA_SERVICE_LOGIN_URL",
+            server.mijia_service_login_url(),
+        )
+        .env("MIT_MIJIA_LOGIN_URL", server.mijia_login_url())
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let auth_path = test_home.join(".mit").join("auth.json");
+    let mut state = String::new();
+    for _ in 0..50 {
+        if let Ok(text) = fs::read_to_string(&auth_path) {
+            if let Ok(auth) = serde_json::from_str::<Value>(&text) {
+                if let Some(found) = auth
+                    .get("pendingAuth")
+                    .and_then(Value::as_object)
+                    .and_then(|pending| pending.get("xiaomi"))
+                    .and_then(Value::as_object)
+                    .and_then(|xiaomi| xiaomi.get("state"))
+                    .and_then(Value::as_str)
+                {
+                    state = found.to_string();
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!state.is_empty(), "pending auth state was not created");
+
+    // Stray #1: connect and close immediately without sending anything (the
+    // classic browser pre-connect that previously aborted login with
+    // "无效的 HTTP 请求").
+    drop(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+    // Stray #2: a malformed, non-HTTP request line.
+    {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ = stream.write_all(b"GARBAGE-NOT-HTTP\r\n\r\n");
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    // The real callback must still complete the login despite the strays above.
+    let callback_response = send_callback(&redirect_uri, &state);
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        callback_response.starts_with("HTTP/1.1 302 Found"),
+        "callback response: {callback_response}\nstderr: {stderr}"
+    );
+
+    let auth: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    assert_eq!(auth["accounts"][0]["user"]["uid"], "1001");
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
 fn send_callback(redirect_uri: &str, state: &str) -> String {
     let parsed = url::Url::parse(redirect_uri).unwrap();
     let host = parsed.host_str().unwrap();

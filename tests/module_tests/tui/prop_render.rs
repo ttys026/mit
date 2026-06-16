@@ -61,7 +61,8 @@ fn prop_dialog_footer_refresh_shows_props_loading_effect() {
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let text = terminal_text(&terminal);
-    assert!(text.contains("dev-1 (Loading...)"), "{text}");
+    assert!(text.contains("dev-1"), "{text}");
+    assert!(text.contains("(Loading...)"), "{text}");
     assert!(
         terminal_has_dim_substring(&terminal, "Power"),
         "props row should dim while props are refreshing:\n{text}"

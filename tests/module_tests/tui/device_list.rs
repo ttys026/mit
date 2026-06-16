@@ -330,3 +330,24 @@ fn format_device_list_item_orders_columns_room_name_category_account() {
         "{line}"
     );
 }
+
+#[test]
+fn device_list_shows_channel_column() {
+    let header = format_device_list_header(Language::English);
+    assert!(
+        header.contains(super::device_list_header_titles(Language::English)[4]),
+        "{header}"
+    );
+
+    let mut row = device_list_row("name", "cat", "客厅", "acc");
+    row.channel = "LAN".to_string();
+    let columns =
+        compute_device_list_columns(std::slice::from_ref(&row), usize::MAX, Language::English);
+    let line = format_device_list_item_with_columns(&row, columns);
+    assert!(line.contains("LAN"), "{line}");
+    assert_eq!(
+        UnicodeWidthStr::width(line.as_str()),
+        columns.total_width(),
+        "{line}"
+    );
+}

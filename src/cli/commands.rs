@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::mico_api::MicoClient;
+use crate::mico_api::{MicoClient, MiotChannel};
 use crate::mijia_api::DeviceHistoryQuery;
 use crate::mips_cloud::{
     config_from_account, property_subscription_for, start_stdout_subscription, CloudMipsHandle,
@@ -306,6 +306,14 @@ fn parse_cli_value(text: &str) -> Result<Value> {
     Ok(Value::String(trimmed.to_string()))
 }
 
+/// Trailing "（通道: LAN）" / "（通道: Cloud）" tag for text-mode prop output.
+fn channel_text_suffix(channel: Option<MiotChannel>) -> String {
+    match channel {
+        Some(channel) => format!("（通道: {channel}）"),
+        None => String::new(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PropGetOutput {
@@ -316,6 +324,8 @@ struct PropGetOutput {
     siid: i64,
     piid: i64,
     value: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<MiotChannel>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -329,6 +339,8 @@ struct PropSetOutput {
     piid: i64,
     value: Value,
     result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<MiotChannel>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -342,6 +354,8 @@ struct PropActOutput {
     aiid: i64,
     values: Vec<Value>,
     result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<MiotChannel>,
 }
 
 struct PropsSubscriptionGroup {
@@ -406,20 +420,26 @@ pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> 
     match command {
         PropsCommand::Get(args) => {
             let target = find_target_device(&args.did)?;
+            let _ = target
+                .fresh
+                .client
+                .prime_local_credential_for(target.device.did.as_str());
             let value =
                 target
                     .fresh
                     .client
                     .get_prop(target.device.did.as_str(), args.siid, args.piid)?;
+            let channel = target.fresh.client.last_channel();
             match output_mode {
                 OutputMode::Text => {
                     println!(
-                        "{}（{}） {}.{} => {}",
+                        "{}（{}） {}.{} => {}{}",
                         target.device.name,
                         target.device.did,
                         args.siid,
                         args.piid,
-                        serde_json::to_string(&value)?
+                        serde_json::to_string(&value)?,
+                        channel_text_suffix(channel),
                     );
                 }
                 OutputMode::Json => print_json(&PropGetOutput {
@@ -429,12 +449,17 @@ pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> 
                     siid: args.siid,
                     piid: args.piid,
                     value,
+                    channel,
                 })?,
             }
             Ok(())
         }
         PropsCommand::Set(args) => {
             let target = find_target_device(&args.did)?;
+            let _ = target
+                .fresh
+                .client
+                .prime_local_credential_for(target.device.did.as_str());
             let value = parse_cli_value(&args.value)?;
             let result = target.fresh.client.set_prop(
                 target.device.did.as_str(),
@@ -442,16 +467,18 @@ pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> 
                 args.piid,
                 value.clone(),
             )?;
+            let channel = target.fresh.client.last_channel();
             match output_mode {
                 OutputMode::Text => {
                     println!(
-                        "{}（{}） {}.{} <= {} => {}",
+                        "{}（{}） {}.{} <= {} => {}{}",
                         target.device.name,
                         target.device.did,
                         args.siid,
                         args.piid,
                         serde_json::to_string(&value)?,
-                        serde_json::to_string(&result)?
+                        serde_json::to_string(&result)?,
+                        channel_text_suffix(channel),
                     );
                 }
                 OutputMode::Json => print_json(&PropSetOutput {
@@ -462,12 +489,17 @@ pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> 
                     piid: args.piid,
                     value,
                     result,
+                    channel,
                 })?,
             }
             Ok(())
         }
         PropsCommand::Act(args) => {
             let target = find_target_device(&args.did)?;
+            let _ = target
+                .fresh
+                .client
+                .prime_local_credential_for(target.device.did.as_str());
             let values = args
                 .values
                 .iter()
@@ -479,15 +511,17 @@ pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> 
                 args.aiid,
                 values.as_slice(),
             )?;
+            let channel = target.fresh.client.last_channel();
             match output_mode {
                 OutputMode::Text => {
                     println!(
-                        "{}（{}） {}.{} => {}",
+                        "{}（{}） {}.{} => {}{}",
                         target.device.name,
                         target.device.did,
                         args.siid,
                         args.aiid,
-                        serde_json::to_string(&result)?
+                        serde_json::to_string(&result)?,
+                        channel_text_suffix(channel),
                     );
                 }
                 OutputMode::Json => print_json(&PropActOutput {
@@ -498,6 +532,7 @@ pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> 
                     aiid: args.aiid,
                     values,
                     result,
+                    channel,
                 })?,
             }
             Ok(())

@@ -17,6 +17,7 @@ use time::{format_description::FormatItem, macros::format_description};
 
 use crate::cli::ensure_fresh_account;
 use crate::mico_api::{Device, MicoClient};
+use crate::miot_lan::LanPushEvent;
 use crate::property_cache::PropertyCache;
 use crate::storage::{
     default_auth, get_auth_accounts, get_home_dir, load_auth, load_settings, save_settings,
@@ -117,10 +118,10 @@ pub(crate) fn account_list_header_titles(lang: Language) -> [&'static str; 5] {
         Language::English => ["Region", "Nickname", "ID", "Xiaomi", "Mijia"],
     }
 }
-pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 4] {
+pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 5] {
     match lang {
-        Language::Chinese => ["房间", "名称", "类别", "账户"],
-        Language::English => ["Room", "Name", "Category", "Account"],
+        Language::Chinese => ["房间", "名称", "类别", "账户", "通道"],
+        Language::English => ["Room", "Name", "Category", "Account", "Channel"],
     }
 }
 const STATUS_BAR_MARGIN_TOP: u16 = 1;
@@ -421,6 +422,28 @@ struct TuiApp {
     update_check_status: Option<String>,
     /// Receiver for output/result of the in-flight in-app upgrade, if one is running.
     install_rx: Option<Receiver<InstallMessage>>,
+}
+
+/// Forward LAN push events from a subscribed device into the shared property
+/// cache so the UI reflects `properties_changed` updates live, mirroring the
+/// cloud MIPS listener. Runs until the LAN manager shuts down (channel closes).
+fn start_lan_push_forwarder(rx: Receiver<LanPushEvent>, property_cache: Arc<PropertyCache>) {
+    thread::Builder::new()
+        .name("mit-lan-push".to_string())
+        .spawn(move || {
+            while let Ok(event) = rx.recv() {
+                if let LanPushEvent::PropertiesChanged {
+                    did,
+                    siid,
+                    piid,
+                    value,
+                } = event
+                {
+                    property_cache.set_property(did, siid, piid, value);
+                }
+            }
+        })
+        .ok();
 }
 
 impl TuiApp {
@@ -842,13 +865,19 @@ impl TuiApp {
                         self.log(log);
                     }
                     self.refresh_cloud_mips_listeners();
-                    let should_rewarm_local_transport = refresh_local_transport_if_missing
+                    let account_online = refresh_local_transport_if_missing
                         && self
                             .current_uid()
-                            .is_some_and(|uid| !self.offline_account_uids.contains(uid))
-                        && self.current_account_local_credentials_snapshot_missing();
-                    if should_rewarm_local_transport {
-                        self.request_local_transport_refresh(true);
+                            .is_some_and(|uid| !self.offline_account_uids.contains(uid));
+                    if account_online {
+                        if self.current_account_local_credentials_snapshot_missing() {
+                            // No cached creds yet: do the full cloud sync.
+                            self.request_local_transport_refresh(true);
+                        } else {
+                            // Reuse the persisted snapshot so LAN works immediately
+                            // without re-fetching from the cloud each launch.
+                            self.hydrate_local_transport_from_snapshot();
+                        }
                     }
                 }
                 BootstrapMessage::Failed {
@@ -957,6 +986,24 @@ impl TuiApp {
         }
     }
 
+    /// Populate the in-memory local-credential cache from the persisted snapshot
+    /// (no cloud call), so the device table's Channel column and property reads
+    /// use LAN right away on a relaunch. Runs in the background.
+    fn hydrate_local_transport_from_snapshot(&mut self) {
+        let Some(account) = self.current_account().cloned() else {
+            return;
+        };
+        let property_cache = self.property_cache.clone();
+        thread::spawn(move || {
+            if let Ok(client) = MicoClient::new(&account) {
+                let _ = client.hydrate_local_credentials_from_snapshot();
+                if let Some(rx) = client.lan_push_receiver() {
+                    start_lan_push_forwarder(rx, property_cache);
+                }
+            }
+        });
+    }
+
     fn request_local_transport_refresh(&mut self, force: bool) {
         let Some(account) = self.current_account().cloned() else {
             self.local_transport_fetching = false;
@@ -991,10 +1038,16 @@ impl TuiApp {
         self.local_transport_refresh_device_id = Some(account.device_id.clone());
         let generation = self.local_transport_refresh_generation;
         let tx = self.local_transport_tx.clone();
+        let property_cache = self.property_cache.clone();
         thread::spawn(move || {
             let error = (|| -> Result<()> {
                 let client = MicoClient::new(&account)?;
                 client.get_local_device_credentials()?;
+                // Bridge LAN push (if any) into the shared cache. `take`-once
+                // semantics mean only the first refresh per account starts it.
+                if let Some(rx) = client.lan_push_receiver() {
+                    start_lan_push_forwarder(rx, property_cache);
+                }
                 Ok(())
             })()
             .err()
