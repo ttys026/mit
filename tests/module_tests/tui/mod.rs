@@ -14,10 +14,9 @@ use super::{
     format_prop_value_for_dialog, handle_key, handle_mouse, load_cached_devices_from_home,
     parse_bool_prop_value, raw_device_logs_item, raw_device_statistics_item,
     read_device_categories_from_template, settings_action_for_row, single_line_textarea,
-    strip_ansi, tab_index_for_column_with_titles,
-    AccountActionDialog, ActionItem, AuthFlowMessage, AuthState, BootState, BootstrapMessage,
-    BootstrapPending, ListState, LocalTransportRefreshMessage, PropDialog, PropDialogTab, PropItem,
-    ToggleItem, TuiApp,
+    strip_ansi, tab_index_for_column_with_titles, AccountActionDialog, ActionItem, AuthFlowMessage,
+    AuthState, BootState, BootstrapMessage, BootstrapPending, ListState,
+    LocalTransportRefreshMessage, PropDialog, PropDialogTab, PropItem, ToggleItem, TuiApp,
 };
 use crate::mico_api::Device;
 use crate::property_cache::PropertyCache;

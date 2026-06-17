@@ -526,10 +526,7 @@ fn normalize_account_ref(value: &Value, allow_flat_xiaomi: bool) -> AuthAccount 
     // Legacy (version < 2) accounts stored the Xiaomi credentials as flat fields
     // on the account itself. Migrate them by wrapping those fields into `xiaomi`;
     // such accounts never had Mijia credentials, so `mijia` becomes null.
-    let stored_version = object
-        .get("version")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+    let stored_version = object.get("version").and_then(Value::as_u64).unwrap_or(0) as u32;
     let allow_flat_xiaomi = allow_flat_xiaomi || stored_version < CURRENT_AUTH_VERSION;
 
     let xiaomi = object

@@ -7,15 +7,17 @@
 //! thread is woken promptly for outbound work via a loopback "self-wake" packet
 //! sent to the loop socket's own port.
 //!
-//! Unlike the legacy per-request handshake in [`crate::miio_local`], devices are
-//! discovered by broadcasting a 32-byte `MDID` probe (see [`build_probe`]). Each
+//! Devices are discovered by broadcasting (or directly probing) a 32-byte `MDID`
+//! probe (see [`build_probe`]). Each
 //! reply teaches us the device's real 8-byte DID, its clock (so we can derive
 //! the packet timestamp without a handshake) and its IP. A per-device keepalive
 //! state machine (FRESH/PING/DEAD) tracks liveness, and — when enabled — devices
 //! that advertise wildcard subscription push `properties_changed` /
 //! `event_occured` messages which are surfaced on a channel.
 
+use aes::Aes128;
 use anyhow::{anyhow, bail, Result};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -26,7 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::miio_local::{decrypt_payload, encrypt_payload};
+type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
 const OT_HEADER: [u8; 2] = [0x21, 0x31];
 const OT_PORT: u16 = 54321;
@@ -281,8 +284,7 @@ impl LanManager {
 
     /// Send a MIoT-spec request to a device over the LAN and await the reply.
     ///
-    /// Returns the `result` payload (mirroring [`crate::miio_local::MiioUdpClient::request`])
-    /// so this is a drop-in replacement on the call site.
+    /// Returns the `result` payload so callers get the device response directly.
     pub fn request(
         &self,
         did: &str,
@@ -632,7 +634,8 @@ impl LanLoop {
                         None
                     };
                     dev.ka_interval = (dev.ka_interval * 2.0).min(KA_INTERVAL_MAX);
-                    dev.ka_at = Some(now + Duration::from_secs_f64(randomize(dev.ka_interval, 0.1)));
+                    dev.ka_at =
+                        Some(now + Duration::from_secs_f64(randomize(dev.ka_interval, 0.1)));
                     dev.ka_target = DevState::Ping1;
                     (None, online)
                 }
@@ -813,7 +816,11 @@ impl LanLoop {
             dev.offset = unix_secs() - timestamp as i64;
         }
 
-        let subscribed = self.devices.get(&did).map(|d| d.subscribed).unwrap_or(false);
+        let subscribed = self
+            .devices
+            .get(&did)
+            .map(|d| d.subscribed)
+            .unwrap_or(false);
         if data.len() == OT_PROBE_LEN || subscribed {
             self.keep_alive(&did, src_ip, now);
         }
@@ -892,10 +899,9 @@ impl LanLoop {
         }
 
         // Uplink (device-initiated) message: requires method + params.
-        let (Some(method), Some(params)) = (
-            msg.get("method").and_then(Value::as_str),
-            msg.get("params"),
-        ) else {
+        let (Some(method), Some(params)) =
+            (msg.get("method").and_then(Value::as_str), msg.get("params"))
+        else {
             return;
         };
 
@@ -969,6 +975,165 @@ impl LanLoop {
 // Packet codec
 // ---------------------------------------------------------------------------
 
+/// Control a device directly over the LAN using the classic miIO "hello"
+/// handshake: send a hello, learn the device's id and clock stamp, then send the
+/// encrypted command and decrypt the reply. Unlike the OT broadcast/keepalive
+/// path of [`LanManager`], this works for Wi-Fi devices **and** gateway-proxied
+/// sub-devices (switches/lights behind a central hub) that never answer the OT
+/// discovery probe. Returns the `result` payload, mirroring a MIoT-spec call.
+pub fn lan_request_direct(
+    ip: &str,
+    token_hex: &str,
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let token = parse_token(token_hex)?;
+    let socket = miio_connect(ip, timeout)?;
+    let mut buf = vec![0u8; 2048];
+    let (device_id, stamp) = miio_handshake(&socket, &mut buf)?;
+    miio_command(
+        &socket,
+        device_id,
+        stamp.wrapping_add(1),
+        &token,
+        method,
+        params,
+        1,
+        &mut buf,
+    )
+}
+
+/// Run several miIO requests against one device over a **single** handshake.
+///
+/// Many miIO devices drop back-to-back hello handshakes (each one would surface
+/// as a timeout / `os error 35`), so issuing N separate [`lan_request_direct`]
+/// calls in quick succession fails after the first. Reusing one handshake and
+/// streaming the commands on the same socket avoids that. Returns one result per
+/// request, in order; a per-command failure (e.g. a lost reply) is captured in
+/// that slot's `Err` without aborting the rest.
+pub fn lan_request_batch(
+    ip: &str,
+    token_hex: &str,
+    requests: &[(&str, Value)],
+    timeout: Duration,
+) -> Result<Vec<Result<Value>>> {
+    let token = parse_token(token_hex)?;
+    let socket = miio_connect(ip, timeout)?;
+    let mut buf = vec![0u8; 2048];
+    let (device_id, stamp) = miio_handshake(&socket, &mut buf)?;
+    let mut out = Vec::with_capacity(requests.len());
+    for (index, (method, params)) in requests.iter().enumerate() {
+        // Distinct id + stamp per command keeps the device from treating rapid
+        // requests as replays.
+        let result = miio_command(
+            &socket,
+            device_id,
+            stamp.wrapping_add(1 + index as u32),
+            &token,
+            method,
+            params,
+            index as i64 + 1,
+            &mut buf,
+        );
+        out.push(result);
+    }
+    Ok(out)
+}
+
+fn miio_connect(ip: &str, timeout: Duration) -> Result<UdpSocket> {
+    let addr = if ip.contains(':') {
+        ip.to_string()
+    } else {
+        format!("{ip}:{OT_PORT}")
+    };
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
+    socket.connect(addr.as_str())?;
+    Ok(socket)
+}
+
+/// Send a "hello" and read the device id + clock stamp from the reply.
+fn miio_handshake(socket: &UdpSocket, buf: &mut [u8]) -> Result<(u32, u32)> {
+    socket.send(&miio_hello_packet())?;
+    let n = socket.recv(buf)?;
+    if n < OT_HEADER_LEN || buf[0..2] != OT_HEADER {
+        bail!("miio handshake: bad reply");
+    }
+    let device_id = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let stamp = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    Ok((device_id, stamp))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn miio_command(
+    socket: &UdpSocket,
+    device_id: u32,
+    stamp: u32,
+    token: &[u8; 16],
+    method: &str,
+    params: &Value,
+    msg_id: i64,
+    buf: &mut [u8],
+) -> Result<Value> {
+    let payload = json!({ "id": msg_id, "method": method, "params": params });
+    let body = serde_json::to_vec(&payload)?;
+    let packet = miio_command_packet(device_id, stamp, token, &body)?;
+    socket.send(&packet)?;
+    let n = socket.recv(buf)?;
+    if n < OT_HEADER_LEN || buf[0..2] != OT_HEADER {
+        bail!("miio command: bad reply");
+    }
+    let data_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    if data_len < OT_HEADER_LEN || data_len > n {
+        bail!("miio command: truncated reply");
+    }
+    let decrypted = decrypt_payload(token, &buf[OT_HEADER_LEN..data_len])?;
+    let trimmed = strip_trailing_nulls(&decrypted);
+    let value: Value = serde_json::from_slice(trimmed)?;
+    if value.get("error").is_some() {
+        bail!("miio device error: {value}");
+    }
+    Ok(value.get("result").cloned().unwrap_or(value))
+}
+
+/// The 32-byte miIO "hello" handshake packet (all 0xFF after the length field).
+fn miio_hello_packet() -> [u8; OT_HEADER_LEN] {
+    let mut p = [0xFFu8; OT_HEADER_LEN];
+    p[0] = 0x21;
+    p[1] = 0x31;
+    p[2] = 0x00;
+    p[3] = 0x20; // length = 32
+    p
+}
+
+/// Build a legacy miIO command packet: a 4-byte device id at `[8..12]` (vs the
+/// OT 8-byte DID at `[4..12]`) with the trailer MD5 over the whole packet.
+fn miio_command_packet(
+    device_id: u32,
+    stamp: u32,
+    token: &[u8; 16],
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let encrypted = encrypt_payload(token, body)?;
+    let data_len = OT_HEADER_LEN + encrypted.len();
+    if data_len > OT_MSG_LEN {
+        bail!("lan packet too long: {data_len}");
+    }
+    let mut pkt = vec![0u8; data_len];
+    pkt[0..2].copy_from_slice(&OT_HEADER);
+    pkt[2..4].copy_from_slice(&(data_len as u16).to_be_bytes());
+    // pkt[4..8] left zero (unknown), 4-byte device id at [8..12].
+    pkt[8..12].copy_from_slice(&device_id.to_be_bytes());
+    pkt[12..16].copy_from_slice(&stamp.to_be_bytes());
+    pkt[16..32].copy_from_slice(token); // md5 placeholder
+    pkt[32..].copy_from_slice(&encrypted);
+    let digest = md5::compute(&pkt);
+    pkt[16..32].copy_from_slice(&digest.0);
+    Ok(pkt)
+}
+
 /// 32-byte broadcast discovery probe carrying our virtual DID after the `MDID` tag.
 pub fn build_probe(virtual_did: u64) -> [u8; OT_PROBE_LEN] {
     let mut p = [0u8; OT_PROBE_LEN];
@@ -1036,6 +1201,38 @@ fn strip_trailing_nulls(data: &[u8]) -> &[u8] {
     &data[..end]
 }
 
+/// miIO AES-128-CBC encryption: key = md5(token), iv = md5(key ++ token).
+pub fn encrypt_payload(token: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
+    let key = md5::compute(token).0;
+    let mut iv_src = Vec::with_capacity(32);
+    iv_src.extend_from_slice(&key);
+    iv_src.extend_from_slice(token);
+    let iv = md5::compute(iv_src).0;
+    let padded_len = (payload.len() / 16 + 1) * 16;
+    let mut buf = vec![0u8; padded_len];
+    buf[..payload.len()].copy_from_slice(payload);
+    let encrypted = Aes128CbcEnc::new_from_slices(&key, &iv)
+        .map_err(|e| anyhow!("miio AES init failed: {e}"))?
+        .encrypt_padded_mut::<Pkcs7>(&mut buf, payload.len())
+        .map_err(|e| anyhow!("miio AES encrypt failed: {e:?}"))?;
+    Ok(encrypted.to_vec())
+}
+
+/// Inverse of [`encrypt_payload`].
+pub fn decrypt_payload(token: &[u8; 16], payload: &[u8]) -> Result<Vec<u8>> {
+    let key = md5::compute(token).0;
+    let mut iv_src = Vec::with_capacity(32);
+    iv_src.extend_from_slice(&key);
+    iv_src.extend_from_slice(token);
+    let iv = md5::compute(iv_src).0;
+    let mut buf = payload.to_vec();
+    let decrypted = Aes128CbcDec::new_from_slices(&key, &iv)
+        .map_err(|e| anyhow!("miio AES init failed: {e}"))?
+        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .map_err(|e| anyhow!("miio AES decrypt failed: {e:?}"))?;
+    Ok(decrypted.to_vec())
+}
+
 fn parse_token(raw: &str) -> Result<[u8; 16]> {
     let hex = raw.trim();
     if hex.len() != 32 {
@@ -1065,16 +1262,19 @@ fn randomize(value: f64, pct: f64) -> f64 {
 /// broadcast (so multi-homed / Docker bridge setups are reached too).
 fn broadcast_targets() -> Vec<Ipv4Addr> {
     let mut out = vec![Ipv4Addr::BROADCAST];
-    for addr in local_directed_broadcasts() {
-        if !out.contains(&addr) {
-            out.push(addr);
+    for (addr, mask) in local_ipv4_networks() {
+        let directed = Ipv4Addr::from(u32::from(addr) | !u32::from(mask));
+        if !out.contains(&directed) {
+            out.push(directed);
         }
     }
     out
 }
 
+/// Each non-loopback IPv4 interface as `(address, netmask)`. Empty on platforms
+/// without interface enumeration.
 #[cfg(unix)]
-fn local_directed_broadcasts() -> Vec<Ipv4Addr> {
+pub fn local_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
     let mut out = Vec::new();
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -1101,7 +1301,7 @@ fn local_directed_broadcasts() -> Vec<Ipv4Addr> {
             if addr == 0 || mask == 0 {
                 continue;
             }
-            out.push(Ipv4Addr::from(addr | !mask));
+            out.push((Ipv4Addr::from(addr), Ipv4Addr::from(mask)));
         }
         libc::freeifaddrs(ifap);
     }
@@ -1109,8 +1309,24 @@ fn local_directed_broadcasts() -> Vec<Ipv4Addr> {
 }
 
 #[cfg(not(unix))]
-fn local_directed_broadcasts() -> Vec<Ipv4Addr> {
+pub fn local_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
     Vec::new()
+}
+
+/// Whether `ip` shares a subnet with one of this host's non-loopback IPv4
+/// interfaces — i.e. the device is on the same intranet and reachable directly.
+/// On platforms without interface enumeration, falls back to RFC-1918 private
+/// ranges (`10/8`, `172.16/12`, `192.168/16`).
+pub fn is_on_local_subnet(ip: Ipv4Addr) -> bool {
+    let networks = local_ipv4_networks();
+    if networks.is_empty() {
+        return ip.is_private();
+    }
+    let ip_bits = u32::from(ip);
+    networks.iter().any(|(addr, mask)| {
+        let mask_bits = u32::from(*mask);
+        mask_bits != 0 && (ip_bits & mask_bits) == (u32::from(*addr) & mask_bits)
+    })
 }
 
 #[cfg(test)]
@@ -1122,6 +1338,40 @@ mod tests {
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0xEE, 0xFF,
         ]
+    }
+
+    #[test]
+    fn hello_packet_has_expected_layout() {
+        let hello = miio_hello_packet();
+        assert_eq!(&hello[0..4], &[0x21, 0x31, 0x00, 0x20]);
+        assert_eq!(&hello[4..32], &[0xFF; 28]);
+    }
+
+    #[test]
+    fn legacy_command_packet_layout_and_body_round_trip() {
+        let device_id: u32 = 0x0A0B_0C0D;
+        let stamp: u32 = 1_700_000_000;
+        let body = br#"{"id":1,"method":"get_properties","params":[]}"#;
+        let pkt = miio_command_packet(device_id, stamp, &token(), body).unwrap();
+
+        // Header: magic, length, zero "unknown", 4-byte device id at [8..12], stamp.
+        assert_eq!(&pkt[0..2], &OT_HEADER);
+        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]) as usize, pkt.len());
+        assert_eq!(&pkt[4..8], &[0, 0, 0, 0]);
+        assert_eq!(u32::from_be_bytes(pkt[8..12].try_into().unwrap()), device_id);
+        assert_eq!(u32::from_be_bytes(pkt[12..16].try_into().unwrap()), stamp);
+
+        // The payload region decrypts back to the original body.
+        let decrypted = decrypt_payload(&token(), &pkt[OT_HEADER_LEN..]).unwrap();
+        assert_eq!(strip_trailing_nulls(&decrypted), &body[..]);
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trips() {
+        let clear = b"{\"hello\":\"world\"}";
+        let encrypted = encrypt_payload(&token(), clear).unwrap();
+        let decrypted = decrypt_payload(&token(), &encrypted).unwrap();
+        assert_eq!(&decrypted, clear);
     }
 
     #[test]
@@ -1150,11 +1400,11 @@ mod tests {
             u16::from_be_bytes([packet[2], packet[3]]) as usize,
             packet.len()
         );
+        assert_eq!(u64::from_be_bytes(packet[4..12].try_into().unwrap()), did);
         assert_eq!(
-            u64::from_be_bytes(packet[4..12].try_into().unwrap()),
-            did
+            u32::from_be_bytes(packet[12..16].try_into().unwrap()),
+            stamp
         );
-        assert_eq!(u32::from_be_bytes(packet[12..16].try_into().unwrap()), stamp);
 
         let decoded = decrypt_packet(&token(), &packet).unwrap();
         assert_eq!(decoded, clear);

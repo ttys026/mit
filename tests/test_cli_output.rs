@@ -987,7 +987,10 @@ fn update_check_reports_rate_limit_clearly() {
     let server = MockMicoServer::start();
     let output = Command::new(env!("CARGO_BIN_EXE_mit"))
         .args(["update", "--check"])
-        .env("MIT_GITHUB_API_BASE", format!("{}/ratelimited", server.base_url()))
+        .env(
+            "MIT_GITHUB_API_BASE",
+            format!("{}/ratelimited", server.base_url()),
+        )
         .output()
         .unwrap();
     assert!(!output.status.success());

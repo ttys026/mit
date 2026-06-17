@@ -583,6 +583,12 @@ impl TuiApp {
             }
         }
 
+        // Populate the local-credential cache from the persisted snapshot up front
+        // so the device table's Channel column reflects LAN reachability right away,
+        // instead of showing Cloud for everything until the background cloud sync
+        // finishes. No-ops when there is no snapshot yet.
+        self.hydrate_local_transport_from_snapshot();
+
         if selected_uid.is_empty() {
             if show_loading_splash {
                 self.boot_state = BootState::Ready;

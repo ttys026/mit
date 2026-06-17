@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use url::Url;
 
-use crate::miio_local::MiioUdpClient;
-use crate::miot_lan::{LanConfig, LanDeviceInfo, LanManager, LanPushEvent};
-use crate::miot_mdns::CentralHubMonitor;
+use crate::miot_lan::{is_on_local_subnet, LanConfig, LanDeviceInfo, LanManager, LanPushEvent};
 use crate::storage::{get_account_dir, get_home_dir, AuthAccount, UserProfile, DEFAULT_REGION};
 
 const PROJECT_CODE: &str = "mico";
@@ -35,16 +33,18 @@ const USER_PROFILE_URL: &str = "https://open.account.xiaomi.com/user/profile";
 const MICO_BASE_URL_ENV: &str = "MIT_MICO_BASE_URL";
 const USER_PROFILE_URL_ENV: &str = "MIT_USER_PROFILE_URL";
 const TOKEN_EXPIRES_RATIO: f64 = 0.7;
-const LOCAL_MIIO_PORT: u16 = 54321;
-const LOCAL_UDP_MAX_ATTEMPTS: usize = 1;
-const LOCAL_UDP_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
-const LOCAL_LAN_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Per-attempt socket timeout for a direct LAN (miIO handshake) request. miIO
+/// devices answer on the LAN in tens of ms, so a short timeout keeps both the
+/// retry-after-packet-loss case and offline/stale-IP detection cheap before any
+/// cloud fallback.
+const LOCAL_LAN_TIMEOUT: Duration = Duration::from_millis(250);
+/// LAN requests are retried this many times on transient UDP errors (packet loss
+/// on the private network is common; a single attempt is not reliable).
+const LAN_MAX_ATTEMPTS: usize = 3;
 /// Max properties per local `get_properties` request. Many miio devices cap
 /// their UDP response near 1 KB and silently truncate larger ones (yielding
 /// unparseable JSON), so we chunk to keep each response well under that.
-const LOCAL_PROPS_CHUNK_SIZE: usize = 8;
-/// How many devices to probe concurrently when hydrating from the snapshot.
-const HYDRATE_PROBE_CONCURRENCY: usize = 16;
+const LOCAL_PROPS_CHUNK_SIZE: usize = 4;
 const MIOT_FLOW_LOG_FILE: &str = "miot-flow.log";
 // Xiaomi OAuth endpoints currently reject requests unless this legacy Python UA is used.
 const USER_AGENT: &str = "Python/3.12 aiohttp/3.13.3";
@@ -123,6 +123,20 @@ impl std::fmt::Display for MiotChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Whether a device can be reached over the LAN right now, and how.
+enum LanEligibility {
+    /// On our intranet with a usable credential — LAN can be attempted.
+    Eligible(LanTarget),
+    /// Not LAN-controllable; `reason` explains why (logged + surfaced under `--LAN`).
+    Ineligible(String),
+}
+
+/// The credential needed to control a device directly over the LAN.
+struct LanTarget {
+    ip: String,
+    token: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -582,44 +596,12 @@ impl MicoClient {
         }
         cache.by_did = resolved_by_did
             .iter()
-            .filter(|(did, _)| !cache.disabled_dids.contains(*did))
             .map(|(did, credential)| (did.clone(), credential.clone()))
             .collect();
-        let known_dids = cache.by_did.keys().cloned().collect::<HashSet<_>>();
-        cache.ready_dids.retain(|did| known_dids.contains(did));
-        let credentials_to_probe = cache
-            .by_did
-            .iter()
-            .filter(|(did, _)| !cache.disabled_dids.contains(*did))
-            .map(|(did, credential)| (did.clone(), credential.clone()))
-            .collect::<Vec<_>>();
-        drop(cache);
-
-        for (did, credential) in credentials_to_probe {
-            if self.local_device_probe_succeeds(&credential) {
-                let mut cache = self
-                    .local_credential_cache
-                    .lock()
-                    .map_err(|_| anyhow!("local credential cache lock poisoned"))?;
-                cache.ready_dids.insert(did);
-                continue;
-            }
-            let mut cache = self
-                .local_credential_cache
-                .lock()
-                .map_err(|_| anyhow!("local credential cache lock poisoned"))?;
-            cache.ready_dids.remove(&did);
-            cache.disabled_dids.insert(did);
-        }
-
-        let mut cache = self
-            .local_credential_cache
-            .lock()
-            .map_err(|_| anyhow!("local credential cache lock poisoned"))?;
-        let disabled_dids = cache.disabled_dids.clone();
-        cache.by_did.retain(|did, _| !disabled_dids.contains(did));
-        let known_dids = cache.by_did.keys().cloned().collect::<HashSet<_>>();
-        cache.ready_dids.retain(|did| known_dids.contains(did));
+        // No probe step: with subnet-gated routing every resolved credential is
+        // "ready"; the same-intranet check at control time decides LAN vs cloud.
+        cache.ready_dids = cache.by_did.keys().cloned().collect();
+        cache.disabled_dids.clear();
         drop(cache);
 
         self.write_local_credentials_snapshot(&resolved_by_did)?;
@@ -654,43 +636,6 @@ impl MicoClient {
             cache.ready_dids.insert(key.clone());
             cache.by_did.insert(key, credential.clone());
         }
-    }
-
-    fn disable_local_credential(cache: &mut LocalCredentialCache, did: &str) {
-        for key in local_credential_cache_keys(did) {
-            cache.by_did.remove(&key);
-            cache.ready_dids.remove(&key);
-            cache.disabled_dids.insert(key);
-        }
-    }
-
-    fn invalidate_cached_local_credential(&self, did: &str) -> Result<()> {
-        let mut cache = self
-            .local_credential_cache
-            .lock()
-            .map_err(|_| anyhow!("local credential cache lock poisoned"))?;
-        Self::disable_local_credential(&mut cache, did);
-        Ok(())
-    }
-
-    fn local_miio_client_for_did(&self, did: &str) -> Result<Option<MiioUdpClient>> {
-        let Some(credential) = self.lookup_cached_local_credential(did)? else {
-            return Ok(None);
-        };
-        let token = credential.token.trim();
-        if token.is_empty() || credential.local_ip.trim().is_empty() {
-            return Ok(None);
-        }
-        let addr = if credential.local_ip.contains(':') {
-            credential.local_ip
-        } else {
-            format!("{}:{LOCAL_MIIO_PORT}", credential.local_ip.trim())
-        };
-        Ok(Some(MiioUdpClient::new(&addr, token)?))
-    }
-
-    fn local_device_probe_succeeds(&self, credential: &LocalDeviceCredential) -> bool {
-        probe_local_device(credential)
     }
 
     fn lan_manager(&self) -> Option<LanManager> {
@@ -745,7 +690,7 @@ impl MicoClient {
         if matches!(self.lookup_cached_local_credential(&did), Ok(Some(_))) {
             log_miot_flow(
                 "prime",
-                "lan-udp",
+                "prime",
                 &format!("did={requested_did} request_did={did} reason=already-ready"),
             );
             return Ok(());
@@ -757,7 +702,7 @@ impl MicoClient {
                 }
                 log_miot_flow(
                     "prime",
-                    "lan-udp",
+                    "prime",
                     &format!("did={requested_did} request_did={did} reason=aliased-ready"),
                 );
                 return Ok(());
@@ -784,7 +729,7 @@ impl MicoClient {
             Err(error) => {
                 log_miot_flow(
                     "prime",
-                    "lan-udp",
+                    "prime",
                     &format!("did={did} stage=cloud-fetch error={error}"),
                 );
                 return Ok(());
@@ -794,8 +739,10 @@ impl MicoClient {
         let Some(summary) = page.get(&did) else {
             log_miot_flow(
                 "prime",
-                "lan-udp",
-                &format!("did={did} reason=not-in-device-list (cloud returned no entry for this did)"),
+                "prime",
+                &format!(
+                    "did={did} reason=not-in-device-list (cloud returned no entry for this did)"
+                ),
             );
             return Ok(());
         };
@@ -804,7 +751,7 @@ impl MicoClient {
         if ip.is_empty() {
             log_miot_flow(
                 "prime",
-                "lan-udp",
+                "prime",
                 &format!(
                     "did={did} reason=cloud-localip-empty token_present={} model={} \
                      (cloud did not report a LAN IP; need broadcast discovery)",
@@ -817,7 +764,7 @@ impl MicoClient {
         if token.is_empty() {
             log_miot_flow(
                 "prime",
-                "lan-udp",
+                "prime",
                 &format!("did={did} reason=token-empty local_ip={ip}"),
             );
             return Ok(());
@@ -836,18 +783,18 @@ impl MicoClient {
 
     /// Hydrate the in-memory credential cache from the persisted snapshot — the
     /// same cache `get_local_device_credentials` builds, but sourced from disk
-    /// with **no cloud round-trip**. Each device is probed (~200ms) so readiness
-    /// is accurate, and all are registered with the LAN manager for discovery.
-    /// Lets a fresh process (e.g. a TUI relaunch that would otherwise skip the
-    /// cloud sync) use LAN immediately by reusing cached creds. Returns the count
-    /// of devices confirmed reachable.
+    /// with **no cloud round-trip**. All devices are registered with the LAN
+    /// manager for discovery and marked ready; the same-intranet check at control
+    /// time decides LAN vs cloud per request (no startup probe). Lets a fresh
+    /// process (e.g. a TUI relaunch that skips the cloud sync) use LAN immediately.
+    /// Returns the count of credentials whose IP is on a local subnet.
     pub fn hydrate_local_credentials_from_snapshot(&self) -> Result<usize> {
         let creds = self.load_all_snapshot_credentials()?;
         if creds.is_empty() {
             return Ok(0);
         }
-        // Register everything with the LAN manager so broadcast discovery can
-        // also find devices (and recover if a snapshot IP has since changed).
+        // Register everything with the LAN manager so on-demand / broadcast
+        // discovery can locate the devices (and recover if a snapshot IP changed).
         if let Some(lan) = self.lan_manager() {
             let infos: Vec<LanDeviceInfo> = creds
                 .iter()
@@ -868,53 +815,38 @@ impl MicoClient {
                 lan.update_devices(infos);
             }
         }
+        let total = creds.len();
+        let mut on_subnet = 0usize;
         {
             let mut cache = self
                 .local_credential_cache
                 .lock()
                 .map_err(|_| anyhow!("local credential cache lock poisoned"))?;
-            cache.fetched_at = unix_timestamp();
-            for (did, cred) in &creds {
-                for key in local_credential_cache_keys(did) {
-                    cache.by_did.entry(key).or_insert_with(|| cred.clone());
-                }
+            if cache.fetched_at <= 0 {
+                cache.fetched_at = unix_timestamp();
             }
-        }
-        // Probe in parallel batches — 55 devices × 200ms sequential would block
-        // readiness for ~11s, during which reads see `missing-local-credential`.
-        let total = creds.len();
-        let mut ready = 0usize;
-        for batch in creds.chunks(HYDRATE_PROBE_CONCURRENCY) {
-            let handles: Vec<_> = batch
-                .iter()
-                .cloned()
-                .map(|(did, credential)| {
-                    let cache = Arc::clone(&self.local_credential_cache);
-                    std::thread::spawn(move || {
-                        let reachable = probe_local_device(&credential);
-                        if let Ok(mut cache) = cache.lock() {
-                            if reachable {
-                                Self::insert_ready_local_credential(&mut cache, &did, &credential);
-                            } else {
-                                Self::disable_local_credential(&mut cache, &did);
-                            }
-                        }
-                        reachable
-                    })
-                })
-                .collect();
-            for handle in handles {
-                if handle.join().unwrap_or(false) {
-                    ready += 1;
+            for (did, cred) in &creds {
+                if cred
+                    .local_ip
+                    .trim()
+                    .parse::<std::net::Ipv4Addr>()
+                    .map(is_on_local_subnet)
+                    .unwrap_or(false)
+                {
+                    on_subnet += 1;
+                }
+                for key in local_credential_cache_keys(did) {
+                    cache.by_did.entry(key.clone()).or_insert_with(|| cred.clone());
+                    cache.ready_dids.insert(key);
                 }
             }
         }
         log_miot_flow(
             "hydrate",
-            "lan-udp",
-            &format!("source=snapshot devices={total} ready={ready}"),
+            "prime",
+            &format!("source=snapshot devices={total} on_subnet={on_subnet}"),
         );
-        Ok(ready)
+        Ok(on_subnet)
     }
 
     /// Read every `{did → localIp, token}` from the persisted snapshot.
@@ -1029,46 +961,33 @@ impl MicoClient {
         }
     }
 
-    /// Probe a credential and, if the device answers, seed the in-memory cache so
-    /// the handshake fast path is used. Returns whether the device is now ready.
+    /// Seed the in-memory cache with a credential and mark it ready. Returns
+    /// whether the device's IP is on a local subnet (i.e. LAN is plausible); the
+    /// caller uses `false` to decide whether to refresh a (likely stale) IP from
+    /// the cloud. The actual LAN-vs-cloud routing is decided per request.
     fn prime_local_credential(
         &self,
         did: &str,
         credential: LocalDeviceCredential,
         source: &str,
     ) -> bool {
-        let ip = credential.local_ip.trim();
-        let addr = if ip.contains(':') {
-            ip.to_string()
-        } else {
-            format!("{ip}:{LOCAL_MIIO_PORT}")
-        };
-        // Only enable the local fast path if the device actually answers on the
-        // LAN (a ~200ms probe), so remote invocations don't stall on a stale IP.
-        if !self.local_device_probe_succeeds(&credential) {
-            log_miot_flow(
-                "prime",
-                "lan-udp",
-                &format!(
-                    "did={did} addr={addr} source={source} reason=probe-failed \
-                     (no miIO handshake reply within {}ms — wrong/stale IP, firewall, or device not on this subnet)",
-                    LOCAL_UDP_PROBE_TIMEOUT.as_millis()
-                ),
-            );
-            return false;
-        }
-        log_miot_flow(
-            "prime",
-            "lan-udp",
-            &format!("did={did} addr={addr} source={source} probe=ok ready=true"),
-        );
+        let ip = credential.local_ip.trim().to_string();
+        let on_subnet = ip
+            .parse::<std::net::Ipv4Addr>()
+            .map(is_on_local_subnet)
+            .unwrap_or(false);
         if let Ok(mut cache) = self.local_credential_cache.lock() {
             if cache.fetched_at <= 0 {
                 cache.fetched_at = unix_timestamp();
             }
             Self::insert_ready_local_credential(&mut cache, did, &credential);
         }
-        true
+        log_miot_flow(
+            "prime",
+            "prime",
+            &format!("did={did} ip={ip} source={source} on_subnet={on_subnet} ready=true"),
+        );
+        on_subnet
     }
 
     /// Take the LAN push-event receiver (only the first caller gets it). Lets the
@@ -1085,50 +1004,137 @@ impl MicoClient {
             .unwrap_or(false)
     }
 
-    /// Fast path: control a discovered device directly over the LAN (no
-    /// per-request handshake). Returns `None` to let the caller fall back to the
-    /// legacy handshake path or the cloud.
-    fn try_lan_request(&self, did: &str, method: &str, params: &Value) -> Option<Value> {
+    /// Decide whether `did` can be controlled over the LAN right now: it needs a
+    /// usable credential (token + IP) whose IP is on one of our local subnets
+    /// (the "same intranet" check). That IP + token is what the direct miIO
+    /// handshake in [`Self::lan_execute`] talks to.
+    fn lan_eligibility(&self, did: &str) -> LanEligibility {
         if !lan_discovery_enabled() {
-            log_miot_flow(method, "lan-udp", &format!("did={did} reason=discovery-disabled"));
-            return None;
+            return LanEligibility::Ineligible("lan-disabled".to_string());
         }
-        // Check discovery first so one-shot calls that have nothing on the LAN
-        // skip straight to the fallback without spinning up the mDNS browser.
-        let Some(lan) = self.lan_manager() else {
-            log_miot_flow(
-                method,
-                "lan-udp",
-                &format!("did={did} reason=lan-manager-unavailable"),
-            );
-            return None;
+        let credential = match self.lookup_cached_local_credential(did) {
+            Ok(Some(credential)) => credential,
+            Ok(None) => return LanEligibility::Ineligible("no-credential".to_string()),
+            Err(error) => {
+                return LanEligibility::Ineligible(format!("credential-error error={error}"))
+            }
         };
-        if !lan.is_online(did) {
-            log_miot_flow(
-                method,
-                "lan-udp",
-                &format!("did={did} reason=not-discovered-online (no broadcast reply yet)"),
-            );
-            return None;
+        let ip = credential.local_ip.trim();
+        let token = credential.token.trim();
+        if ip.is_empty() || token.is_empty() {
+            return LanEligibility::Ineligible("no-credential".to_string());
         }
-        // Mirror ha_xiaomi_home: when a central hub gateway is present, defer to
-        // the cloud path instead of direct LAN control.
-        if central_hub_present() {
-            log_miot_flow(
-                method,
-                "lan-udp",
-                &format!("did={did} reason=central-hub-present"),
-            );
-            return None;
+        let Ok(parsed) = ip.parse::<std::net::Ipv4Addr>() else {
+            return LanEligibility::Ineligible(format!("bad-ip ip={ip}"));
+        };
+        if !is_on_local_subnet(parsed) {
+            return LanEligibility::Ineligible(format!("off-subnet ip={ip}"));
         }
-        match lan.request(did, method, params.clone(), LOCAL_LAN_TIMEOUT) {
+        LanEligibility::Eligible(LanTarget {
+            ip: ip.to_string(),
+            token: token.to_string(),
+        })
+    }
+
+    /// Run one request over the LAN. Uses the classic miIO hello-handshake to the
+    /// device's on-subnet IP — the single control transport, which reaches both
+    /// standalone Wi-Fi devices and gateway-proxied sub-devices (the OT
+    /// `LanManager` is kept only for opt-in push subscriptions). Transient UDP
+    /// errors (packet loss on the private LAN) are retried a few times.
+    fn lan_execute(&self, target: &LanTarget, method: &str, params: &Value) -> Result<Value> {
+        let mut last_error = None;
+        for attempt in 1..=LAN_MAX_ATTEMPTS {
+            match crate::miot_lan::lan_request_direct(
+                &target.ip,
+                &target.token,
+                method,
+                params,
+                LOCAL_LAN_TIMEOUT,
+            ) {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if attempt < LAN_MAX_ATTEMPTS && is_transient_lan_error(&error) {
+                        last_error = Some(error);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("lan request failed")))
+    }
+
+    /// The single control router for set/action: detect intranet → try LAN →
+    /// fall back to cloud, unless `--LAN` forces LAN with no fallback.
+    fn route_control(
+        &self,
+        op: &str,
+        did: &str,
+        lan_method: &str,
+        lan_params: Value,
+        cloud: impl FnOnce() -> Result<Value>,
+    ) -> Result<Value> {
+        let forced = force_lan_enabled();
+        let mode = if forced { "forced-lan" } else { "auto" };
+
+        if forced {
+            return match self.lan_eligibility(did) {
+                LanEligibility::Eligible(target) => {
+                    self.record_channel(MiotChannel::Lan);
+                    match self.lan_execute(&target, lan_method, &lan_params) {
+                        Ok(value) => {
+                            log_route(op, did, mode, "LAN", "forced", "ok", None);
+                            Ok(value)
+                        }
+                        Err(error) => {
+                            log_route(op, did, mode, "LAN", "forced", "err", Some(&error));
+                            Err(anyhow!("--LAN: LAN control failed for {did}: {error}"))
+                        }
+                    }
+                }
+                LanEligibility::Ineligible(reason) => {
+                    log_route(op, did, mode, "none", &reason, "err", None);
+                    Err(anyhow!("--LAN: {did} not controllable over LAN: {reason}"))
+                }
+            };
+        }
+
+        // AUTO: LAN → cloud.
+        match self.lan_eligibility(did) {
+            LanEligibility::Eligible(target) => {
+                match self.lan_execute(&target, lan_method, &lan_params) {
+                    Ok(value) => {
+                        self.record_channel(MiotChannel::Lan);
+                        log_route(op, did, mode, "LAN", "eligible", "ok", None);
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        log_route(op, did, mode, "LAN", "attempt", "err", Some(&error));
+                        self.route_cloud(op, did, mode, "lan-failed", cloud)
+                    }
+                }
+            }
+            LanEligibility::Ineligible(reason) => self.route_cloud(op, did, mode, &reason, cloud),
+        }
+    }
+
+    fn route_cloud(
+        &self,
+        op: &str,
+        did: &str,
+        mode: &str,
+        reason: &str,
+        cloud: impl FnOnce() -> Result<Value>,
+    ) -> Result<Value> {
+        self.record_channel(MiotChannel::Cloud);
+        match cloud() {
             Ok(value) => {
-                log_miot_flow(method, "lan-udp", &format!("did={did}"));
-                Some(value)
+                log_route(op, did, mode, "Cloud", reason, "ok", None);
+                Ok(value)
             }
             Err(error) => {
-                log_miot_flow(method, "lan-udp", &format!("did={did} error={error}"));
-                None
+                log_route(op, did, mode, "Cloud", reason, "err", Some(&error));
+                Err(error)
             }
         }
     }
@@ -1142,89 +1148,6 @@ impl MicoClient {
     /// The transport used by the most recent single-device request, if known.
     pub fn last_channel(&self) -> Option<MiotChannel> {
         self.last_channel.lock().ok().and_then(|guard| *guard)
-    }
-
-    /// Try the local fast paths and record which transport served the request.
-    /// `Some` means a local (LAN) path succeeded; `None` means the caller will
-    /// fall back to the cloud, which we record accordingly.
-    fn try_local_request_with_retry(
-        &self,
-        did: &str,
-        method: &str,
-        params: Value,
-    ) -> Option<Value> {
-        let result = self.try_local_request_inner(did, method, params);
-        let channel = if result.is_some() {
-            MiotChannel::Lan
-        } else {
-            MiotChannel::Cloud
-        };
-        self.record_channel(channel);
-        log_miot_flow(
-            method,
-            "channel",
-            &format!("did={did} resolved={}", channel.as_str()),
-        );
-        result
-    }
-
-    fn try_local_request_inner(
-        &self,
-        did: &str,
-        method: &str,
-        params: Value,
-    ) -> Option<Value> {
-        if let Some(value) = self.try_lan_request(did, method, &params) {
-            return Some(value);
-        }
-
-        let client = match self.local_miio_client_for_did(did) {
-            Ok(Some(client)) => client,
-            Ok(None) => {
-                log_miot_flow(
-                    method,
-                    "local-udp",
-                    &format!("did={did} reason=missing-local-credential"),
-                );
-                return None;
-            }
-            Err(error) => {
-                log_miot_flow(
-                    method,
-                    "local-udp",
-                    &format!("did={did} reason=credential-error error={error}"),
-                );
-                return None;
-            }
-        };
-
-        for attempt in 1..=LOCAL_UDP_MAX_ATTEMPTS {
-            match client.request(method, params.clone()) {
-                Ok(value) => return Some(value),
-                Err(error)
-                    if attempt < LOCAL_UDP_MAX_ATTEMPTS && is_transient_local_udp_error(&error) =>
-                {
-                    continue;
-                }
-                Err(error) => {
-                    log_miot_flow(
-                        method,
-                        "local-udp",
-                        &format!("did={did} attempt={attempt} error={error}"),
-                    );
-                    if let Err(invalidate_error) = self.invalidate_cached_local_credential(did) {
-                        log_miot_flow(
-                            method,
-                            "local-udp",
-                            &format!("did={did} stage=invalidate error={invalidate_error}"),
-                        );
-                    }
-                    return None;
-                }
-            }
-        }
-
-        None
     }
 
     pub fn set_volume(&self, did: &str, volume: u8) -> Result<()> {
@@ -1241,7 +1164,82 @@ impl MicoClient {
             .unwrap_or(Value::Null))
     }
 
+    /// Read all property chunks for one device over a single LAN handshake.
+    /// Returns one entry per chunk: `Some(values)` for a LAN-resolved chunk,
+    /// `None` when that chunk should fall back to cloud. The handshake (not each
+    /// chunk) is retried on transient errors.
+    fn lan_get_chunks(
+        &self,
+        did: &str,
+        target: &LanTarget,
+        chunks: &[&[(usize, i64, i64)]],
+        mode: &str,
+    ) -> Vec<Option<Value>> {
+        let requests: Vec<(&str, Value)> = chunks
+            .iter()
+            .map(|chunk| {
+                (
+                    "get_properties",
+                    Value::Array(miio_get_properties_params(did, chunk)),
+                )
+            })
+            .collect();
+        for attempt in 1..=LAN_MAX_ATTEMPTS {
+            match crate::miot_lan::lan_request_batch(
+                &target.ip,
+                &target.token,
+                &requests,
+                LOCAL_LAN_TIMEOUT,
+            ) {
+                Ok(results) => {
+                    self.record_channel(MiotChannel::Lan);
+                    return results
+                        .into_iter()
+                        .zip(chunks.iter())
+                        .map(|(res, chunk)| match res {
+                            Ok(value) => {
+                                log_route(
+                                    "get",
+                                    did,
+                                    mode,
+                                    "LAN",
+                                    &format!("props={}", chunk.len()),
+                                    "ok",
+                                    None,
+                                );
+                                Some(value)
+                            }
+                            Err(error) => {
+                                log_route(
+                                    "get",
+                                    did,
+                                    mode,
+                                    "LAN",
+                                    &format!("props={}", chunk.len()),
+                                    "err",
+                                    Some(&error),
+                                );
+                                None
+                            }
+                        })
+                        .collect();
+                }
+                Err(error) => {
+                    if attempt < LAN_MAX_ATTEMPTS && is_transient_lan_error(&error) {
+                        continue;
+                    }
+                    log_route("get", did, mode, "LAN", "handshake", "err", Some(&error));
+                    return vec![None; chunks.len()];
+                }
+            }
+        }
+        vec![None; chunks.len()]
+    }
+
     pub fn get_props_batch(&self, params: &[(&str, i64, i64)]) -> Result<Value> {
+        let forced = force_lan_enabled();
+        let mode = if forced { "forced-lan" } else { "auto" };
+
         let mut grouped: HashMap<String, Vec<(usize, i64, i64)>> = HashMap::new();
         for (index, (did, siid, piid)) in params.iter().enumerate() {
             grouped
@@ -1253,51 +1251,63 @@ impl MicoClient {
         let mut output = vec![Value::Null; params.len()];
         let mut unresolved_indices = Vec::new();
         for (did, items) in grouped {
-            // Chunk so each local response stays under the device's ~1 KB cap; an
-            // oversized response truncates to invalid JSON. Each chunk that fails
-            // locally falls back to the cloud independently.
-            for chunk in items.chunks(LOCAL_PROPS_CHUNK_SIZE) {
-                let miio_params = chunk
-                    .iter()
-                    .map(|(_, siid, piid)| {
-                        json!({
-                            "did": did,
-                            "siid": siid,
-                            "piid": piid,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let local = self.try_local_request_with_retry(
-                    did.as_str(),
-                    "get_properties",
-                    Value::Array(miio_params),
-                );
-                if let Some(result) = local {
-                    log_miot_flow(
-                        "get_props_batch",
-                        "local-udp",
-                        &format!("did={did} props={}", chunk.len()),
-                    );
-                    if let Some(values) = result.as_array() {
-                        for (pos, (index, _, _)) in chunk.iter().enumerate() {
-                            if let Some(value) = values.get(pos) {
-                                output[*index] = value.clone();
-                            } else {
-                                unresolved_indices.push(*index);
+            // Resolve LAN eligibility once per device (same intranet + credential).
+            let target = match self.lan_eligibility(&did) {
+                LanEligibility::Eligible(target) => Some(target),
+                LanEligibility::Ineligible(reason) => {
+                    if forced {
+                        return Err(anyhow!("--LAN: {did} not controllable over LAN: {reason}"));
+                    }
+                    log_route("get", &did, mode, "Cloud", &reason, "pending", None);
+                    None
+                }
+            };
+
+            // Chunk so each LAN response stays under the device's ~1 KB UDP cap;
+            // an oversized response truncates to invalid JSON. All chunks for a
+            // device share ONE handshake — many miIO devices drop back-to-back
+            // hello handshakes, which would fail every chunk after the first.
+            let chunks: Vec<&[(usize, i64, i64)]> =
+                items.chunks(LOCAL_PROPS_CHUNK_SIZE).collect();
+            let chunk_values = match target.as_ref() {
+                Some(target) => self.lan_get_chunks(&did, target, &chunks, mode),
+                None => vec![None; chunks.len()],
+            };
+
+            for (chunk, value) in chunks.iter().zip(chunk_values) {
+                match value {
+                    Some(result) => {
+                        if let Some(values) = result.as_array() {
+                            for (pos, (index, _, _)) in chunk.iter().enumerate() {
+                                if let Some(value) = values.get(pos) {
+                                    output[*index] = value.clone();
+                                } else {
+                                    unresolved_indices.push(*index);
+                                }
                             }
+                        } else {
+                            unresolved_indices.extend(chunk.iter().map(|(index, _, _)| *index));
                         }
-                    } else {
+                    }
+                    None => {
+                        if forced {
+                            return Err(anyhow!("--LAN: LAN read failed for {did}"));
+                        }
                         unresolved_indices.extend(chunk.iter().map(|(index, _, _)| *index));
                     }
-                } else {
-                    log_miot_flow(
-                        "get_props_batch",
-                        "cloud",
-                        &format!("did={did} reason=fallback props={}", chunk.len()),
-                    );
-                    unresolved_indices.extend(chunk.iter().map(|(index, _, _)| *index));
                 }
             }
+        }
+
+        if forced {
+            // No cloud fallback under --LAN: a complete LAN response, or an error.
+            if unresolved_indices.is_empty() {
+                return Ok(Value::Array(output));
+            }
+            return Err(anyhow!(
+                "--LAN: incomplete LAN response ({} unresolved property/properties)",
+                unresolved_indices.len()
+            ));
         }
 
         if unresolved_indices.is_empty() {
@@ -1321,10 +1331,14 @@ impl MicoClient {
             "/app/v2/miotspec/prop/get",
             &json!({ "params": fallback_params }),
         )?;
-        log_miot_flow(
-            "get_props_batch",
-            "cloud",
+        log_route(
+            "get",
+            "batch",
+            mode,
+            "Cloud",
             &format!("items={}", unresolved_indices.len()),
+            "ok",
+            None,
         );
         if let Some(values) = fallback.as_array() {
             for (position, index) in unresolved_indices.iter().enumerate() {
@@ -1376,70 +1390,38 @@ impl MicoClient {
 
     pub fn set_prop(&self, did: &str, siid: i64, piid: i64, value: Value) -> Result<Value> {
         let did = prop_request_did(did);
-        if let Some(result) = self.try_local_request_with_retry(
-            did.as_str(),
-            "set_properties",
-            Value::Array(vec![json!({
-                "did": did,
-                "siid": siid,
-                "piid": piid,
-                "value": value.clone(),
-            })]),
-        ) {
-            log_miot_flow("set_prop", "local-udp", &format!("did={did} {siid}.{piid}"));
-            return Ok(result);
-        }
-        log_miot_flow(
-            "set_prop",
-            "cloud",
-            &format!("did={did} {siid}.{piid} reason=fallback"),
-        );
-        self.post_encrypted(
-            "/app/v2/miotspec/prop/set",
-            &json!({
-                "params": [
-                    {
-                        "did": did,
-                        "siid": siid,
-                        "piid": piid,
-                        "value": value,
-                    }
-                ]
-            }),
-        )
+        let entry = json!({
+            "did": did,
+            "siid": siid,
+            "piid": piid,
+            "value": value,
+        });
+        let lan_params = Value::Array(vec![entry.clone()]);
+        let cloud_body = json!({ "params": [entry] });
+        self.route_control("set", &did, "set_properties", lan_params, || {
+            self.post_encrypted("/app/v2/miotspec/prop/set", &cloud_body)
+        })
     }
 
     pub fn action(&self, did: &str, siid: i64, aiid: i64, values: &[Value]) -> Result<Value> {
         let did = prop_request_did(did);
-        if let Some(result) = self.try_local_request_with_retry(
-            did.as_str(),
-            "action",
-            json!({
+        let lan_params = json!({
+            "did": did,
+            "siid": siid,
+            "aiid": aiid,
+            "in": values,
+        });
+        let cloud_body = json!({
+            "params": {
                 "did": did,
                 "siid": siid,
                 "aiid": aiid,
                 "in": values,
-            }),
-        ) {
-            log_miot_flow("action", "local-udp", &format!("did={did} {siid}.{aiid}"));
-            return Ok(result);
-        }
-        log_miot_flow(
-            "action",
-            "cloud",
-            &format!("did={did} {siid}.{aiid} reason=fallback"),
-        );
-        self.post_encrypted(
-            "/app/v2/miotspec/action",
-            &json!({
-                "params": {
-                    "did": did,
-                    "siid": siid,
-                    "aiid": aiid,
-                    "in": values,
-                }
-            }),
-        )
+            }
+        });
+        self.route_control("action", &did, "action", lan_params, || {
+            self.post_encrypted("/app/v2/miotspec/action", &cloud_body)
+        })
     }
 
     pub fn create_app_notification(&self, text: &str) -> Result<String> {
@@ -1840,7 +1822,6 @@ pub fn has_cached_local_credential_for_device(device_id: &str, did: &str) -> boo
 }
 
 static LAN_MANAGERS: OnceLock<Mutex<HashMap<String, Option<LanManager>>>> = OnceLock::new();
-static CENTRAL_HUB_MONITOR: OnceLock<Option<CentralHubMonitor>> = OnceLock::new();
 
 fn env_flag(name: &str) -> bool {
     env::var(name)
@@ -1851,9 +1832,8 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Direct LAN discovery is on by default; set `MIT_DISABLE_LAN_DISCOVERY=1` to
-/// fall back to the legacy per-request handshake (and skip the background
-/// discovery / mDNS threads entirely).
+/// LAN control is on by default; set `MIT_DISABLE_LAN_DISCOVERY=1` to force every
+/// request to the cloud (and skip the background push/discovery thread entirely).
 fn lan_discovery_enabled() -> bool {
     !env_flag("MIT_DISABLE_LAN_DISCOVERY")
 }
@@ -1878,30 +1858,6 @@ fn lan_manager_for_device(device_id: &str) -> Option<LanManager> {
     manager
 }
 
-/// Whether a MIoT central hub gateway is present (lazily starts an mDNS browser).
-/// When present, direct LAN control is gated off in favour of the cloud path,
-/// mirroring `ha_xiaomi_home`'s coordination between LAN and the central hub.
-fn central_hub_present() -> bool {
-    if !lan_discovery_enabled() {
-        return false;
-    }
-    CENTRAL_HUB_MONITOR
-        .get_or_init(|| CentralHubMonitor::start().ok())
-        .as_ref()
-        .map(|monitor| monitor.has_primary_hub())
-        .unwrap_or(false)
-}
-
-/// Non-initializing check of central-hub presence, safe to call from rendering
-/// (does not start the mDNS browser).
-fn lan_central_hub_present_if_started() -> bool {
-    CENTRAL_HUB_MONITOR
-        .get()
-        .and_then(|monitor| monitor.as_ref())
-        .map(|monitor| monitor.has_primary_hub())
-        .unwrap_or(false)
-}
-
 /// Whether any running LAN manager has discovered this DID online. DIDs are
 /// globally unique, so we can scan every account's manager without needing to
 /// know which account owns the device.
@@ -1918,9 +1874,10 @@ fn lan_device_is_online_any(did: &str) -> bool {
         .any(|manager| manager.is_online(did))
 }
 
-/// Whether any account has a probed-ready local credential for this DID (the
-/// legacy handshake fast path is available).
-fn local_credential_ready_any(did: &str) -> bool {
+/// Whether any account has a ready local credential for this DID whose IP is on
+/// one of our local subnets (i.e. the same-intranet check would pass, so LAN
+/// control is plausible).
+fn local_credential_on_subnet_any(did: &str) -> bool {
     let Some(registry) = LOCAL_CREDENTIAL_CACHES.get() else {
         return false;
     };
@@ -1932,22 +1889,27 @@ fn local_credential_ready_any(did: &str) -> bool {
             .lock()
             .map(|cache| {
                 cache.fetched_at > 0
-                    && !cache.disabled_dids.contains(did)
                     && cache.ready_dids.contains(did)
+                    && cache
+                        .by_did
+                        .get(did)
+                        .and_then(|cred| cred.local_ip.trim().parse::<std::net::Ipv4Addr>().ok())
+                        .map(is_on_local_subnet)
+                        .unwrap_or(false)
             })
             .unwrap_or(false)
     })
 }
 
 /// Best-effort, non-initializing resolution of the transport a request to this
-/// DID would use right now: `Lan` when the device is locally reachable (LAN
-/// discovery online or a probed-ready local credential) and no central hub is
-/// gating it off, otherwise `Cloud`. Intended for status display.
+/// DID would use right now under AUTO routing: `Lan` when the device is locally
+/// reachable (LAN-discovered online, or a credential on our subnet), otherwise
+/// `Cloud`. Intended for status display.
 pub fn device_link_channel(did: &str) -> MiotChannel {
-    if lan_central_hub_present_if_started() {
+    if !lan_discovery_enabled() {
         return MiotChannel::Cloud;
     }
-    if lan_device_is_online_any(did) || local_credential_ready_any(did) {
+    if lan_device_is_online_any(did) || local_credential_on_subnet_any(did) {
         MiotChannel::Lan
     } else {
         MiotChannel::Cloud
@@ -2143,6 +2105,7 @@ fn value_to_string(value: &Value) -> String {
 }
 
 static MIOT_VERBOSE: AtomicBool = AtomicBool::new(false);
+static FORCE_LAN: AtomicBool = AtomicBool::new(false);
 
 /// Enable diagnostic logging to stderr (the `--verbose` CLI flag). Flow logs are
 /// always written to `~/.mit/miot-flow.log`; verbose additionally mirrors them to
@@ -2153,6 +2116,16 @@ pub fn set_verbose_logging(enabled: bool) {
 
 fn verbose_logging() -> bool {
     MIOT_VERBOSE.load(Ordering::Relaxed)
+}
+
+/// Force LAN control with no cloud fallback (the `--LAN` CLI flag). When set, a
+/// device that is not on the local subnet fails fast instead of going to cloud.
+pub fn set_force_lan(enabled: bool) {
+    FORCE_LAN.store(enabled, Ordering::Relaxed);
+}
+
+fn force_lan_enabled() -> bool {
+    FORCE_LAN.load(Ordering::Relaxed)
 }
 
 /// UTC wall-clock `HH:MM:SS` so log lines from different runs are distinguishable
@@ -2188,21 +2161,23 @@ fn log_miot_flow(operation: &str, flow: &str, detail: &str) {
     }
 }
 
-/// Probe a device with a miIO handshake (~200ms). Free function so it can run on
-/// worker threads during parallel hydration.
-fn probe_local_device(credential: &LocalDeviceCredential) -> bool {
-    let token = credential.token.trim();
-    if token.is_empty() || credential.local_ip.trim().is_empty() {
-        return false;
+/// Emit one standardized routing line so the chosen flow is unambiguous:
+/// `op=<op> transport=<LAN|Cloud|none> did=<did> mode=<auto|forced-lan>
+/// reason=<…> result=<ok|err|pending>`.
+fn log_route(
+    op: &str,
+    did: &str,
+    mode: &str,
+    transport: &str,
+    reason: &str,
+    result: &str,
+    error: Option<&anyhow::Error>,
+) {
+    let mut detail = format!("did={did} mode={mode} reason={reason} result={result}");
+    if let Some(error) = error {
+        detail.push_str(&format!(" error={error}"));
     }
-    let addr = if credential.local_ip.contains(':') {
-        credential.local_ip.clone()
-    } else {
-        format!("{}:{LOCAL_MIIO_PORT}", credential.local_ip.trim())
-    };
-    MiioUdpClient::with_timeout(&addr, token, LOCAL_UDP_PROBE_TIMEOUT)
-        .and_then(|client| client.probe())
-        .is_ok()
+    log_miot_flow(op, transport, &detail);
 }
 
 fn miot_flow_log_path() -> Option<PathBuf> {
@@ -2233,12 +2208,29 @@ fn is_gateway_model(model: &str) -> bool {
     text.contains("gateway") || text.contains(".hub")
 }
 
-fn is_transient_local_udp_error(error: &anyhow::Error) -> bool {
+/// Whether a LAN error is a transient private-network glitch worth retrying
+/// (UDP packet loss surfaces as a read timeout, and an occasional truncated
+/// reply fails AES unpadding) rather than a permanent failure.
+fn is_transient_lan_error(error: &anyhow::Error) -> bool {
     let text = error.to_string().to_ascii_lowercase();
     text.contains("timed out")
         || text.contains("would block")
         || text.contains("resource temporarily unavailable")
         || text.contains("os error 35")
+        || text.contains("unpaderror")
+}
+
+fn miio_get_properties_params(did: &str, props: &[(usize, i64, i64)]) -> Vec<Value> {
+    props
+        .iter()
+        .map(|(_, siid, piid)| {
+            json!({
+                "did": did,
+                "siid": siid,
+                "piid": piid,
+            })
+        })
+        .collect()
 }
 
 fn root_did_for_sub_device(did: &str) -> Option<&str> {

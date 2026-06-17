@@ -1817,13 +1817,16 @@ impl TuiApp {
             logs_index,
             statistics_index,
         ) = match &self.prop_dialog {
+            // Note: we intentionally do NOT block on `dialog.refresh_rx.is_some()`.
+            // Opening a dialog starts a slow background mijia logs/statistics fetch
+            // that holds `refresh_rx` for many seconds; gating R on it made R appear
+            // to do nothing. A new refresh simply replaces that in-flight fetch.
             Some(dialog)
                 if !dialog.loading
                     && dialog.status.is_none()
                     && !dialog.items.is_empty()
                     && (allow_editing || !dialog.editing)
-                    && !dialog.refreshing
-                    && dialog.refresh_rx.is_none() =>
+                    && !dialog.refreshing =>
             {
                 let Some(account) = self
                     .accounts

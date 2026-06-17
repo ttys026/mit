@@ -36,6 +36,13 @@ pub struct Cli {
     pub json: bool,
     #[arg(long, global = true, help = "输出诊断日志（含 LAN/云通道选择原因）")]
     pub verbose: bool,
+    #[arg(
+        long = "LAN",
+        visible_alias = "lan",
+        global = true,
+        help = "强制局域网控制，禁止云端回退（设备不在同一内网时直接报错）"
+    )]
+    pub force_lan: bool,
     #[command(subcommand)]
     pub command: Option<RootCommand>,
 }
@@ -419,6 +426,7 @@ fn arg_expects_value(arg: &clap::Arg) -> bool {
 
 pub fn run(args: Cli) -> Result<()> {
     crate::mico_api::set_verbose_logging(args.verbose);
+    crate::mico_api::set_force_lan(args.force_lan);
     let output_mode = OutputMode::from_json_flag(args.json);
     match args.command {
         Some(RootCommand::Auth(args)) => handle_auth(output_mode, args),

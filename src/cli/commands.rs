@@ -282,6 +282,22 @@ fn find_target_device(did: &str) -> Result<TargetDevice> {
         bail!("未授权，请先执行 mit auth login");
     }
     let normalized_did = normalize_command_did(did);
+
+    // Fast path: resolve the device from the on-disk cache the TUI/sync writes
+    // (`devices.json`), so a single `props` command does not pay for a full cloud
+    // device-list fetch. The LAN credential (IP + token) comes from the snapshot,
+    // so this whole path stays off the network.
+    for account in &accounts {
+        let cached = load_cached_devices(&account.user.uid)
+            .into_iter()
+            .find(|device| normalize_command_did(device.did.as_str()) == normalized_did);
+        if let Some(device) = cached {
+            let fresh = ensure_fresh_account(auth_state.clone(), account.clone())?;
+            return Ok(TargetDevice { fresh, device });
+        }
+    }
+
+    // Slow path: the device isn't cached yet — fall back to the cloud device list.
     let mut working_auth_state = auth_state;
     for account in accounts {
         let fresh = ensure_fresh_account(working_auth_state.clone(), account)?;
@@ -293,6 +309,29 @@ fn find_target_device(did: &str) -> Result<TargetDevice> {
         }
     }
     bail!("未找到设备 {did}");
+}
+
+/// Read the per-account `devices.json` cache (written by the TUI / device sync)
+/// without any cloud round-trip. Tolerates both the `{ "devices": [...] }` and
+/// bare-array layouts; returns empty on any miss so callers fall back to cloud.
+fn load_cached_devices(uid: &str) -> Vec<crate::mico_api::Device> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return Vec::new();
+    }
+    let path = crate::storage::get_account_dir(uid).join("devices.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let devices = if value.is_array() {
+        value
+    } else {
+        value.get("devices").cloned().unwrap_or(Value::Null)
+    };
+    serde_json::from_value::<Vec<crate::mico_api::Device>>(devices).unwrap_or_default()
 }
 
 fn parse_cli_value(text: &str) -> Result<Value> {

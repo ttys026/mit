@@ -375,10 +375,8 @@ impl CallbackServer {
                         match &login_page {
                             // A failed status write (e.g. the poll connection
                             // closed) is non-fatal; keep waiting for the scan.
-                            Some(page) => {
-                                write_mijia_login_status_response(&mut stream, page)
-                                    .unwrap_or_default()
-                            }
+                            Some(page) => write_mijia_login_status_response(&mut stream, page)
+                                .unwrap_or_default(),
                             None => {
                                 let _ = write_json_response(
                                     &mut stream,

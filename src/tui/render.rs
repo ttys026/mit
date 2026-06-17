@@ -207,8 +207,12 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 let prefix = lang_str(app.language, "当前版本", "Current Version");
                 let separator = lang_str(app.language, "：", ": ");
                 let status = app.update_check_status.clone().unwrap_or_else(|| {
-                    lang_str(app.language, "回车检查更新", "press Enter to check for updates")
-                        .to_string()
+                    lang_str(
+                        app.language,
+                        "回车检查更新",
+                        "press Enter to check for updates",
+                    )
+                    .to_string()
                 });
                 let (open, close) = match app.language {
                     Language::Chinese => ("（", "）"),
@@ -333,8 +337,16 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 let popup = centered_rect(48, 34, frame.area());
                 let items = [
                     lang_str(app.language, "推送消息", "Push Message"),
-                    lang_str(app.language, "重新登录(小米: 设备列表/设备操作)", "Relogin (Xiaomi: Device List / Device Control)"),
-                    lang_str(app.language, "重新登录(米家: 操作记录/能耗统计)", "Relogin (Mijia: Action History / Energy Stats)"),
+                    lang_str(
+                        app.language,
+                        "重新登录(小米: 设备列表/设备操作)",
+                        "Relogin (Xiaomi: Device List / Device Control)",
+                    ),
+                    lang_str(
+                        app.language,
+                        "重新登录(米家: 操作记录/能耗统计)",
+                        "Relogin (Mijia: Action History / Energy Stats)",
+                    ),
                     lang_str(app.language, "退出登录", "Logout"),
                 ]
                 .iter()
@@ -491,7 +503,10 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 let popup = centered_rect(60, 30, frame.area());
                 frame.render_widget(Clear, popup);
                 let body = [
-                    format!("{}: {latest}", lang_str(app.language, "发现新版本", "New version")),
+                    format!(
+                        "{}: {latest}",
+                        lang_str(app.language, "发现新版本", "New version")
+                    ),
                     format!(
                         "{}: v{}",
                         lang_str(app.language, "当前版本", "Current"),
@@ -507,11 +522,11 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 ];
                 frame.render_widget(
                     Paragraph::new(body.join("\n"))
-                        .block(
-                            Block::default()
-                                .borders(all_borders())
-                                .title(lang_str(app.language, "更新", "Update")),
-                        )
+                        .block(Block::default().borders(all_borders()).title(lang_str(
+                            app.language,
+                            "更新",
+                            "Update",
+                        )))
                         .wrap(Wrap { trim: true }),
                     popup,
                 );
@@ -530,11 +545,11 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 body.extend(lines.iter().cloned());
                 frame.render_widget(
                     Paragraph::new(body.join("\n"))
-                        .block(
-                            Block::default()
-                                .borders(all_borders())
-                                .title(lang_str(app.language, "正在升级", "Updating")),
-                        )
+                        .block(Block::default().borders(all_borders()).title(lang_str(
+                            app.language,
+                            "正在升级",
+                            "Updating",
+                        )))
                         .wrap(Wrap { trim: true }),
                     popup,
                 );

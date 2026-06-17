@@ -746,14 +746,19 @@ pub(crate) fn draw_prop_dialog(
         match dialog {
             AccountActionDialog::Menu { selected } => {
                 let popup = centered_rect(48, 34, frame.area());
-                let items = ["推送消息", "重新登录(小米: 设备列表/设备操作)", "重新登录(米家: 操作记录/能耗统计)", "登出"]
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, item)| {
-                        let selected_marker = if idx == *selected { ">" } else { " " };
-                        ListItem::new(format!("{selected_marker} {item}"))
-                    })
-                    .collect::<Vec<_>>();
+                let items = [
+                    "推送消息",
+                    "重新登录(小米: 设备列表/设备操作)",
+                    "重新登录(米家: 操作记录/能耗统计)",
+                    "登出",
+                ]
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| {
+                    let selected_marker = if idx == *selected { ">" } else { " " };
+                    ListItem::new(format!("{selected_marker} {item}"))
+                })
+                .collect::<Vec<_>>();
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
                     List::new(items)

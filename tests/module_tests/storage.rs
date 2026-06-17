@@ -158,7 +158,9 @@ fn auth_v1_flat_account_migrates_to_v2_nested_on_write() {
     write_auth(&path, &auth).unwrap();
 
     let persisted: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    let account = persisted["accounts"].as_array().unwrap()[0].as_object().unwrap();
+    let account = persisted["accounts"].as_array().unwrap()[0]
+        .as_object()
+        .unwrap();
     // Version bumped, Xiaomi fields nested, Mijia null, flat fields gone.
     assert_eq!(account["version"], json!(CURRENT_AUTH_VERSION));
     assert_eq!(account["mijia"], Value::Null);

@@ -22,7 +22,25 @@ fn root_help_lists_commands() {
     assert!(stdout.contains("启动全屏 TUI 控制台"));
     assert!(stdout.contains("--json"));
     assert!(stdout.contains("使用 JSON 格式输出"));
+    assert!(stdout.contains("--LAN"));
+    assert!(stdout.contains("强制局域网控制"));
     assert!(!stdout.contains("help     Print this message or the help of the given subcommand(s)"));
+}
+
+#[test]
+fn lan_flag_is_accepted_globally_with_both_casings() {
+    // The global `--LAN` flag (and its `--lan` alias) parse before any subcommand.
+    for flag in ["--LAN", "--lan"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+            .args([flag, "props", "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "flag={flag} should be accepted; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
