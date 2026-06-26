@@ -16,6 +16,8 @@ pub(crate) struct DeviceListRow {
     pub(crate) category: String,
     pub(crate) room: String,
     pub(crate) account: String,
+    /// Connection-type label ("WiFi"/"BLE-Mesh"/…); empty when unknown.
+    pub(crate) connect: String,
     /// Transport label ("LAN"/"Cloud"); empty when unknown.
     pub(crate) channel: String,
 }
@@ -26,12 +28,13 @@ pub(crate) struct DeviceListColumns {
     pub(crate) category: usize,
     pub(crate) room: usize,
     pub(crate) account: usize,
+    pub(crate) connect: usize,
     pub(crate) channel: usize,
 }
 
 impl DeviceListColumns {
     pub(crate) fn total_width(self) -> usize {
-        self.room + self.name + self.category + self.account + self.channel
+        self.room + self.name + self.category + self.connect + self.account + self.channel
     }
 
     fn shrink_largest(&mut self) -> bool {
@@ -40,6 +43,7 @@ impl DeviceListColumns {
             self.category,
             self.room,
             self.account,
+            self.connect,
             self.channel,
         ];
         if !shrink_largest_width(&mut widths) {
@@ -50,6 +54,7 @@ impl DeviceListColumns {
             self.category,
             self.room,
             self.account,
+            self.connect,
             self.channel,
         ] = widths;
         true
@@ -79,6 +84,7 @@ pub(crate) fn device_list_row(
         category: category.to_string(),
         room: room.to_string(),
         account: account_label.trim().to_string(),
+        connect: String::new(),
         channel: String::new(),
     }
 }
@@ -93,8 +99,9 @@ pub(crate) fn compute_device_list_columns(
         name: UnicodeWidthStr::width(headers[1]) + 2,
         category: UnicodeWidthStr::width(headers[2]) + 2,
         room: UnicodeWidthStr::width(headers[0]) + 2,
-        account: UnicodeWidthStr::width(headers[3]) + 2,
-        channel: UnicodeWidthStr::width(headers[4]) + 2,
+        connect: UnicodeWidthStr::width(headers[3]) + 2,
+        account: UnicodeWidthStr::width(headers[4]) + 2,
+        channel: UnicodeWidthStr::width(headers[5]) + 2,
     };
     for row in rows {
         columns.name = columns
@@ -106,6 +113,9 @@ pub(crate) fn compute_device_list_columns(
         columns.room = columns
             .room
             .max(UnicodeWidthStr::width(row.room.as_str()) + 2);
+        columns.connect = columns
+            .connect
+            .max(UnicodeWidthStr::width(row.connect.as_str()) + 2);
         columns.account = columns
             .account
             .max(UnicodeWidthStr::width(row.account.as_str()) + 2);
@@ -123,10 +133,11 @@ pub(crate) fn format_device_list_item_with_columns(
     columns: DeviceListColumns,
 ) -> String {
     format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         display_truncate_pad(&row.room, columns.room),
         display_truncate_pad_with_ellipsis(&row.name, columns.name),
         display_truncate_pad(&row.category, columns.category),
+        display_truncate_pad(&row.connect, columns.connect),
         display_truncate_pad(&row.account, columns.account),
         display_truncate_pad(&row.channel, columns.channel),
     )
@@ -156,12 +167,13 @@ pub(crate) fn format_device_list_header_with_columns(
 ) -> String {
     let headers = device_list_header_titles(lang);
     format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         display_truncate_pad(headers[0], columns.room),
         display_truncate_pad(headers[1], columns.name),
         display_truncate_pad(headers[2], columns.category),
-        display_truncate_pad(headers[3], columns.account),
-        display_truncate_pad(headers[4], columns.channel),
+        display_truncate_pad(headers[3], columns.connect),
+        display_truncate_pad(headers[4], columns.account),
+        display_truncate_pad(headers[5], columns.channel),
     )
 }
 

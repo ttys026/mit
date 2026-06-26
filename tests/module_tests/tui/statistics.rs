@@ -95,8 +95,8 @@ fn prop_dialog_statistics_tab_renders_controls_and_bar_chart() {
         terminal_find_substring_position_in_area(&terminal, "1.25", chart_area).is_none(),
         "{stats_text}"
     );
-    let first_bar_position = terminal_find_substring_position_in_area(&terminal, "█", chart_area)
-        .expect("bar rendered");
+    let first_bar_position =
+        terminal_find_substring_position_in_area(&terminal, "█", chart_area).expect("bar rendered");
     let first_time_position =
         terminal_find_substring_position_in_area(&terminal, first_label.as_str(), chart_area)
             .expect("first chart time label rendered");
@@ -629,7 +629,10 @@ fn prop_dialog_statistics_without_response_renders_unsupported_message() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let stats_text = terminal_text(&terminal);
     let compact = stats_text.replace(' ', "");
-    assert!(compact.contains("此设备不支持查看统计数据"), "{stats_text}");
+    assert!(
+        compact.contains("此设备不支持查看统计数据或所选周期内暂无数据"),
+        "{stats_text}"
+    );
     assert!(!compact.contains("值↑时间→"), "{stats_text}");
     assert!(!stats_text.contains('█'), "{stats_text}");
 }
@@ -776,8 +779,8 @@ fn prop_dialog_statistics_chart_click_shows_crosshair_tooltip_and_click_away_cle
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
     let chart_area = ratatui::layout::Rect::new(0, 6, 120, 18);
-    let bar_position = terminal_find_substring_position_in_area(&terminal, "█", chart_area)
-        .expect("bar rendered");
+    let bar_position =
+        terminal_find_substring_position_in_area(&terminal, "█", chart_area).expect("bar rendered");
 
     // Clicking a bar selects it (crosshair + tooltip).
     handle_mouse(
@@ -827,7 +830,10 @@ fn prop_dialog_statistics_chart_click_shows_crosshair_tooltip_and_click_away_cle
 
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let cleared_text = terminal_text(&terminal);
-    assert!(!cleared_text.replace(' ', "").contains("日期:01-01"), "{cleared_text}");
+    assert!(
+        !cleared_text.replace(' ', "").contains("日期:01-01"),
+        "{cleared_text}"
+    );
 }
 
 #[test]

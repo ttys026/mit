@@ -450,6 +450,21 @@ pub fn is_mijia_auth_present(auth: Option<&MijiaAuth>) -> bool {
     auth.is_some_and(|auth| !auth.service_token.trim().is_empty())
 }
 
+/// Whether a failed Mijia request indicates the stored credentials are no longer
+/// valid (an HTTP 401 from the data endpoints, or a serviceToken-expired error),
+/// as opposed to a transient network/server failure. Used to flag the account's
+/// Mijia login as invalid in the UI.
+pub fn is_mijia_auth_error(error: &anyhow::Error) -> bool {
+    if is_http_unauthorized(error) {
+        return true;
+    }
+    let message = error.to_string();
+    message.contains("SERVICETOKEN_EXPIRED")
+        || message.contains("auth err")
+        || message.contains("invalid signature")
+        || message.contains("米家 token")
+}
+
 fn check_new_msg_payload() -> Value {
     json!({
         "begin_at": (unix_millis() / 1000).saturating_sub(3600)

@@ -538,6 +538,7 @@ fn route(
                     "name": "living-room",
                     "model": "xiaomi.wifispeaker.lx04",
                     "isOnline": true,
+                    "pid": 0,
                     "localip": "192.168.1.10",
                     "token": "token-dev-1"
                 }),
@@ -564,6 +565,7 @@ fn route(
                     "name": "third-party-light",
                     "model": "third.party.light",
                     "isOnline": true,
+                    "pid": 14,
                     "localip": "",
                     "token": ""
                 }));

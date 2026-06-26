@@ -53,6 +53,7 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
             name: "offline-speaker".to_string(),
             model: "xiaomi.wifispeaker.lx04".to_string(),
             online: false,
+            pid: 0,
 
             home_id: "cache-account:1001".to_string(),
             home_name: "账号A(1001)".to_string(),
@@ -82,6 +83,9 @@ fn opening_device_dialog_shows_schema_with_placeholders_while_loading() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -133,6 +137,7 @@ fn format_device_list_item_shows_room_column() {
         name: "living-room".to_string(),
         model: "xiaomi.wifispeaker.lx04".to_string(),
         online: true,
+        pid: 0,
 
         home_id: "home-1".to_string(),
         home_name: "我家".to_string(),
@@ -158,6 +163,7 @@ fn format_device_list_item_does_not_show_mode_field() {
         name: "living-room".to_string(),
         model: "xiaomi.wifispeaker.lx04".to_string(),
         online: true,
+        pid: 0,
 
         home_id: "home-1".to_string(),
         home_name: "我家".to_string(),
@@ -204,6 +210,7 @@ fn format_device_list_item_caps_device_name_column_to_ten_chinese_chars_width() 
         name: "A very long device name".to_string(),
         model: "xiaomi.wifispeaker.lx04".to_string(),
         online: true,
+        pid: 0,
 
         home_id: "home-1".to_string(),
         home_name: "我家".to_string(),
@@ -231,6 +238,7 @@ fn format_device_list_item_uses_longest_value_plus_one_for_columns() {
         name: "name".to_string(),
         model: "xiaomi.wifispeaker.lx04".to_string(),
         online: true,
+        pid: 0,
 
         home_id: "home-1".to_string(),
         home_name: "我家".to_string(),
@@ -310,6 +318,7 @@ fn format_device_list_item_orders_columns_room_name_category_account() {
         name: "living-room".to_string(),
         model: "xiaomi.wifispeaker.lx04".to_string(),
         online: true,
+        pid: 0,
 
         home_id: "home-1".to_string(),
         home_name: "我家".to_string(),
@@ -332,18 +341,69 @@ fn format_device_list_item_orders_columns_room_name_category_account() {
 }
 
 #[test]
-fn device_list_shows_channel_column() {
+fn connect_type_label_maps_pid_to_official_enum() {
+    use crate::tui::connect_type_label;
+    // Known connect types from Xiaomi's official ha_xiaomi_home enum.
+    assert_eq!(connect_type_label(0, Language::English), "WiFi");
+    assert_eq!(connect_type_label(16, Language::English), "BLE-Mesh");
+    assert_eq!(
+        connect_type_label(14, Language::English),
+        "Third-party cloud"
+    );
+    assert_eq!(connect_type_label(14, Language::Chinese), "第三方云接入");
+
+    // Unsynced devices (pid < 0) render as "-".
+    assert_eq!(connect_type_label(-1, Language::Chinese), "-");
+
+    // Unknown codes (e.g. 21, absent from the official enum) keep the raw value.
+    assert_eq!(connect_type_label(21, Language::English), "Other(21)");
+    assert_eq!(connect_type_label(21, Language::Chinese), "其他(21)");
+}
+
+#[test]
+fn device_table_renders_connect_type_column() {
+    let device = Device {
+        did: "dev-1".to_string(),
+        name: "客厅灯".to_string(),
+        model: "xiaomi.switch.2wpro2".to_string(),
+        online: true,
+        pid: 16,
+        home_id: "cache-account:1001".to_string(),
+        home_name: "账号A(1001)".to_string(),
+        room_id: "room-1".to_string(),
+        room_name: "客厅".to_string(),
+    };
+    let mut app = devices_tab_test_app(vec![device]);
+    // English renders ASCII headers (CJK cells get space-separated in the test
+    // backend buffer, which defeats a substring match).
+    app.language = Language::English;
+    let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = terminal_text(&terminal);
+    assert!(text.contains("Connect"), "connect header missing: {text}");
+    assert!(text.contains("BLE-Mesh"), "connect value missing: {text}");
+}
+
+#[test]
+fn device_list_shows_connect_and_channel_columns() {
     let header = format_device_list_header(Language::English);
+    // Connect column header is index [3]; Channel is index [5].
     assert!(
-        header.contains(super::device_list_header_titles(Language::English)[4]),
+        header.contains(super::device_list_header_titles(Language::English)[3]),
+        "{header}"
+    );
+    assert!(
+        header.contains(super::device_list_header_titles(Language::English)[5]),
         "{header}"
     );
 
     let mut row = device_list_row("name", "cat", "客厅", "acc");
+    row.connect = "BLE-Mesh".to_string();
     row.channel = "LAN".to_string();
     let columns =
         compute_device_list_columns(std::slice::from_ref(&row), usize::MAX, Language::English);
     let line = format_device_list_item_with_columns(&row, columns);
+    assert!(line.contains("BLE-Mesh"), "{line}");
     assert!(line.contains("LAN"), "{line}");
     assert_eq!(
         UnicodeWidthStr::width(line.as_str()),

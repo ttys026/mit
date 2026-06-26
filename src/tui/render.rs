@@ -97,6 +97,11 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                     account_page::account_list_row(
                         account,
                         app.offline_account_uids.contains(account.user.uid.as_str()),
+                        app.invalid_xiaomi_account_uids
+                            .contains(account.user.uid.as_str()),
+                        app.invalid_mijia_account_uids
+                            .contains(account.user.uid.as_str()),
+                        app.account_check_in_flight,
                         app.language,
                     )
                 })
@@ -158,6 +163,7 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                         &device.room_name,
                         account_label.as_str(),
                     );
+                    row.connect = connect_type_label(device.pid, app.language);
                     row.channel = crate::mico_api::device_link_channel(&device.did)
                         .as_str()
                         .to_string();

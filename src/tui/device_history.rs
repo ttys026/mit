@@ -1341,8 +1341,8 @@ pub(in crate::tui) fn statistics_chart_points(
 pub(in crate::tui) fn statistics_unsupported_message(lang: Language) -> String {
     lang_str(
         lang,
-        "此设备不支持查看统计数据",
-        "This device does not support stats",
+        "此设备不支持查看统计数据或所选周期内暂无数据",
+        "This device does not support stats or there is no data for the selected period",
     )
     .to_string()
 }

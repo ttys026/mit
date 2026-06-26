@@ -33,6 +33,12 @@ use super::{
     PropDialog, PropDialogRefreshMessage, PropDialogTab, PropItem, ToggleItem, TuiApp,
 };
 
+/// Placeholder for the logs/statistics tabs under `--LAN`, where the cloud-only
+/// mijia API is not used. Rendered as an inline message by the raw-device view.
+fn lan_unsupported_raw() -> Value {
+    json!({ "error": "日志/统计需要云端，--LAN 模式下不可用 (cloud-only, disabled in --LAN)" })
+}
+
 pub(in crate::tui) fn apply_single_line_textarea_key(
     input: &mut String,
     cursor: &mut usize,
@@ -1599,6 +1605,9 @@ impl TuiApp {
         let account_uid = device_account_uid(&selected)
             .ok_or_else(|| anyhow!("设备缺少所属账号，无法读取属性"))?
             .to_string();
+        // Cache LAN-unavailable props per model, so reads share one device's
+        // learning across every device of the same model.
+        crate::mico_api::note_device_model(&selected.did, &selected.model);
         let spec = load_spec(&self.home_dir, &selected.model)?;
         let spec = spec.ok_or_else(|| anyhow!("未找到设备规格，请先 sync-specs"))?;
         let props = collect_readable_props(&spec, self.language);
@@ -1676,7 +1685,7 @@ impl TuiApp {
                     // Enable the LAN fast path for this device (reuses the cached
                     // snapshot cred, probes ~200ms) before reading.
                     let _ = client.prime_local_credential_for(&did);
-                    let raw_values = client.get_props_batch(&query_refs)?;
+                    let raw_values = client.get_props_batch_local(&query_refs)?;
                     let list = raw_values
                         .as_array()
                         .ok_or_else(|| anyhow!("property loading did not return list"))?;
@@ -1721,6 +1730,15 @@ impl TuiApp {
             };
             let logs_index = items.len();
             let statistics_index = logs_index + 1;
+            // Logs & statistics are cloud-only (mijia API). Under `--LAN` we skip
+            // that remote fetch entirely so opening a dialog stays purely local.
+            if crate::mico_api::force_lan_enabled() {
+                items.push(raw_device_logs_item(lan_unsupported_raw()));
+                items.push(raw_device_statistics_item(lan_unsupported_raw()));
+                let _ = tx.send(Ok(items));
+                let _ = raw_tx.send(PropDialogRefreshMessage::Finished);
+                return;
+            }
             items.push(raw_device_logs_item(json!({"status": "loading"})));
             items.push(raw_device_statistics_item(json!({"status": "loading"})));
             if tx.send(Ok(items)).is_err() {
@@ -1903,7 +1921,7 @@ impl TuiApp {
                     // Re-attempt the LAN fast path on each refresh (R), so a
                     // device that wasn't ready at startup can still go local.
                     let _ = client.prime_local_credential_for(&device_did);
-                    let values = client.get_props_batch(&query_refs)?;
+                    let values = client.get_props_batch_local(&query_refs)?;
                     let list = values
                         .as_array()
                         .ok_or_else(|| anyhow!("property refresh did not return list"))?;
@@ -1934,13 +1952,19 @@ impl TuiApp {
                     }
                 }
 
+                // Logs & statistics are cloud-only; skip the remote fetch under `--LAN`.
+                let lan_only = crate::mico_api::force_lan_enabled();
                 if let Some(index) = logs_index {
-                    let value = load_mijia_device_logs_json_with_query(
-                        &account,
-                        device_did.as_str(),
-                        mijia_prop_keys.as_slice(),
-                        operation_record_date_filter,
-                    );
+                    let value = if lan_only {
+                        lan_unsupported_raw()
+                    } else {
+                        load_mijia_device_logs_json_with_query(
+                            &account,
+                            device_did.as_str(),
+                            mijia_prop_keys.as_slice(),
+                            operation_record_date_filter,
+                        )
+                    };
                     if tx
                         .send(PropDialogRefreshMessage::Raw(vec![(index, value)]))
                         .is_err()
@@ -1949,14 +1973,18 @@ impl TuiApp {
                     }
                 }
                 if let Some(index) = statistics_index {
-                    let value = load_mijia_device_statistics_json_with_query(
-                        &account,
-                        device_did.as_str(),
-                        mijia_statistics_keys.as_slice(),
-                        statistics_period,
-                        statistics_query,
-                        statistics_selected_key,
-                    );
+                    let value = if lan_only {
+                        lan_unsupported_raw()
+                    } else {
+                        load_mijia_device_statistics_json_with_query(
+                            &account,
+                            device_did.as_str(),
+                            mijia_statistics_keys.as_slice(),
+                            statistics_period,
+                            statistics_query,
+                            statistics_selected_key,
+                        )
+                    };
                     if tx
                         .send(PropDialogRefreshMessage::Raw(vec![(index, value)]))
                         .is_err()
@@ -2097,6 +2125,12 @@ impl TuiApp {
                 match message {
                     PropDialogRefreshMessage::Props(updates) => {
                         for (index, value) in updates {
+                            // A null means the refresh couldn't read this prop this
+                            // time (transient LAN miss under --LAN); keep the prior
+                            // value rather than blanking it.
+                            if value.is_null() {
+                                continue;
+                            }
                             if let Some(item) = dialog.items.get_mut(index) {
                                 item.value = value;
                             }

@@ -87,6 +87,17 @@ fn mico_get_devices_requests_third_party_devices() {
         devices.iter().any(|device| device.did == "third-1"),
         "third-party devices should be returned when get_third_device is requested"
     );
+    // The connect type (`pid`) is captured from the API and carried per-did.
+    let third = devices
+        .iter()
+        .find(|device| device.did == "third-1")
+        .expect("third-party device present");
+    assert_eq!(third.pid, 14, "third-party cloud device should carry pid=14");
+    let wifi = devices
+        .iter()
+        .find(|device| device.did == "dev-1")
+        .expect("wifi device present");
+    assert_eq!(wifi.pid, 0, "wifi device should carry pid=0");
     let requests = server.requests();
     let request = requests
         .iter()

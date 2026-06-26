@@ -66,6 +66,9 @@ fn push_message_dialog_shows_cursor_and_moves_with_left_right() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -164,6 +167,9 @@ fn push_message_dialog_submits_text_for_selected_account_uid() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -246,6 +252,9 @@ fn escaping_push_message_dialog_restores_previous_menu_selection() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -376,6 +385,9 @@ fn push_message_action_opens_input_dialog() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -447,6 +459,9 @@ fn push_message_cursor_row_stays_stable_when_typing_first_char() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -516,6 +531,9 @@ fn selected_push_message_textarea_text_uses_selection_background() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -596,11 +614,134 @@ fn account_list_row_marks_missing_tokens_independently() {
         "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
     }));
 
-    let row = account_page::account_list_row(&account, false, Language::Chinese);
+    let row = account_page::account_list_row(&account, false, false, false, false, Language::Chinese);
 
     assert_eq!(row.xiaomi_status, "未登录");
     assert_eq!(row.mijia_status, "未登录");
 }
+
+#[test]
+fn account_list_row_flags_invalid_mijia_login() {
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "tui-account-status-invalid",
+        "deviceId": "mico.tui-account-status-invalid",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 32503680000_u64,
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+        "mijia": {
+            "ua": "Android-15-test",
+            "deviceId": "mijia-device-a",
+            "passO": "pass-o-a",
+            "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+            "passToken": "pass-token-a",
+            "userId": "1001",
+            "cUserId": "c-1001",
+            "serviceToken": "service-token-a",
+            "expireTime": 222,
+            "saveTime": 123
+        }
+    }));
+
+    // Mijia credentials are present but the validity check failed (e.g. 401),
+    // so the table must show "无效" rather than "已登录" while Xiaomi stays valid.
+    let row = account_page::account_list_row(&account, false, false, true, false, Language::Chinese);
+    assert_eq!(row.xiaomi_status, "已登录");
+    assert_eq!(row.mijia_status, "无效");
+
+    let row_en = account_page::account_list_row(&account, false, false, true, false, Language::English);
+    assert_eq!(row_en.mijia_status, "Invalid");
+
+    // The Xiaomi token check is independent: flagging it shows "无效" too.
+    let row_xiaomi =
+        account_page::account_list_row(&account, false, true, false, false, Language::Chinese);
+    assert_eq!(row_xiaomi.xiaomi_status, "无效");
+    assert_eq!(row_xiaomi.mijia_status, "已登录");
+
+    // When the credentials are absent, the invalid flag is irrelevant: still "Missing".
+    let missing = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "tui-account-status-invalid-missing",
+        "deviceId": "mico.tui-account-status-invalid-missing",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "user": {"uid": "1002", "nickname": "账号B", "icon": "", "unionId": "union-b"}
+    }));
+    let row_missing =
+        account_page::account_list_row(&missing, false, false, true, false, Language::English);
+    assert_eq!(row_missing.mijia_status, "Missing");
+}
+
+#[test]
+fn account_list_row_shows_checking_while_probe_in_flight() {
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "tui-account-status-checking",
+        "deviceId": "mico.tui-account-status-checking",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 32503680000_u64,
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+        "mijia": {
+            "ua": "Android-15-test",
+            "deviceId": "mijia-device-a",
+            "passO": "pass-o-a",
+            "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+            "passToken": "pass-token-a",
+            "userId": "1001",
+            "cUserId": "c-1001",
+            "serviceToken": "service-token-a",
+            "expireTime": 222,
+            "saveTime": 123
+        }
+    }));
+
+    // While the validity probe runs, neither column should claim "已登录".
+    let row = account_page::account_list_row(&account, false, false, false, true, Language::Chinese);
+    assert_eq!(row.xiaomi_status, "检查中");
+    assert_eq!(row.mijia_status, "检查中");
+
+    // A known-invalid verdict still wins over the in-flight indicator.
+    let row_invalid =
+        account_page::account_list_row(&account, false, false, true, true, Language::Chinese);
+    assert_eq!(row_invalid.mijia_status, "无效");
+}
+
+#[test]
+fn account_check_message_updates_xiaomi_and_mijia_invalid_flags() {
+    let mut app = accounts_tab_test_app(vec![
+        test_account_with("1001", "账号A", "cn"),
+        test_account_with("1002", "账号B", "cn"),
+    ]);
+    // A stale flag that a fresh "valid" verdict should clear.
+    app.invalid_mijia_account_uids.insert("1001".to_string());
+    app.account_check_in_flight = true;
+
+    app.bootstrap_tx
+        .send(BootstrapMessage::AccountCheck {
+            auth_state: app.auth_state.clone(),
+            accounts: app.accounts.clone(),
+            xiaomi_valid_uids: vec!["1001".to_string()],
+            xiaomi_invalid_uids: vec!["1002".to_string()],
+            mijia_valid_uids: vec!["1001".to_string()],
+            mijia_invalid_uids: vec!["1002".to_string()],
+        })
+        .unwrap();
+    app.process_background_messages();
+
+    assert!(!app.invalid_mijia_account_uids.contains("1001"));
+    assert!(app.invalid_mijia_account_uids.contains("1002"));
+    assert!(!app.invalid_xiaomi_account_uids.contains("1001"));
+    assert!(app.invalid_xiaomi_account_uids.contains("1002"));
+    assert!(!app.account_check_in_flight);
+}
+
 
 #[test]
 fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
@@ -647,6 +788,9 @@ fn pressing_enter_on_accounts_tab_opens_account_action_dialog() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -726,6 +870,9 @@ fn account_action_menu_mouse_wheel_changes_selected_item() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -821,6 +968,9 @@ fn clicking_selected_account_action_executes_it() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,

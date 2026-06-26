@@ -266,6 +266,11 @@ impl TuiApp {
             account,
             self.offline_account_uids
                 .contains(account.user.uid.as_str()),
+            self.invalid_xiaomi_account_uids
+                .contains(account.user.uid.as_str()),
+            self.invalid_mijia_account_uids
+                .contains(account.user.uid.as_str()),
+            self.account_check_in_flight,
             self.language,
         );
         let label = account_page::format_account_label(account);

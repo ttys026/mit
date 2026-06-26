@@ -292,6 +292,7 @@ fn find_target_device(did: &str) -> Result<TargetDevice> {
             .into_iter()
             .find(|device| normalize_command_did(device.did.as_str()) == normalized_did);
         if let Some(device) = cached {
+            crate::mico_api::note_device_model(&device.did, &device.model);
             let fresh = ensure_fresh_account(auth_state.clone(), account.clone())?;
             return Ok(TargetDevice { fresh, device });
         }
@@ -304,6 +305,7 @@ fn find_target_device(did: &str) -> Result<TargetDevice> {
         working_auth_state = fresh.auth_state.clone();
         for device in fresh.client.get_devices()? {
             if normalize_command_did(device.did.as_str()) == normalized_did {
+                crate::mico_api::note_device_model(&device.did, &device.model);
                 return Ok(TargetDevice { fresh, device });
             }
         }

@@ -9,6 +9,7 @@ use std::io::Read;
 use std::thread;
 use unicode_width::UnicodeWidthStr;
 
+use crate::mico_api::is_auth_expired;
 use crate::mijia_api::is_mijia_auth_present;
 use crate::storage::{get_auth_accounts, AuthAccount, Language};
 use crate::tui::extract_auth_url_from_line;
@@ -118,6 +119,9 @@ impl AccountListColumns {
 pub(crate) fn account_list_row(
     account: &AuthAccount,
     offline: bool,
+    xiaomi_invalid: bool,
+    mijia_invalid: bool,
+    checking: bool,
     lang: Language,
 ) -> AccountListRow {
     let region = if account.region.trim().is_empty() {
@@ -135,21 +139,38 @@ pub(crate) fn account_list_row(
     } else {
         account.user.uid.trim()
     };
+    let t = |zh: &'static str, en: &'static str| match lang {
+        Language::Chinese => zh,
+        Language::English => en,
+    };
     let has_xiaomi =
         !account.access_token.trim().is_empty() || !account.refresh_token.trim().is_empty();
-    let xiaomi_status = match (has_xiaomi, offline, lang) {
-        (false, _, Language::Chinese) => "未登录",
-        (false, _, Language::English) => "Missing",
-        (true, true, Language::Chinese) => "离线",
-        (true, true, Language::English) => "Offline",
-        (true, false, Language::Chinese) => "已登录",
-        (true, false, Language::English) => "Logged In",
+    // A token that is past expiry with no refresh token can never be revived,
+    // so treat it as invalid even before the async check confirms it.
+    let xiaomi_expired_local =
+        is_auth_expired(account) && account.refresh_token.trim().is_empty();
+    let xiaomi_status = if !has_xiaomi {
+        t("未登录", "Missing")
+    } else if xiaomi_invalid || xiaomi_expired_local {
+        t("无效", "Invalid")
+    } else if checking {
+        // The async validity probe is still running; don't claim "logged in"
+        // until it confirms the token actually works.
+        t("检查中", "Checking")
+    } else if offline {
+        t("离线", "Offline")
+    } else {
+        t("已登录", "Logged In")
     };
-    let mijia_status = match (is_mijia_auth_present(account.mijia.as_ref()), lang) {
-        (true, Language::Chinese) => "已登录",
-        (true, Language::English) => "Logged In",
-        (false, Language::Chinese) => "未登录",
-        (false, Language::English) => "Missing",
+    let mijia_present = is_mijia_auth_present(account.mijia.as_ref());
+    let mijia_status = if !mijia_present {
+        t("未登录", "Missing")
+    } else if mijia_invalid {
+        t("无效", "Invalid")
+    } else if checking {
+        t("检查中", "Checking")
+    } else {
+        t("已登录", "Logged In")
     };
     AccountListRow {
         region: region.to_string().to_uppercase(),
@@ -445,6 +466,8 @@ impl TuiApp {
         }
 
         self.offline_account_uids.remove(uid);
+        self.invalid_xiaomi_account_uids.remove(uid);
+        self.invalid_mijia_account_uids.remove(uid);
 
         self.bootstrap_pending = None;
         if self.accounts.is_empty() {

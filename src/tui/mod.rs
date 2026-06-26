@@ -16,12 +16,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::{format_description::FormatItem, macros::format_description};
 
 use crate::cli::ensure_fresh_account;
-use crate::mico_api::{Device, MicoClient};
+use crate::mico_api::{is_auth_expired, Device, MicoClient};
+use crate::mijia_api::{is_mijia_auth_error, is_mijia_auth_present, MijiaClient};
 use crate::miot_lan::LanPushEvent;
 use crate::property_cache::PropertyCache;
 use crate::storage::{
-    default_auth, get_auth_accounts, get_home_dir, load_auth, load_settings, save_settings,
-    AuthAccount, AuthState, Language, UserSettings,
+    default_auth, get_auth_accounts, get_home_dir, load_auth, load_settings, save_auth,
+    save_settings, upsert_auth_account, AuthAccount, AuthState, Language, UserSettings,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -118,10 +119,10 @@ pub(crate) fn account_list_header_titles(lang: Language) -> [&'static str; 5] {
         Language::English => ["Region", "Nickname", "ID", "Xiaomi", "Mijia"],
     }
 }
-pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 5] {
+pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 6] {
     match lang {
-        Language::Chinese => ["房间", "名称", "类别", "账户", "通道"],
-        Language::English => ["Room", "Name", "Category", "Account", "Channel"],
+        Language::Chinese => ["房间", "名称", "类别", "连接模式", "账户", "通道"],
+        Language::English => ["Room", "Name", "Category", "Connect", "Account", "Channel"],
     }
 }
 const STATUS_BAR_MARGIN_TOP: u16 = 1;
@@ -181,6 +182,44 @@ pub(in crate::tui) fn lang_str(lang: Language, zh: &'static str, en: &'static st
     match lang {
         Language::Chinese => zh,
         Language::English => en,
+    }
+}
+
+/// Human-readable label for a device's MiHome `connect_type` (the device-list
+/// API's `pid` field), per Xiaomi's official `ha_xiaomi_home` enum. Unknown
+/// codes fall back to the raw value; `pid < 0` (not synced) renders as "-".
+pub(in crate::tui) fn connect_type_label(pid: i64, lang: Language) -> String {
+    let known = match pid {
+        0 => Some(("WiFi", "WiFi")),
+        1 => Some(("yunyi设备", "yunyi device")),
+        2 => Some(("云接入设备", "Cloud device")),
+        3 => Some(("ZigBee", "ZigBee")),
+        4 => Some(("webSocket", "webSocket")),
+        5 => Some(("虚拟设备", "Virtual device")),
+        6 => Some(("BLE", "BLE")),
+        7 => Some(("本地AP", "Local AP")),
+        8 => Some(("WiFi+BLE", "WiFi+BLE")),
+        9 => Some(("其他", "Other")),
+        10 => Some(("功能插件", "Function plug-in")),
+        11 => Some(("蜂窝网", "Cellular")),
+        12 => Some(("网线", "Cable")),
+        13 => Some(("NB-IoT", "NB-IoT")),
+        14 => Some(("第三方云接入", "Third-party cloud")),
+        15 => Some(("红外子设备", "Infrared sub-device")),
+        16 => Some(("BLE-Mesh", "BLE-Mesh")),
+        17 => Some(("虚拟设备组", "Virtual group")),
+        18 => Some(("网关子设备", "Gateway sub-device")),
+        19 => Some(("安全网关子设备", "Secure gateway sub-device")),
+        22 => Some(("PLC", "PLC")),
+        23 => Some(("仅网线", "Cable only")),
+        24 => Some(("Matter", "Matter")),
+        25 => Some(("WiFi+蜂窝网", "WiFi+Cellular")),
+        _ => None,
+    };
+    match known {
+        Some((zh, en)) => lang_str(lang, zh, en).to_string(),
+        None if pid < 0 => "-".to_string(),
+        None => format!("{}({pid})", lang_str(lang, "其他", "Other")),
     }
 }
 
@@ -260,6 +299,93 @@ enum BootstrapMessage {
         accounts: Option<Vec<AuthAccount>>,
         error: String,
     },
+    /// Result of the on-demand account token validity check (triggered when the
+    /// user opens the account tab). Carries per-account verdicts for both the
+    /// Xiaomi and Mijia logins plus any state refreshed/renewed while probing.
+    AccountCheck {
+        auth_state: AuthState,
+        accounts: Vec<AuthAccount>,
+        xiaomi_valid_uids: Vec<String>,
+        xiaomi_invalid_uids: Vec<String>,
+        mijia_valid_uids: Vec<String>,
+        mijia_invalid_uids: Vec<String>,
+    },
+}
+
+/// Probe each account's Xiaomi and Mijia tokens and build the verdict message.
+/// Runs on a background thread. A token that can be refreshed/renewed is
+/// silently refreshed (and persisted) and reported valid; a definite auth
+/// failure marks it invalid; a transient network error leaves it unreported so
+/// the table keeps its prior status.
+#[cfg_attr(test, allow(dead_code))]
+fn run_account_token_check(
+    mut auth_state: AuthState,
+    accounts: Vec<AuthAccount>,
+) -> BootstrapMessage {
+    let mijia_client = MijiaClient::new().ok();
+    let mut xiaomi_valid_uids = Vec::new();
+    let mut xiaomi_invalid_uids = Vec::new();
+    let mut mijia_valid_uids = Vec::new();
+    let mut mijia_invalid_uids = Vec::new();
+
+    for account in &accounts {
+        let uid = account.user.uid.clone();
+        let has_xiaomi =
+            !account.access_token.trim().is_empty() || !account.refresh_token.trim().is_empty();
+        if has_xiaomi {
+            match ensure_fresh_account(auth_state.clone(), account.clone()) {
+                Ok(fresh) => {
+                    auth_state = fresh.auth_state;
+                    xiaomi_valid_uids.push(uid.clone());
+                }
+                Err(_) => {
+                    // Only flag when the token genuinely can't be used. A
+                    // transient failure on a still-valid token is left alone.
+                    if is_auth_expired(account) || account.access_token.trim().is_empty() {
+                        xiaomi_invalid_uids.push(uid.clone());
+                    }
+                }
+            }
+        }
+
+        if let (Some(client), Some(mijia)) = (mijia_client.as_ref(), account.mijia.as_ref()) {
+            if is_mijia_auth_present(Some(mijia)) {
+                match client.check_new_msg_with_renewal(mijia) {
+                    Ok(None) => mijia_valid_uids.push(uid.clone()),
+                    Ok(Some(renewed)) => {
+                        let mut updated = account.clone();
+                        updated.mijia = Some(renewed);
+                        if let Ok(next) = upsert_auth_account(&auth_state, &updated) {
+                            auth_state = save_auth(&next).unwrap_or(next);
+                        }
+                        mijia_valid_uids.push(uid.clone());
+                    }
+                    Err(error) if is_mijia_auth_error(&error) => {
+                        mijia_invalid_uids.push(uid.clone());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    let refreshed_accounts = get_auth_accounts(&auth_state)
+        .map(|accounts| {
+            accounts
+                .into_iter()
+                .filter(|a| !a.access_token.is_empty() || !a.refresh_token.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or(accounts);
+
+    BootstrapMessage::AccountCheck {
+        auth_state,
+        accounts: refreshed_accounts,
+        xiaomi_valid_uids,
+        xiaomi_invalid_uids,
+        mijia_valid_uids,
+        mijia_invalid_uids,
+    }
 }
 
 pub fn run(default_uid: Option<&str>) -> Result<()> {
@@ -273,6 +399,10 @@ pub fn run(default_uid: Option<&str>) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     app.start_bootstrap();
+    // Validate tokens immediately, in parallel with the device bootstrap, so the
+    // account tab (the default landing tab) shows a live verdict instead of a
+    // stale "logged in" while the slower device sync runs.
+    app.start_account_token_check();
     let result = run_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -406,6 +536,9 @@ struct TuiApp {
     auth_flow_tx: Sender<AuthFlowMessage>,
     auth_flow_rx: Receiver<AuthFlowMessage>,
     offline_account_uids: HashSet<String>,
+    invalid_xiaomi_account_uids: HashSet<String>,
+    invalid_mijia_account_uids: HashSet<String>,
+    account_check_in_flight: bool,
     boot_state: BootState,
     boot_spinner_index: usize,
     bootstrap_generation: u64,
@@ -496,6 +629,9 @@ impl TuiApp {
             auth_flow_tx,
             auth_flow_rx,
             offline_account_uids: HashSet::new(),
+            invalid_xiaomi_account_uids: HashSet::new(),
+            invalid_mijia_account_uids: HashSet::new(),
+            account_check_in_flight: false,
             boot_state: BootState::Loading,
             boot_spinner_index: 0,
             bootstrap_generation: 0,
@@ -524,6 +660,44 @@ impl TuiApp {
         self.log("> sync");
         self.start_background_sync();
         self.log("sync started in background");
+    }
+
+    /// Validate every account's Xiaomi and Mijia tokens in the background and
+    /// refresh the account table once verdicts arrive. Triggered when the user
+    /// opens the account tab so the table reflects the live token state rather
+    /// than just whether credentials are present. Network failures leave the
+    /// prior status untouched (only definite auth failures flag an account).
+    fn start_account_token_check(&mut self) {
+        if self.account_check_in_flight {
+            return;
+        }
+        let accounts = self
+            .accounts
+            .iter()
+            .filter(|a| !a.user.uid.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if accounts.is_empty() {
+            return;
+        }
+        self.account_check_in_flight = true;
+        let tx = self.bootstrap_tx.clone();
+        let auth_state = self.auth_state.clone();
+
+        #[cfg(not(test))]
+        thread::spawn(move || {
+            let message = run_account_token_check(auth_state, accounts);
+            let _ = tx.send(message);
+        });
+
+        // In tests the network probe is skipped; clear the guard immediately so
+        // a follow-up check can be triggered. Verdict application is covered by
+        // feeding `BootstrapMessage::AccountCheck` directly.
+        #[cfg(test)]
+        {
+            let _ = (tx, auth_state, accounts);
+            self.account_check_in_flight = false;
+        }
     }
 
     fn start_bootstrap_internal(&mut self, show_loading_splash: bool) {
@@ -915,6 +1089,43 @@ impl TuiApp {
                     self.boot_state = BootState::Ready;
                     self.log(format!("bootstrap failed: {error}"));
                 }
+                BootstrapMessage::AccountCheck {
+                    auth_state,
+                    accounts,
+                    xiaomi_valid_uids,
+                    xiaomi_invalid_uids,
+                    mijia_valid_uids,
+                    mijia_invalid_uids,
+                } => {
+                    self.account_check_in_flight = false;
+                    // Adopt any tokens refreshed/renewed while probing, keeping
+                    // the current selection pinned by uid.
+                    let selected_uid = self.current_uid().map(ToString::to_string);
+                    self.auth_state = auth_state;
+                    self.accounts = accounts;
+                    if let Some(selected_uid) = selected_uid {
+                        self.account_index = self
+                            .accounts
+                            .iter()
+                            .position(|account| account.user.uid == selected_uid)
+                            .unwrap_or(self.account_index);
+                    }
+                    if self.account_index >= self.accounts.len() {
+                        self.account_index = 0;
+                    }
+                    for uid in xiaomi_valid_uids {
+                        self.invalid_xiaomi_account_uids.remove(uid.as_str());
+                    }
+                    for uid in xiaomi_invalid_uids {
+                        self.invalid_xiaomi_account_uids.insert(uid);
+                    }
+                    for uid in mijia_valid_uids {
+                        self.invalid_mijia_account_uids.remove(uid.as_str());
+                    }
+                    for uid in mijia_invalid_uids {
+                        self.invalid_mijia_account_uids.insert(uid);
+                    }
+                }
             }
         }
 
@@ -967,6 +1178,13 @@ impl TuiApp {
                                 self.accounts = accounts;
                                 if self.account_index >= self.accounts.len() {
                                     self.account_index = 0;
+                                }
+                                // A completed re-login refreshes this account's
+                                // credentials, so drop any stale "invalid" flags;
+                                // the next check re-validates if needed.
+                                if let Some(uid) = self.current_uid().map(ToString::to_string) {
+                                    self.invalid_xiaomi_account_uids.remove(uid.as_str());
+                                    self.invalid_mijia_account_uids.remove(uid.as_str());
                                 }
                                 self.refresh_cloud_mips_listeners();
                             }
@@ -1213,6 +1431,8 @@ impl TuiApp {
         self.prop_dialog = None;
         self.property_cache.clear_all();
         self.offline_account_uids.clear();
+        self.invalid_xiaomi_account_uids.clear();
+        self.invalid_mijia_account_uids.clear();
         self.bootstrap_pending = None;
         self.active_tab = 0;
         self.log("已重置全部设置（~/.mit 已删除）".to_string());
@@ -1361,6 +1581,11 @@ impl TuiApp {
             }
         } else {
             self.active_tab = target;
+        }
+        // Entering the account tab re-validates every account's Xiaomi and Mijia
+        // tokens so the status column reflects the live login state.
+        if target == 0 {
+            self.start_account_token_check();
         }
     }
 

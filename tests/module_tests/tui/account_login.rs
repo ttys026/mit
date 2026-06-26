@@ -41,7 +41,7 @@ fn account_list_row_shows_xiaomi_and_mijia_login_statuses() {
         }
     }));
 
-    let row = account_page::account_list_row(&account, false, Language::Chinese);
+    let row = account_page::account_list_row(&account, false, false, false, false, Language::Chinese);
 
     assert_eq!(row.xiaomi_status, "已登录");
     assert_eq!(row.mijia_status, "已登录");
@@ -139,6 +139,9 @@ fn add_account_port_conflict_shows_error_dialog_without_quitting_tui() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -269,6 +272,9 @@ fn process_auth_flow_completion_closes_reauth_dialog() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
@@ -334,6 +340,9 @@ fn failed_auth_flow_shows_port_8000_hint_in_reauth_dialog() {
         auth_flow_tx,
         auth_flow_rx,
         offline_account_uids: HashSet::new(),
+        invalid_xiaomi_account_uids: HashSet::new(),
+        invalid_mijia_account_uids: HashSet::new(),
+        account_check_in_flight: false,
         boot_state: BootState::Ready,
         boot_spinner_index: 0,
         bootstrap_generation: 0,
