@@ -328,6 +328,11 @@ pub(in crate::tui) fn handle_key(
                 KeyCode::Esc | KeyCode::Enter => app.account_action_dialog = None,
                 _ => {}
             },
+            Some(AccountActionDialog::ThirdCloudSync { running, .. }) => match key.code {
+                KeyCode::Esc => app.account_action_dialog = None,
+                KeyCode::Enter if !running => app.account_action_dialog = None,
+                _ => {}
+            },
             None => {}
         }
         return Ok(false);
@@ -409,7 +414,8 @@ pub(in crate::tui) fn settings_action_label(
         SettingsAction::ToggleLanguage
         | SettingsAction::ToggleAutoSubscribeDeviceStatus
         | SettingsAction::VersionAndCheckUpdate
-        | SettingsAction::ViewGithub => {
+        | SettingsAction::ViewGithub
+        | SettingsAction::ResyncThirdCloudDeviceStatus => {
             unreachable!("This settings action has no confirm dialog")
         }
     }
@@ -456,7 +462,8 @@ pub(in crate::tui) fn settings_confirm_lines(
         SettingsAction::ToggleLanguage
         | SettingsAction::ToggleAutoSubscribeDeviceStatus
         | SettingsAction::VersionAndCheckUpdate
-        | SettingsAction::ViewGithub => {
+        | SettingsAction::ViewGithub
+        | SettingsAction::ResyncThirdCloudDeviceStatus => {
             unreachable!("This settings action has no confirm dialog")
         }
     };
@@ -507,9 +514,15 @@ fn account_action_popup_area(
         AccountActionDialog::UpdateRunning { .. } | AccountActionDialog::UpdateFinished { .. } => {
             centered_rect(72, 50, terminal_area)
         }
-        AccountActionDialog::Reauth { .. }
-        | AccountActionDialog::PushMessage { .. }
-        | AccountActionDialog::SettingsConfirm { .. } => centered_rect(74, 42, terminal_area),
+        AccountActionDialog::ThirdCloudSync { .. } => {
+            expand_rect(centered_rect(72, 50, terminal_area), 2, 1, terminal_area)
+        }
+        AccountActionDialog::SettingsConfirm { .. } => {
+            expand_rect(centered_rect(74, 42, terminal_area), 2, 1, terminal_area)
+        }
+        AccountActionDialog::Reauth { .. } | AccountActionDialog::PushMessage { .. } => {
+            centered_rect(74, 42, terminal_area)
+        }
     }
 }
 
@@ -521,7 +534,11 @@ fn active_click_away_overlay(
 ) -> Option<(ClickAwayOverlay, ratatui::layout::Rect)> {
     if let Some(dialog) = app.account_action_dialog.as_ref() {
         // The upgrade is mid-flight; a stray click outside shouldn't dismiss it.
-        if matches!(dialog, AccountActionDialog::UpdateRunning { .. }) {
+        if matches!(
+            dialog,
+            AccountActionDialog::UpdateRunning { .. }
+                | AccountActionDialog::ThirdCloudSync { running: true, .. }
+        ) {
             return None;
         }
         let area = account_action_popup_area(dialog, app.prop_dialog.is_some(), terminal_area);

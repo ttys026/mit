@@ -419,7 +419,8 @@ pub(crate) fn selection_snapshot_for_mouse(
             AccountActionDialog::Menu { .. } => {}
             AccountActionDialog::UpdateAvailable { .. }
             | AccountActionDialog::UpdateRunning { .. }
-            | AccountActionDialog::UpdateFinished { .. } => {}
+            | AccountActionDialog::UpdateFinished { .. }
+            | AccountActionDialog::ThirdCloudSync { .. } => {}
         }
     }
 
@@ -755,4 +756,25 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
         ])
         .split(vertical[1]);
     horizontal[1]
+}
+
+pub(crate) fn expand_rect(area: Rect, horizontal: u16, vertical: u16, bounds: Rect) -> Rect {
+    let min_x = area.x.saturating_sub(horizontal).max(bounds.x);
+    let min_y = area.y.saturating_sub(vertical).max(bounds.y);
+    let max_x = area
+        .x
+        .saturating_add(area.width)
+        .saturating_add(horizontal)
+        .min(bounds.x.saturating_add(bounds.width));
+    let max_y = area
+        .y
+        .saturating_add(area.height)
+        .saturating_add(vertical)
+        .min(bounds.y.saturating_add(bounds.height));
+    Rect::new(
+        min_x,
+        min_y,
+        max_x.saturating_sub(min_x),
+        max_y.saturating_sub(min_y),
+    )
 }

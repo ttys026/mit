@@ -592,7 +592,7 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
         auto_subscribe_device_status: true,
-        settings_selected: 5,
+        settings_selected: 6,
         update_check_rx: None,
         update_check_status: None,
         install_rx: None,
@@ -610,7 +610,11 @@ fn settings_tab_enter_on_reset_option_removes_mit_dir_after_single_confirm() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let text = terminal_text(&terminal);
     let compact = text.replace(' ', "");
-    assert!(compact.contains("操作:重置全部设置"), "{text}");
+    let action = match &app.account_action_dialog {
+        Some(AccountActionDialog::SettingsConfirm { action }) => format!("{action:?}"),
+        other => panic!("expected reset confirm dialog, got {other:?}"),
+    };
+    assert_eq!(action, "ResetAll");
     assert!(compact.contains("该操作不可恢复"), "{text}");
 
     let quit = handle_key(
@@ -714,6 +718,7 @@ fn settings_tab_shows_combined_version_view_github_and_separator() {
     );
     // New "view on GitHub" item.
     assert!(compact.contains("在GitHub查看"), "{text}");
+    assert!(compact.contains("重新同步三方设备状态"), "{text}");
     // A full-width separator divides the toggleable settings from the action items.
     assert!(
         text.lines()
@@ -724,17 +729,19 @@ fn settings_tab_shows_combined_version_view_github_and_separator() {
 
 #[test]
 fn settings_separator_rows_map_to_no_action() {
-    // Layout: ─, [lang, auto], ─, [version, github], ─, [reset cache, reset all].
+    // Layout: ─, [lang, auto], ─, [version, github], ─, [thirdcloud], ─, [reset cache, reset all].
     assert_eq!(settings_action_for_row(0), None); // leading divider
     assert_eq!(settings_action_for_row(1), Some(0));
     assert_eq!(settings_action_for_row(2), Some(1));
     assert_eq!(settings_action_for_row(3), None); // divider before version group
     assert_eq!(settings_action_for_row(4), Some(2));
     assert_eq!(settings_action_for_row(5), Some(3));
-    assert_eq!(settings_action_for_row(6), None); // divider before reset group
+    assert_eq!(settings_action_for_row(6), None); // divider before thirdcloud group
     assert_eq!(settings_action_for_row(7), Some(4));
-    assert_eq!(settings_action_for_row(8), Some(5));
-    assert_eq!(settings_action_for_row(9), None); // past the end
+    assert_eq!(settings_action_for_row(8), None); // divider before reset group
+    assert_eq!(settings_action_for_row(9), Some(5));
+    assert_eq!(settings_action_for_row(10), Some(6));
+    assert_eq!(settings_action_for_row(11), None); // past the end
 }
 
 #[test]
@@ -761,6 +768,34 @@ fn settings_tab_enter_on_view_github_logs_repo_url() {
 }
 
 #[test]
+fn settings_tab_enter_on_thirdcloud_sync_without_mijia_shows_dialog() {
+    let mut app = devices_tab_test_app(Vec::new());
+    app.active_tab = 3;
+    app.settings_selected = 4; // "重新同步三方设备状态"
+
+    let quit = handle_key(
+        &mut app,
+        crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .unwrap();
+
+    assert!(!quit);
+    match &app.account_action_dialog {
+        Some(AccountActionDialog::ThirdCloudSync {
+            groups,
+            running,
+            message,
+            ..
+        }) => {
+            assert!(!running);
+            assert!(groups.is_empty());
+            assert!(message.contains("未登录米家"), "{message}");
+        }
+        other => panic!("expected thirdcloud sync dialog, got {other:?}"),
+    }
+}
+
+#[test]
 fn strip_ansi_removes_color_codes_and_control_bytes() {
     // Mirrors real install-script output: SGR color codes around plain text.
     assert_eq!(
@@ -773,7 +808,10 @@ fn strip_ansi_removes_color_codes_and_control_bytes() {
     );
     // Carriage returns and other control bytes are dropped; plain text is untouched.
     assert_eq!(strip_ansi("done\r"), "done");
-    assert_eq!(strip_ansi("mit-1.1.0-aarch64-apple-darwin.tar.gz"), "mit-1.1.0-aarch64-apple-darwin.tar.gz");
+    assert_eq!(
+        strip_ansi("mit-1.1.0-aarch64-apple-darwin.tar.gz"),
+        "mit-1.1.0-aarch64-apple-darwin.tar.gz"
+    );
 }
 
 #[test]
@@ -1384,7 +1422,7 @@ fn settings_tab_enter_purges_devices_cache_after_single_confirm() {
         property_cache: Arc::new(PropertyCache::new()),
         language: Language::Chinese,
         auto_subscribe_device_status: true,
-        settings_selected: 4,
+        settings_selected: 5,
         update_check_rx: None,
         update_check_status: None,
         install_rx: None,
@@ -1410,7 +1448,11 @@ fn settings_tab_enter_purges_devices_cache_after_single_confirm() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let text = terminal_text(&terminal);
     let compact = text.replace(' ', "");
-    assert!(compact.contains("操作:重置设备缓存"), "{text}");
+    let action = match &app.account_action_dialog {
+        Some(AccountActionDialog::SettingsConfirm { action }) => format!("{action:?}"),
+        other => panic!("expected cache confirm dialog, got {other:?}"),
+    };
+    assert_eq!(action, "ClearCacheKeepAuth");
     assert!(!compact.contains("该操作不可恢复"), "{text}");
 
     let quit = handle_key(
@@ -1817,4 +1859,3 @@ fn clicking_accounts_row_selects_account() {
     assert_eq!(app.account_index, 1);
     assert!(app.account_action_dialog.is_none());
 }
-

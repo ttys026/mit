@@ -17,7 +17,7 @@ use time::{format_description::FormatItem, macros::format_description};
 
 use crate::cli::ensure_fresh_account;
 use crate::mico_api::{is_auth_expired, Device, MicoClient};
-use crate::mijia_api::{is_mijia_auth_error, is_mijia_auth_present, MijiaClient};
+use crate::mijia_api::{is_mijia_auth_error, is_mijia_auth_present, MijiaClient, ThirdCloudGroup};
 use crate::miot_lan::LanPushEvent;
 use crate::property_cache::PropertyCache;
 use crate::storage::{
@@ -126,10 +126,10 @@ pub(crate) fn device_list_header_titles(lang: Language) -> [&'static str; 6] {
     }
 }
 const STATUS_BAR_MARGIN_TOP: u16 = 1;
-const SETTINGS_ITEM_COUNT: usize = 6;
+const SETTINGS_ITEM_COUNT: usize = 7;
 /// Action indices that get a divider line drawn immediately before them, splitting
-/// the list into groups: (leading) | toggles | version/links | destructive resets.
-const SETTINGS_SEPARATORS: [usize; 3] = [0, 2, 4];
+/// the list into groups: (leading) | toggles | version/links | sync | destructive resets.
+const SETTINGS_SEPARATORS: [usize; 4] = [0, 2, 4, 5];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsAction {
@@ -137,6 +137,7 @@ enum SettingsAction {
     ToggleAutoSubscribeDeviceStatus,
     VersionAndCheckUpdate,
     ViewGithub,
+    ResyncThirdCloudDeviceStatus,
     ClearCacheKeepAuth,
     ResetAll,
 }
@@ -281,6 +282,36 @@ struct BootstrapPending {
     refresh_local_transport_if_missing: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThirdCloudSyncGroupState {
+    group_id: i64,
+    name: String,
+    short_name: String,
+    status: ThirdCloudSyncStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ThirdCloudSyncStatus {
+    Pending,
+    Running,
+    Success { detail: String },
+    Failed { error: String },
+}
+
+#[derive(Clone, Debug)]
+enum ThirdCloudSyncEvent {
+    Planned(Vec<ThirdCloudGroup>),
+    GroupStarted(i64),
+    GroupFinished {
+        group_id: i64,
+        success: bool,
+        detail: String,
+    },
+    Finished {
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug)]
 enum BootstrapMessage {
     Ready {
@@ -309,6 +340,10 @@ enum BootstrapMessage {
         xiaomi_invalid_uids: Vec<String>,
         mijia_valid_uids: Vec<String>,
         mijia_invalid_uids: Vec<String>,
+    },
+    ThirdCloudSync {
+        generation: u64,
+        event: ThirdCloudSyncEvent,
     },
 }
 
@@ -457,6 +492,7 @@ fn run_loop(
             || matches!(
                 app.account_action_dialog,
                 Some(AccountActionDialog::UpdateRunning { .. })
+                    | Some(AccountActionDialog::ThirdCloudSync { running: true, .. })
             )
         {
             // Advance the spinner/indeterminate progress bar each frame.
@@ -1126,6 +1162,9 @@ impl TuiApp {
                         self.invalid_mijia_account_uids.insert(uid);
                     }
                 }
+                BootstrapMessage::ThirdCloudSync { generation, event } => {
+                    self.apply_thirdcloud_sync_event(generation, event);
+                }
             }
         }
 
@@ -1355,7 +1394,8 @@ impl TuiApp {
             1 => SettingsAction::ToggleAutoSubscribeDeviceStatus,
             2 => SettingsAction::VersionAndCheckUpdate,
             3 => SettingsAction::ViewGithub,
-            4 => SettingsAction::ClearCacheKeepAuth,
+            4 => SettingsAction::ResyncThirdCloudDeviceStatus,
+            5 => SettingsAction::ClearCacheKeepAuth,
             _ => SettingsAction::ResetAll,
         }
     }
@@ -1379,6 +1419,7 @@ impl TuiApp {
                 self.open_github_page(&crate::actions::github_home_url());
                 Ok(())
             }
+            SettingsAction::ResyncThirdCloudDeviceStatus => self.start_thirdcloud_sync(),
             SettingsAction::ToggleLanguage => {
                 self.language = match self.language {
                     Language::Chinese => Language::English,
@@ -1556,13 +1597,145 @@ impl TuiApp {
         }
     }
 
+    fn start_thirdcloud_sync(&mut self) -> Result<()> {
+        let generation = now_epoch_millis() as u64;
+        let auth = self
+            .current_account()
+            .and_then(|account| account.mijia.clone());
+        if !is_mijia_auth_present(auth.as_ref()) {
+            self.account_action_dialog = Some(AccountActionDialog::ThirdCloudSync {
+                generation,
+                groups: Vec::new(),
+                running: false,
+                message: lang_str(
+                    self.language,
+                    "当前账号未登录米家，无法同步三方设备状态",
+                    "Current account is not logged into Mijia, so third-party device status cannot be synced",
+                )
+                .to_string(),
+            });
+            return Ok(());
+        }
+        let auth = auth.expect("checked by is_mijia_auth_present");
+        self.boot_spinner_index = 0;
+        self.account_action_dialog = Some(AccountActionDialog::ThirdCloudSync {
+            generation,
+            groups: Vec::new(),
+            running: true,
+            message: lang_str(
+                self.language,
+                "正在获取已绑定三方平台…",
+                "Loading bound third-party platforms…",
+            )
+            .to_string(),
+        });
+        self.log("开始重新同步三方设备状态".to_string());
+
+        let tx = self.bootstrap_tx.clone();
+        let lang = self.language;
+        thread::spawn(move || run_thirdcloud_sync(generation, auth, tx, lang));
+        Ok(())
+    }
+
+    fn apply_thirdcloud_sync_event(&mut self, generation: u64, event: ThirdCloudSyncEvent) {
+        let language = self.language;
+        let mut log_line = None;
+        {
+            let Some(AccountActionDialog::ThirdCloudSync {
+                generation: active_generation,
+                groups,
+                running,
+                message,
+            }) = &mut self.account_action_dialog
+            else {
+                return;
+            };
+            if *active_generation != generation {
+                return;
+            }
+
+            match event {
+                ThirdCloudSyncEvent::Planned(planned_groups) => {
+                    *groups = planned_groups
+                        .into_iter()
+                        .map(thirdcloud_sync_group_state)
+                        .collect();
+                    *message = if groups.is_empty() {
+                        lang_str(
+                            language,
+                            "没有已绑定三方平台",
+                            "No bound third-party platforms",
+                        )
+                        .to_string()
+                    } else {
+                        format!(
+                            "{} {}",
+                            lang_str(language, "已发现三方平台数量：", "Bound platforms:"),
+                            groups.len()
+                        )
+                    };
+                }
+                ThirdCloudSyncEvent::GroupStarted(group_id) => {
+                    if let Some(group) = groups.iter_mut().find(|group| group.group_id == group_id)
+                    {
+                        group.status = ThirdCloudSyncStatus::Running;
+                        *message = format!(
+                            "{} {}",
+                            lang_str(language, "正在同步", "Syncing"),
+                            thirdcloud_group_label(group)
+                        );
+                    }
+                }
+                ThirdCloudSyncEvent::GroupFinished {
+                    group_id,
+                    success,
+                    detail,
+                } => {
+                    if let Some(group) = groups.iter_mut().find(|group| group.group_id == group_id)
+                    {
+                        let label = thirdcloud_group_label(group);
+                        if success {
+                            group.status = ThirdCloudSyncStatus::Success {
+                                detail: detail.clone(),
+                            };
+                            *message =
+                                format!("{} {}", lang_str(language, "同步完成", "Synced"), label);
+                            log_line = Some(format!("三方平台同步成功：{label} - {detail}"));
+                        } else {
+                            group.status = ThirdCloudSyncStatus::Failed {
+                                error: detail.clone(),
+                            };
+                            *message = format!(
+                                "{} {}",
+                                lang_str(language, "同步失败", "Sync failed"),
+                                label
+                            );
+                            log_line = Some(format!("三方平台同步失败：{label} - {detail}"));
+                        }
+                    }
+                }
+                ThirdCloudSyncEvent::Finished {
+                    message: final_message,
+                } => {
+                    *running = false;
+                    *message = final_message.clone();
+                    log_line = Some(format!("三方设备状态同步结束：{final_message}"));
+                }
+            }
+        }
+        if let Some(line) = log_line {
+            self.log(line);
+        }
+    }
+
     fn execute_selected_settings_action(&mut self) -> Result<()> {
         let action = self.selected_settings_action();
         match action {
             SettingsAction::ToggleLanguage
             | SettingsAction::ToggleAutoSubscribeDeviceStatus
             | SettingsAction::VersionAndCheckUpdate
-            | SettingsAction::ViewGithub => self.execute_settings_action(action),
+            | SettingsAction::ViewGithub
+            | SettingsAction::ResyncThirdCloudDeviceStatus => self.execute_settings_action(action),
             SettingsAction::ClearCacheKeepAuth | SettingsAction::ResetAll => {
                 self.account_action_dialog = Some(AccountActionDialog::SettingsConfirm { action });
                 Ok(())
@@ -1915,6 +2088,13 @@ enum AccountActionDialog {
         success: bool,
         message: String,
     },
+    /// A manual third-party cloud status sync is running or has finished.
+    ThirdCloudSync {
+        generation: u64,
+        groups: Vec<ThirdCloudSyncGroupState>,
+        running: bool,
+        message: String,
+    },
 }
 
 /// A message from the background install thread to the UI: a line of script
@@ -1922,6 +2102,146 @@ enum AccountActionDialog {
 enum InstallMessage {
     Line(String),
     Done { success: bool, message: String },
+}
+
+fn thirdcloud_sync_group_state(group: ThirdCloudGroup) -> ThirdCloudSyncGroupState {
+    ThirdCloudSyncGroupState {
+        group_id: group.group_id,
+        name: group.name,
+        short_name: group.short_name,
+        status: ThirdCloudSyncStatus::Pending,
+    }
+}
+
+fn thirdcloud_group_label(group: &ThirdCloudSyncGroupState) -> String {
+    if group.short_name.trim().is_empty() {
+        format!("{} ({})", group.name, group.group_id)
+    } else {
+        format!("{} / {} ({})", group.name, group.short_name, group.group_id)
+    }
+}
+
+fn run_thirdcloud_sync(
+    generation: u64,
+    auth: crate::storage::MijiaAuth,
+    tx: Sender<BootstrapMessage>,
+    lang: Language,
+) {
+    let summary = match crate::actions::sync_third_party_devices(&auth, |event| match event {
+        crate::actions::ThirdPartyDeviceSyncProgress::Planned(groups) => {
+            send_thirdcloud_sync_event(&tx, generation, ThirdCloudSyncEvent::Planned(groups))
+        }
+        crate::actions::ThirdPartyDeviceSyncProgress::GroupStarted(group) => {
+            send_thirdcloud_sync_event(
+                &tx,
+                generation,
+                ThirdCloudSyncEvent::GroupStarted(group.group_id),
+            )
+        }
+        crate::actions::ThirdPartyDeviceSyncProgress::GroupFinished(result) => {
+            send_thirdcloud_sync_event(
+                &tx,
+                generation,
+                ThirdCloudSyncEvent::GroupFinished {
+                    group_id: result.group.group_id,
+                    success: result.success,
+                    detail: thirdcloud_sync_detail(&result, lang),
+                },
+            )
+        }
+    }) {
+        Ok(summary) => summary,
+        Err(error) => {
+            send_thirdcloud_sync_event(
+                &tx,
+                generation,
+                ThirdCloudSyncEvent::Finished {
+                    message: format!(
+                        "{}{error}",
+                        lang_str(
+                            lang,
+                            "同步三方设备状态失败：",
+                            "Failed to sync third-party device status: "
+                        )
+                    ),
+                },
+            );
+            return;
+        }
+    };
+
+    if summary.cancelled {
+        return;
+    }
+    if summary.groups.is_empty() {
+        send_thirdcloud_sync_event(
+            &tx,
+            generation,
+            ThirdCloudSyncEvent::Finished {
+                message: lang_str(lang, "没有已绑定三方平台", "No bound third-party platforms")
+                    .to_string(),
+            },
+        );
+        return;
+    }
+
+    send_thirdcloud_sync_event(
+        &tx,
+        generation,
+        ThirdCloudSyncEvent::Finished {
+            message: if summary.failed_count == 0 {
+                format!(
+                    "{}{}",
+                    lang_str(lang, "全部同步成功：", "All synced: "),
+                    summary.ok_count
+                )
+            } else {
+                format!(
+                    "{}{}{}{}",
+                    lang_str(lang, "同步完成，成功 ", "Sync finished, success "),
+                    summary.ok_count,
+                    lang_str(lang, "，失败 ", ", failed "),
+                    summary.failed_count
+                )
+            },
+        },
+    );
+}
+
+fn send_thirdcloud_sync_event(
+    tx: &Sender<BootstrapMessage>,
+    generation: u64,
+    event: ThirdCloudSyncEvent,
+) -> bool {
+    tx.send(BootstrapMessage::ThirdCloudSync { generation, event })
+        .is_ok()
+}
+
+fn thirdcloud_sync_detail(
+    result: &crate::actions::ThirdPartyDeviceSyncGroupResult,
+    lang: Language,
+) -> String {
+    if result.success {
+        thirdcloud_success_detail(result, lang)
+    } else {
+        result.failure_detail()
+    }
+}
+
+fn thirdcloud_success_detail(
+    result: &crate::actions::ThirdPartyDeviceSyncGroupResult,
+    lang: Language,
+) -> String {
+    let result_text = result.result_text();
+    match result.device_count {
+        Some(count) => format!(
+            "{}{}{}",
+            result_text,
+            lang_str(lang, "，设备数 ", ", devices "),
+            count
+        ),
+        None => result_text,
+    }
 }
 
 /// Remove ANSI/CSI escape sequences (and stray control bytes like `\r`) from a

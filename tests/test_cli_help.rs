@@ -14,6 +14,8 @@ fn root_help_lists_commands() {
     assert!(stdout.contains("登录与账号管理"));
     assert!(stdout.contains("devices"));
     assert!(stdout.contains("列出设备"));
+    assert!(stdout.contains("third-party"));
+    assert!(stdout.contains("管理三方平台设备"));
     assert!(stdout.contains("props"));
     assert!(stdout.contains("读写 MIoT 属性和 action"));
     assert!(stdout.contains("push"));
@@ -56,6 +58,7 @@ fn bare_root_prints_command_summary() {
             "mit 可用命令：",
             "- auth：登录与账号管理",
             "- devices：列出设备",
+            "- third-party：管理三方平台设备",
             "- props：读写 MIoT 属性和 action",
             "- push：向已登录账号发送通知",
             "- logs：查看设备操作记录（米家历史日志）",
@@ -156,6 +159,20 @@ fn nested_help_lists_devices_subcommands() {
     let devices_stdout = String::from_utf8(devices_output.stdout).unwrap();
     assert!(devices_stdout.contains("list"));
     assert!(devices_stdout.contains("列出所有已登录账号的设备"));
+    assert!(!devices_stdout.contains("sync-third-party"));
+}
+
+#[test]
+fn nested_help_lists_third_party_subcommands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["third-party", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("list"));
+    assert!(stdout.contains("列出已绑定三方平台及设备"));
+    assert!(stdout.contains("sync"));
+    assert!(stdout.contains("同步已绑定三方平台的设备状态"));
 }
 
 #[test]

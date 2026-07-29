@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, Padding, Paragraph, Tabs, Wrap};
 use ratatui_core::style::Style as TextAreaStyle;
 use ratatui_core::widgets::Widget as TextAreaWidget;
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
@@ -234,6 +234,12 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                 auto_subscribe_device_status_label(app.language, app.auto_subscribe_device_status),
                 version_label,
                 lang_str(app.language, "在 GitHub 查看", "View on GitHub").to_string(),
+                lang_str(
+                    app.language,
+                    "重新同步三方设备状态",
+                    "Re-sync Third-party Device Status",
+                )
+                .to_string(),
                 lang_str(
                     app.language,
                     "重置设备缓存（重新同步设备）",
@@ -492,13 +498,15 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
             }
             AccountActionDialog::SettingsConfirm { action } => {
                 let popup = centered_rect(74, 42, frame.area());
-                frame.render_widget(Clear, popup);
+                let backdrop = expand_rect(popup, 2, 1, frame.area());
+                frame.render_widget(Clear, backdrop);
                 let lines = settings_confirm_lines(*action, app.language);
                 frame.render_widget(
                     Paragraph::new(lines.join("\n"))
                         .block(
                             Block::default()
-                                .borders(top_bottom_borders())
+                                .borders(all_borders())
+                                .padding(Padding::new(1, 1, 1, 1))
                                 .title(lang_str(app.language, "确认操作", "Confirm Action")),
                         )
                         .wrap(Wrap { trim: true }),
@@ -576,6 +584,59 @@ pub(in crate::tui) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp) {
                             Block::default()
                                 .borders(top_bottom_borders())
                                 .title(lang_str(app.language, "升级结果", "Update Result")),
+                        )
+                        .wrap(Wrap { trim: true }),
+                    popup,
+                );
+            }
+            AccountActionDialog::ThirdCloudSync {
+                groups,
+                running,
+                message,
+                ..
+            } => {
+                let popup = centered_rect(72, 50, frame.area());
+                let backdrop = expand_rect(popup, 2, 1, frame.area());
+                frame.render_widget(Clear, backdrop);
+                let mut body = vec![message.clone()];
+                if *running {
+                    body.push(indeterminate_bar(app.boot_spinner_index, 28));
+                }
+                body.push(String::new());
+                if groups.is_empty() {
+                    body.push(lang_str(app.language, "暂无平台", "No platforms").to_string());
+                } else {
+                    body.extend(groups.iter().map(|group| {
+                        let state = match &group.status {
+                            ThirdCloudSyncStatus::Pending => {
+                                lang_str(app.language, "等待中", "Pending").to_string()
+                            }
+                            ThirdCloudSyncStatus::Running => {
+                                lang_str(app.language, "同步中", "Syncing").to_string()
+                            }
+                            ThirdCloudSyncStatus::Success { detail } => format!(
+                                "{} - {}",
+                                lang_str(app.language, "成功", "Success"),
+                                detail
+                            ),
+                            ThirdCloudSyncStatus::Failed { error } => {
+                                format!("{} - {}", lang_str(app.language, "失败", "Failed"), error)
+                            }
+                        };
+                        format!("{}  {}", thirdcloud_group_label(group), state)
+                    }));
+                }
+                frame.render_widget(
+                    Paragraph::new(body.join("\n"))
+                        .block(
+                            Block::default()
+                                .borders(all_borders())
+                                .padding(Padding::new(1, 1, 1, 1))
+                                .title(lang_str(
+                                    app.language,
+                                    "三方设备状态同步",
+                                    "Third-party Status Sync",
+                                )),
                         )
                         .wrap(Wrap { trim: true }),
                     popup,

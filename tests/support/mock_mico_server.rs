@@ -369,6 +369,70 @@ fn route(
             }
         })
         .into(),
+        ("POST", "/app/business/thirdcloud/api/group/sortedList") => json!({
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "hotList": [
+                    {
+                        "groupId": 2069,
+                        "shortName": "juhl",
+                        "name": "海信爱家",
+                        "bindStatus": 0
+                    },
+                    {
+                        "groupId": 9999,
+                        "shortName": "skip",
+                        "name": "未绑定平台",
+                        "bindStatus": -1
+                    }
+                ],
+                "groupList": [
+                    {
+                        "groupId": 1128,
+                        "shortName": "eco",
+                        "name": "科沃斯机器人",
+                        "bindStatus": 0
+                    }
+                ]
+            }
+        })
+        .into(),
+        ("POST", "/app/v2/thirdcloud2cloud/sync") => json!({
+            "code": 0,
+            "message": "",
+            "result": "ok"
+        })
+        .into(),
+        ("POST", "/app/v2/thirdcloud2cloud/device_list") => json!({
+            "code": 0,
+            "message": "",
+            "result": {
+                "list": [
+                    {
+                        "group_id": 2069,
+                        "short_name": "juhl",
+                        "name": "海信爱家",
+                        "bind_status": 0,
+                        "dev_list": [
+                            {"did": "third-juhl-1"},
+                            {"did": "third-juhl-2"}
+                        ]
+                    },
+                    {
+                        "group_id": 1128,
+                        "short_name": "eco",
+                        "name": "科沃斯机器人",
+                        "bind_status": 0,
+                        "dev_list": [
+                            {"did": "third-eco-1"}
+                        ]
+                    }
+                ],
+                "has_more": false
+            }
+        })
+        .into(),
         ("POST", "/app/v2/homeroom/gethome_merged") => json!({
             "code": 0,
             "result": {

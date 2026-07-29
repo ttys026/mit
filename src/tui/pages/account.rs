@@ -147,8 +147,7 @@ pub(crate) fn account_list_row(
         !account.access_token.trim().is_empty() || !account.refresh_token.trim().is_empty();
     // A token that is past expiry with no refresh token can never be revived,
     // so treat it as invalid even before the async check confirms it.
-    let xiaomi_expired_local =
-        is_auth_expired(account) && account.refresh_token.trim().is_empty();
+    let xiaomi_expired_local = is_auth_expired(account) && account.refresh_token.trim().is_empty();
     let xiaomi_status = if !has_xiaomi {
         t("未登录", "Missing")
     } else if xiaomi_invalid || xiaomi_expired_local {
@@ -312,7 +311,8 @@ impl TuiApp {
                 AccountActionDialog::SettingsConfirm { .. } => None,
                 AccountActionDialog::UpdateAvailable { .. }
                 | AccountActionDialog::UpdateRunning { .. }
-                | AccountActionDialog::UpdateFinished { .. } => None,
+                | AccountActionDialog::UpdateFinished { .. }
+                | AccountActionDialog::ThirdCloudSync { .. } => None,
             })
             .ok_or_else(|| anyhow!("账号操作菜单未打开"))?;
         let uid = self.current_uid().unwrap_or("-").to_string();

@@ -528,7 +528,11 @@ fn prop_dialog_statistics_dropdown_selects_active_key_and_period() {
         "requests": [
             {"key": "2.2", "response": {"code": 0, "result": [{"time": 0, "value": 1.0}]}},
             {"key": "4.1", "response": {"code": 0, "result": [{"time": 0, "value": 9.0}]}}
-        ]
+        ],
+        "date_filter": {
+            "time_start": 0,
+            "time_end": 604799
+        }
     })));
     dialog.active_tab = PropDialogTab::Statistics;
     dialog.selected = 0;

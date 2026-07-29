@@ -107,6 +107,11 @@ mit tui --uid 1234567                            # 以指定账号启动
 # ── 设备 ───────────────────────────────────────────────────
 mit devices list                                 # 列出所有账号下的设备
 
+# ── 三方平台 ───────────────────────────────────────────────
+mit third-party list                             # 列出已绑定三方平台及设备
+mit third-party sync                             # 同步已绑定三方设备状态
+mit third-party sync --uid 1001                  # 只同步指定账号
+
 # ── 推送通知 ────────────────────────────────────────────────
 mit push "Hello World"                           # 向所有账号推送
 mit push --uid 1001 "Hello World"                # 向指定账号推送
@@ -165,6 +170,8 @@ mit reset --yes                                  # 删除 ~/.mit 下的全部数
 mit --json                  # 帮助信息（JSON 格式）
 mit --json auth list        # 账号列表（JSON 格式）
 mit --json devices list     # 设备列表（JSON 格式）
+mit --json third-party list # 已绑定三方平台及设备（JSON 格式）
+mit --json third-party sync # 三方设备同步结果（JSON 格式）
 mit --json push "hello"     # 推送结果（JSON 格式）
 ```
 

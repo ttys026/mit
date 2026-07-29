@@ -107,6 +107,11 @@ mit tui --uid 1234567                            # Start with a specific account
 # ── Devices ────────────────────────────────────────────────
 mit devices list                                 # List devices for all accounts
 
+# ── Third-party platforms ──────────────────────────────────
+mit third-party list                             # List connected platforms and devices
+mit third-party sync                             # Sync bound third-party device status
+mit third-party sync --uid 1001                  # Sync one account only
+
 # ── Push notifications ─────────────────────────────────────
 mit push "Hello World"                           # Push to all accounts
 mit push --uid 1001 "Hello World"                # Push to a specific account
@@ -165,6 +170,8 @@ Commands support machine-readable JSON output via the global `--json` flag:
 mit --json                  # Help as JSON
 mit --json auth list        # Account list as JSON
 mit --json devices list     # Device list as JSON
+mit --json third-party list # Connected third-party devices as JSON
+mit --json third-party sync # Third-party device sync result as JSON
 mit --json push "hello"     # Push result as JSON
 ```
 

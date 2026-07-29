@@ -21,7 +21,7 @@ pub use commands::{
 };
 use commands::{
     handle_auth_logout, handle_cache, handle_devices, handle_logs, handle_props, handle_push,
-    handle_reset, handle_stats, handle_tui, handle_update,
+    handle_reset, handle_stats, handle_third_party, handle_tui, handle_update,
 };
 use login::{run_mijia_login, run_xiaomi_login};
 
@@ -53,6 +53,8 @@ pub enum RootCommand {
     Auth(AuthArgs),
     #[command(about = "列出设备")]
     Devices(DevicesArgs),
+    #[command(name = "third-party", about = "管理三方平台设备")]
+    ThirdParty(ThirdPartyArgs),
     #[command(about = "读写 MIoT 属性和 action")]
     Props(PropsArgs),
     #[command(about = "向已登录账号发送通知")]
@@ -145,6 +147,12 @@ pub struct DevicesArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+pub struct ThirdPartyArgs {
+    #[command(subcommand)]
+    pub command: Option<ThirdPartyCommand>,
+}
+
+#[derive(Clone, Debug, Args)]
 pub struct PropsArgs {
     #[command(subcommand)]
     pub command: Option<PropsCommand>,
@@ -213,6 +221,26 @@ pub struct PropsSubArgs {
 pub enum DevicesCommand {
     #[command(about = "列出所有已登录账号的设备")]
     List,
+}
+
+#[derive(Clone, Debug, Args, Default)]
+pub struct ThirdPartyListArgs {
+    #[arg(long = "uid", help = "目标账号 UID；省略则列出所有已登录米家的账号")]
+    pub uid: Option<String>,
+}
+
+#[derive(Clone, Debug, Args, Default)]
+pub struct ThirdPartySyncArgs {
+    #[arg(long = "uid", help = "目标账号 UID；省略则同步所有已登录米家的账号")]
+    pub uid: Option<String>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ThirdPartyCommand {
+    #[command(about = "列出已绑定三方平台及设备")]
+    List(ThirdPartyListArgs),
+    #[command(about = "同步已绑定三方平台的设备状态")]
+    Sync(ThirdPartySyncArgs),
 }
 
 #[derive(Clone, Debug, Args, Default)]
@@ -431,6 +459,7 @@ pub fn run(args: Cli) -> Result<()> {
     match args.command {
         Some(RootCommand::Auth(args)) => handle_auth(output_mode, args),
         Some(RootCommand::Devices(args)) => handle_devices(output_mode, args),
+        Some(RootCommand::ThirdParty(args)) => handle_third_party(output_mode, args),
         Some(RootCommand::Props(args)) => handle_props(output_mode, args),
         Some(RootCommand::Push(args)) => handle_push(output_mode, args),
         Some(RootCommand::Logs(args)) => handle_logs(output_mode, args),
@@ -535,6 +564,62 @@ struct DevicesListOutput {
     #[serde(rename = "type")]
     kind: &'static str,
     accounts: Vec<AccountDevicesGroupOutput>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThirdPartyGroupOutput {
+    group_id: i64,
+    name: String,
+    short_name: String,
+    device_count: usize,
+    devices: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThirdPartyListAccountOutput {
+    uid: String,
+    nickname: String,
+    groups: Vec<ThirdPartyGroupOutput>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThirdPartyListOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    accounts: Vec<ThirdPartyListAccountOutput>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThirdPartyDeviceSyncGroupOutput {
+    group_id: i64,
+    name: String,
+    short_name: String,
+    success: bool,
+    code: Option<i64>,
+    message: Option<String>,
+    result: Option<serde_json::Value>,
+    device_count: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThirdPartyDeviceSyncAccountOutput {
+    uid: String,
+    nickname: String,
+    groups: Vec<ThirdPartyDeviceSyncGroupOutput>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThirdPartyDeviceSyncOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    accounts: Vec<ThirdPartyDeviceSyncAccountOutput>,
 }
 
 #[derive(Clone, Debug, Serialize)]

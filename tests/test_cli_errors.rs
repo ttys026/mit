@@ -158,6 +158,22 @@ fn bare_devices_shows_help() {
     assert!(stdout.contains("列出所有已登录账号的设备"));
 }
 
+#[test]
+fn bare_third_party_shows_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .arg("third-party")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains("管理三方平台设备"));
+    assert!(stdout.contains("list"));
+    assert!(stdout.contains("列出已绑定三方平台及设备"));
+    assert!(stdout.contains("sync"));
+    assert!(stdout.contains("同步已绑定三方平台的设备状态"));
+}
+
 fn make_temp_dir(prefix: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

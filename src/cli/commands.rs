@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::mico_api::{MicoClient, MiotChannel};
-use crate::mijia_api::DeviceHistoryQuery;
+use crate::mijia_api::{is_mijia_auth_present, DeviceHistoryQuery};
 use crate::mips_cloud::{
     config_from_account, property_subscription_for, start_stdout_subscription, CloudMipsHandle,
     CloudMipsSubscription,
@@ -231,6 +231,290 @@ pub(in crate::cli) fn handle_devices(output_mode: OutputMode, args: DevicesArgs)
             }
             Ok(())
         }
+    }
+}
+
+pub(in crate::cli) fn handle_third_party(
+    output_mode: OutputMode,
+    args: ThirdPartyArgs,
+) -> Result<()> {
+    let Some(command) = args.command else {
+        return show_subcommand_help(output_mode, "third-party");
+    };
+    match command {
+        ThirdPartyCommand::List(args) => {
+            let accounts = handle_third_party_list(args)?;
+            match output_mode {
+                OutputMode::Text => print_third_party_list_text(&accounts),
+                OutputMode::Json => {
+                    let accounts = accounts
+                        .into_iter()
+                        .map(third_party_list_account_output)
+                        .collect();
+                    print_json(&ThirdPartyListOutput {
+                        kind: "thirdPartyList",
+                        accounts,
+                    })?;
+                }
+            }
+            Ok(())
+        }
+        ThirdPartyCommand::Sync(args) => {
+            let accounts = handle_third_party_sync(args)?;
+            match output_mode {
+                OutputMode::Text => print_third_party_sync_text(&accounts),
+                OutputMode::Json => {
+                    let accounts = accounts
+                        .into_iter()
+                        .map(third_party_sync_account_output)
+                        .collect();
+                    print_json(&ThirdPartyDeviceSyncOutput {
+                        kind: "thirdPartyDeviceSync",
+                        accounts,
+                    })?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+struct AccountThirdPartyGroups {
+    uid: String,
+    nickname: String,
+    platforms: Vec<crate::actions::ThirdPartyPlatformDevices>,
+}
+
+struct AccountThirdPartyDeviceSync {
+    uid: String,
+    nickname: String,
+    groups: Vec<crate::actions::ThirdPartyDeviceSyncGroupResult>,
+}
+
+fn mijia_accounts_for_uid(uid: Option<&str>) -> Result<Vec<AuthAccount>> {
+    let auth_state = load_auth()?;
+    let accounts = get_auth_accounts(&auth_state)?;
+    let accounts = match uid {
+        Some(uid) => {
+            let account = accounts
+                .into_iter()
+                .find(|account| account.user.uid == uid)
+                .ok_or_else(|| anyhow::anyhow!("未找到账号 {uid}"))?;
+            if !is_mijia_auth_present(account.mijia.as_ref()) {
+                bail!("账号 {uid} 未登录米家，请先运行 mit auth login mijia");
+            }
+            vec![account]
+        }
+        None => accounts
+            .into_iter()
+            .filter(|account| is_mijia_auth_present(account.mijia.as_ref()))
+            .collect::<Vec<_>>(),
+    };
+    if accounts.is_empty() {
+        bail!("没有已登录米家的账号，请先运行 mit auth login mijia");
+    }
+
+    Ok(accounts)
+}
+
+fn handle_third_party_list(args: ThirdPartyListArgs) -> Result<Vec<AccountThirdPartyGroups>> {
+    let accounts = mijia_accounts_for_uid(args.uid.as_deref())?;
+    let mut outputs = Vec::new();
+    for account in accounts {
+        let uid = account.user.uid.clone();
+        let nickname = account.user.nickname.clone();
+        let auth = account
+            .mijia
+            .as_ref()
+            .expect("Mijia auth must be present after filtering");
+        let platforms = crate::actions::list_third_party_platforms(auth)?;
+        outputs.push(AccountThirdPartyGroups {
+            uid,
+            nickname,
+            platforms,
+        });
+    }
+    Ok(outputs)
+}
+
+fn handle_third_party_sync(args: ThirdPartySyncArgs) -> Result<Vec<AccountThirdPartyDeviceSync>> {
+    let accounts = mijia_accounts_for_uid(args.uid.as_deref())?;
+    let mut outputs = Vec::new();
+    for account in accounts {
+        let uid = account.user.uid.clone();
+        let nickname = account.user.nickname.clone();
+        let auth = account
+            .mijia
+            .as_ref()
+            .expect("Mijia auth must be present after filtering");
+        let summary = crate::actions::sync_third_party_devices(auth, |_| true)?;
+        outputs.push(AccountThirdPartyDeviceSync {
+            uid,
+            nickname,
+            groups: summary.groups,
+        });
+    }
+    Ok(outputs)
+}
+
+fn third_party_list_account_output(
+    account: AccountThirdPartyGroups,
+) -> ThirdPartyListAccountOutput {
+    ThirdPartyListAccountOutput {
+        uid: account.uid,
+        nickname: account.nickname,
+        groups: account
+            .platforms
+            .into_iter()
+            .map(third_party_group_output)
+            .collect(),
+    }
+}
+
+fn third_party_group_output(
+    platform: crate::actions::ThirdPartyPlatformDevices,
+) -> ThirdPartyGroupOutput {
+    ThirdPartyGroupOutput {
+        group_id: platform.group.group_id,
+        name: platform.group.name,
+        short_name: platform.group.short_name,
+        device_count: platform.devices.len(),
+        devices: platform.devices,
+    }
+}
+
+fn third_party_sync_account_output(
+    account: AccountThirdPartyDeviceSync,
+) -> ThirdPartyDeviceSyncAccountOutput {
+    ThirdPartyDeviceSyncAccountOutput {
+        uid: account.uid,
+        nickname: account.nickname,
+        groups: account
+            .groups
+            .into_iter()
+            .map(third_party_sync_group_output)
+            .collect(),
+    }
+}
+
+fn third_party_sync_group_output(
+    group: crate::actions::ThirdPartyDeviceSyncGroupResult,
+) -> ThirdPartyDeviceSyncGroupOutput {
+    ThirdPartyDeviceSyncGroupOutput {
+        group_id: group.group.group_id,
+        name: group.group.name,
+        short_name: group.group.short_name,
+        success: group.success,
+        code: group.code,
+        message: group.message,
+        result: group.result,
+        device_count: group.device_count,
+        error: group.error,
+    }
+}
+
+fn print_third_party_list_text(accounts: &[AccountThirdPartyGroups]) {
+    for account in accounts {
+        println!("{}（{}）:", account.nickname, account.uid);
+        if account.platforms.is_empty() {
+            println!("  没有已绑定三方平台");
+            continue;
+        }
+        for platform in &account.platforms {
+            println!("  {}", third_party_group_label(platform));
+            print_third_party_device_tree(&platform.devices);
+        }
+    }
+}
+
+fn print_third_party_sync_text(accounts: &[AccountThirdPartyDeviceSync]) {
+    for account in accounts {
+        println!("{}（{}）:", account.nickname, account.uid);
+        if account.groups.is_empty() {
+            println!("  没有已绑定三方平台");
+            continue;
+        }
+        for group in &account.groups {
+            let label = third_party_sync_group_label(group);
+            if group.success {
+                let mut detail = group.result_text();
+                if let Some(count) = group.device_count {
+                    detail = format!("{detail}，设备数 {count}");
+                }
+                println!("  {label}: ✅ {detail}");
+            } else {
+                let error = group.failure_detail();
+                println!("  {label}: ❌ {error}");
+            }
+        }
+    }
+}
+
+fn third_party_group_label(platform: &crate::actions::ThirdPartyPlatformDevices) -> String {
+    if platform.group.short_name.trim().is_empty() {
+        format!("{}（{}）", platform.group.name, platform.group.group_id)
+    } else {
+        format!(
+            "{} / {}（{}）",
+            platform.group.name, platform.group.short_name, platform.group.group_id
+        )
+    }
+}
+
+fn third_party_sync_group_label(group: &crate::actions::ThirdPartyDeviceSyncGroupResult) -> String {
+    if group.group.short_name.trim().is_empty() {
+        format!("{}（{}）", group.group.name, group.group.group_id)
+    } else {
+        format!(
+            "{} / {}（{}）",
+            group.group.name, group.group.short_name, group.group.group_id
+        )
+    }
+}
+
+fn print_third_party_device_tree(devices: &[Value]) {
+    if devices.is_empty() {
+        println!("  └─ 没有设备");
+        return;
+    }
+    for (index, device) in devices.iter().enumerate() {
+        let branch = if index + 1 == devices.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        println!("  {branch} {}", third_party_device_label(device));
+    }
+}
+
+fn third_party_device_label(device: &Value) -> String {
+    let name = json_field_text(device, &["name", "device_name", "display_name", "dev_name"]);
+    let did = json_field_text(device, &["did", "device_id"]);
+    let model = json_field_text(device, &["model", "model_name"]);
+    match (name, did, model) {
+        (Some(name), Some(did), Some(model)) => format!("{name}（{did}, {model}）"),
+        (Some(name), Some(did), None) => format!("{name}（{did}）"),
+        (Some(name), None, Some(model)) => format!("{name}（{model}）"),
+        (Some(name), None, None) => name,
+        (None, Some(did), Some(model)) => format!("{did}（{model}）"),
+        (None, Some(did), None) => did,
+        (None, None, Some(model)) => model,
+        (None, None, None) => serde_json::to_string(device).unwrap_or_else(|_| "-".to_string()),
+    }
+}
+
+fn json_field_text(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(json_value_text)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn json_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.trim().to_string()),
+        Value::Number(_) | Value::Bool(_) => Some(value.to_string()),
+        _ => None,
     }
 }
 

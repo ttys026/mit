@@ -310,6 +310,7 @@ fn bare_root_uses_chinese_summary_by_default() {
             "mit 可用命令：",
             "- auth：登录与账号管理",
             "- devices：列出设备",
+            "- third-party：管理三方平台设备",
             "- props：读写 MIoT 属性和 action",
             "- push：向已登录账号发送通知",
             "- logs：查看设备操作记录（米家历史日志）",
@@ -357,6 +358,160 @@ fn devices_list_all_groups_results_by_account_across_multiple_accounts() {
     assert!(stdout.contains("账号B（1002）:"));
     assert!(stdout.contains("living-room"));
     assert!(stdout.contains("bedroom"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn third_party_list_json_lists_groups() {
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-cli-output-third-party-list");
+    write_mijia_auth_fixture(&test_home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "third-party", "list", "--uid", "1001"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(payload["type"], "thirdPartyList");
+    assert_eq!(payload["accounts"].as_array().unwrap().len(), 1);
+    let account = &payload["accounts"][0];
+    assert_eq!(account["uid"], "1001");
+    assert_eq!(account["nickname"], "账号A");
+    let groups = account["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    let juhl = groups
+        .iter()
+        .find(|group| group["groupId"] == 2069)
+        .unwrap();
+    assert_eq!(juhl["name"], "海信爱家");
+    assert_eq!(juhl["deviceCount"], 2);
+    assert_eq!(juhl["devices"][0]["did"], "third-juhl-1");
+    assert_eq!(juhl["devices"][1]["did"], "third-juhl-2");
+    let eco = groups
+        .iter()
+        .find(|group| group["groupId"] == 1128)
+        .unwrap();
+    assert_eq!(eco["name"], "科沃斯机器人");
+    assert_eq!(eco["deviceCount"], 1);
+    assert_eq!(eco["devices"][0]["did"], "third-eco-1");
+    assert!(!groups.iter().any(|group| group["groupId"] == 9999));
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/business/thirdcloud/api/group/sortedList")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/device_list")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/sync")
+            .count(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn third_party_list_text_renders_device_tree() {
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-cli-output-third-party-list-text");
+    write_mijia_auth_fixture(&test_home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["third-party", "list", "--uid", "1001"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains("账号A（1001）:"));
+    assert!(stdout.contains("海信爱家 / juhl（2069）"));
+    assert!(stdout.contains("├─ third-juhl-1"));
+    assert!(stdout.contains("└─ third-juhl-2"));
+    assert!(stdout.contains("科沃斯机器人 / eco（1128）"));
+    assert!(stdout.contains("└─ third-eco-1"));
+    assert!(!stdout.contains("未绑定平台"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn third_party_sync_json_syncs_bound_groups() {
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-cli-output-third-party-sync");
+    write_mijia_auth_fixture(&test_home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "third-party", "sync", "--uid", "1001"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(payload["type"], "thirdPartyDeviceSync");
+    assert_eq!(payload["accounts"].as_array().unwrap().len(), 1);
+    let account = &payload["accounts"][0];
+    assert_eq!(account["uid"], "1001");
+    assert_eq!(account["nickname"], "账号A");
+    let groups = account["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["groupId"], 2069);
+    assert_eq!(groups[0]["name"], "海信爱家");
+    assert_eq!(groups[0]["success"], true);
+    assert_eq!(groups[0]["result"], "ok");
+    assert_eq!(groups[0]["deviceCount"], 2);
+    assert_eq!(groups[1]["groupId"], 1128);
+    assert_eq!(groups[1]["name"], "科沃斯机器人");
+    assert_eq!(groups[1]["success"], true);
+    assert_eq!(groups[1]["deviceCount"], 1);
+    assert!(!groups.iter().any(|group| group["groupId"] == 9999));
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/business/thirdcloud/api/group/sortedList")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/sync")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/device_list")
+            .count(),
+        2
+    );
 
     let _ = fs::remove_dir_all(&test_home);
 }
@@ -593,6 +748,38 @@ fn write_auth_fixture(home: &std::path::Path) {
       },
       "mijia": null,
       "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }
+  ],
+  "pendingAuth": null
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn write_mijia_auth_fixture(home: &std::path::Path) {
+    let auth_dir = home.join(".mit");
+    fs::create_dir_all(&auth_dir).unwrap();
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{
+  "accounts": [
+    {
+      "version": 1,
+      "xiaomi": null,
+      "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+      "mijia": {
+        "ua": "Android-15-test",
+        "deviceId": "mijia-device-a",
+        "passO": "pass-o-a",
+        "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+        "passToken": "pass-token-a",
+        "userId": "1001",
+        "cUserId": "c-1001",
+        "serviceToken": "service-token-a",
+        "expireTime": 222,
+        "saveTime": 123
+      }
     }
   ],
   "pendingAuth": null

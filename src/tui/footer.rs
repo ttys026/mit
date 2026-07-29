@@ -150,6 +150,14 @@ pub(in crate::tui) fn footer_segments(app: &TuiApp) -> Vec<FooterSegment> {
                 )],
                 None,
             ),
+            AccountActionDialog::ThirdCloudSync { running, .. } => {
+                let label = if *running {
+                    lang_str(lang, "Esc: 后台运行", "Esc: Run in background")
+                } else {
+                    lang_str(lang, "Esc: 关闭", "Esc: Close")
+                };
+                build_footer_segments(&[(label, FooterOperation::Back)], None)
+            }
         };
     }
 

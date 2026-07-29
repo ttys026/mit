@@ -25,6 +25,8 @@ const MIJIA_LOGIN_URL_ENV: &str = "MIT_MIJIA_LOGIN_URL";
 const MIJIA_API_BASE_URL_ENV: &str = "MIT_MIJIA_API_BASE_URL";
 const DEFAULT_LOGIN_TIMEOUT_SECS: u64 = 120;
 const ANDROID_UA_PREFIX: &str = "Android-15-11.0.701-Xiaomi-23046RP50C-OS2.0.212.0.VMYCNXM";
+const THIRDCLOUD_ACCESS_KEY: &str = "IOS00026747c5acafc2";
+const THIRDCLOUD_DEVICE_LIST_LIMIT: u32 = 300;
 
 #[derive(Clone, Debug)]
 pub struct MijiaLoginSession {
@@ -43,6 +45,14 @@ pub struct MijiaClient {
     login_url: String,
     api_base_url: String,
     locale: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThirdCloudGroup {
+    pub group_id: i64,
+    pub name: String,
+    pub short_name: String,
+    pub bind_status: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,6 +382,53 @@ impl MijiaClient {
         )
     }
 
+    pub fn get_thirdcloud_groups(&self, auth: &MijiaAuth) -> Result<Vec<ThirdCloudGroup>> {
+        validate_mijia_auth(auth)?;
+        let envelope = self.post_encrypted(
+            "/business/thirdcloud/api/group/sortedList",
+            auth,
+            &json!({ "accessKey": THIRDCLOUD_ACCESS_KEY }),
+        )?;
+        ensure_mijia_success(&envelope)?;
+        Ok(parse_thirdcloud_groups(&envelope))
+    }
+
+    pub fn sync_thirdcloud_group(&self, auth: &MijiaAuth, group_id: i64) -> Result<Value> {
+        validate_mijia_auth(auth)?;
+        let envelope = self.post_encrypted(
+            "/v2/thirdcloud2cloud/sync",
+            auth,
+            &json!({
+                "accessKey": THIRDCLOUD_ACCESS_KEY,
+                "group_id": group_id,
+            }),
+        )?;
+        Ok(envelope)
+    }
+
+    pub fn get_thirdcloud_device_list(&self, auth: &MijiaAuth, group_ids: &[i64]) -> Result<Value> {
+        validate_mijia_auth(auth)?;
+        if group_ids.is_empty() {
+            bail!("三方平台 group_ids 为空");
+        }
+        let group_ids = group_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let envelope = self.post_encrypted(
+            "/v2/thirdcloud2cloud/device_list",
+            auth,
+            &json!({
+                "accessKey": THIRDCLOUD_ACCESS_KEY,
+                "group_ids": group_ids,
+                "limit": THIRDCLOUD_DEVICE_LIST_LIMIT,
+            }),
+        )?;
+        ensure_mijia_success(&envelope)?;
+        Ok(envelope)
+    }
+
     fn post_encrypted(&self, uri: &str, auth: &MijiaAuth, payload: &Value) -> Result<Value> {
         let (body, nonce) = encrypted_form_body(uri, "POST", auth, payload)?;
         let response = self
@@ -586,6 +643,37 @@ fn ensure_mijia_success(envelope: &Value) -> Result<()> {
             .or_else(|| text_value(envelope.get("desc")))
             .unwrap_or_default()
     )
+}
+
+fn parse_thirdcloud_groups(envelope: &Value) -> Vec<ThirdCloudGroup> {
+    let Some(data) = envelope.get("data") else {
+        return Vec::new();
+    };
+    let mut groups = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for list_key in ["hotList", "groupList"] {
+        let Some(list) = data.get(list_key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in list {
+            let group_id = value_i64(item.get("groupId"));
+            if group_id <= 0 || !seen.insert(group_id) {
+                continue;
+            }
+            let name = text_value(item.get("name"))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("Group {group_id}"));
+            let short_name = text_value(item.get("shortName")).unwrap_or_default();
+            let bind_status = value_i64(item.get("bindStatus"));
+            groups.push(ThirdCloudGroup {
+                group_id,
+                name,
+                short_name,
+                bind_status,
+            });
+        }
+    }
+    groups
 }
 
 fn is_mijia_token_expired_response(envelope: &Value) -> bool {

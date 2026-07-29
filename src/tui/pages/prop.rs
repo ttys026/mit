@@ -873,7 +873,8 @@ pub(crate) fn draw_prop_dialog(
             // Upgrade dialogs are drawn by the main frame, not layered over a prop dialog.
             AccountActionDialog::UpdateAvailable { .. }
             | AccountActionDialog::UpdateRunning { .. }
-            | AccountActionDialog::UpdateFinished { .. } => {}
+            | AccountActionDialog::UpdateFinished { .. }
+            | AccountActionDialog::ThirdCloudSync { .. } => {}
         }
     }
 }
