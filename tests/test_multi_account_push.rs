@@ -12,25 +12,31 @@ fn push_to_all_accounts_matches_previous_js_behavior() {
         "activeUid": "1001",
         "accounts": [
             {
-                "region": "cn",
-                "redirectUri": "https://127.0.0.1:8000/login_redirect",
-                "uuid": "uuid-a",
-                "deviceId": "mico.a",
-                "state": "state-a",
-                "accessToken": "token-a",
-                "refreshToken": "refresh-a",
-                "expiresTs": 111,
+                "xiaomi": {
+                    "region": "cn",
+                    "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                    "uuid": "uuid-a",
+                    "deviceId": "mico.a",
+                    "state": "state-a",
+                    "accessToken": "token-a",
+                    "refreshToken": "refresh-a",
+                    "expiresTs": 111
+                },
+                "mijia": null,
                 "user": { "uid": "1001", "nickname": "账号A" }
             },
             {
-                "region": "cn",
-                "redirectUri": "https://127.0.0.1:8000/login_redirect",
-                "uuid": "uuid-b",
-                "deviceId": "mico.b",
-                "state": "state-b",
-                "accessToken": "token-b",
-                "refreshToken": "refresh-b",
-                "expiresTs": 222,
+                "xiaomi": {
+                    "region": "cn",
+                    "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                    "uuid": "uuid-b",
+                    "deviceId": "mico.b",
+                    "state": "state-b",
+                    "accessToken": "token-b",
+                    "refreshToken": "refresh-b",
+                    "expiresTs": 222
+                },
+                "mijia": null,
                 "user": { "uid": "1002", "nickname": "账号B" }
             }
         ]
@@ -91,21 +97,27 @@ fn push_to_all_accounts_keeps_partial_failures_in_summary() {
         "activeUid": "1001",
         "accounts": [
             {
-                "region": "cn",
-                "redirectUri": "https://127.0.0.1:8000/login_redirect",
-                "uuid": "uuid-a",
-                "accessToken": "token-a",
-                "refreshToken": "refresh-a",
-                "expiresTs": 111,
+                "xiaomi": {
+                    "region": "cn",
+                    "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                    "uuid": "uuid-a",
+                    "accessToken": "token-a",
+                    "refreshToken": "refresh-a",
+                    "expiresTs": 111
+                },
+                "mijia": null,
                 "user": { "uid": "1001", "nickname": "账号A" }
             },
             {
-                "region": "cn",
-                "redirectUri": "https://127.0.0.1:8000/login_redirect",
-                "uuid": "uuid-b",
-                "accessToken": "token-b",
-                "refreshToken": "refresh-b",
-                "expiresTs": 222,
+                "xiaomi": {
+                    "region": "cn",
+                    "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                    "uuid": "uuid-b",
+                    "accessToken": "token-b",
+                    "refreshToken": "refresh-b",
+                    "expiresTs": 222
+                },
+                "mijia": null,
                 "user": { "uid": "1002", "nickname": "账号B" }
             }
         ]
@@ -154,25 +166,31 @@ fn push_to_all_accounts_skips_accounts_without_login_tokens() {
         "activeUid": "1001",
         "accounts": [
             {
-                "region": "cn",
-                "redirectUri": "https://127.0.0.1:8000/login_redirect",
-                "uuid": "uuid-a",
-                "deviceId": "mico.a",
-                "state": "state-a",
-                "accessToken": "token-a",
-                "refreshToken": "refresh-a",
-                "expiresTs": 111,
+                "xiaomi": {
+                    "region": "cn",
+                    "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                    "uuid": "uuid-a",
+                    "deviceId": "mico.a",
+                    "state": "state-a",
+                    "accessToken": "token-a",
+                    "refreshToken": "refresh-a",
+                    "expiresTs": 111
+                },
+                "mijia": null,
                 "user": { "uid": "1001", "nickname": "账号A" }
             },
             {
-                "region": "cn",
-                "redirectUri": "https://127.0.0.1:8000/login_redirect",
-                "uuid": "uuid-b",
-                "deviceId": "mico.b",
-                "state": "state-b",
-                "accessToken": "",
-                "refreshToken": "",
-                "expiresTs": 222,
+                "xiaomi": {
+                    "region": "cn",
+                    "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                    "uuid": "uuid-b",
+                    "deviceId": "mico.b",
+                    "state": "state-b",
+                    "accessToken": "",
+                    "refreshToken": "",
+                    "expiresTs": 222
+                },
+                "mijia": null,
                 "user": { "uid": "1002", "nickname": "账号B" }
             }
         ]

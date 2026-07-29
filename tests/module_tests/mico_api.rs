@@ -109,18 +109,18 @@ fn local_credential_cache_is_shared_between_client_instances() {
     let client = MicoClient::new(&account).unwrap();
     client.get_local_device_credentials().unwrap();
     {
+        // After a cloud sync the resolved credential is cached as ready (no probe);
+        // the same-intranet check at control time decides LAN vs cloud.
         let cache = shared_local_credential_cache(device_id);
         let cache = cache.lock().unwrap();
-        assert!(cache.disabled_dids.contains("dev-1"));
-        assert!(!cache.ready_dids.contains("dev-1"));
+        assert!(cache.ready_dids.contains("dev-1"));
+        assert!(!cache.disabled_dids.contains("dev-1"));
     }
 
-    let second_client = MicoClient::new(&account).unwrap();
-    assert!(!has_cached_local_credential_for_device(device_id, "dev-1"));
-    assert!(second_client
-        .local_miio_client_for_did("dev-1")
-        .unwrap()
-        .is_none());
+    // A second client for the same account shares the very same process-global
+    // cache, so constructing it does not clear the resolved credential.
+    let _second_client = MicoClient::new(&account).unwrap();
+    assert!(has_cached_local_credential_for_device(device_id, "dev-1"));
 
     std::env::remove_var("MIT_MICO_BASE_URL");
     std::env::remove_var("MIT_USER_PROFILE_URL");
@@ -360,7 +360,7 @@ fn get_local_device_credentials_returns_error_when_snapshot_write_fails() {
 
 #[test]
 #[cfg(unix)]
-fn get_local_device_credentials_does_not_abort_probing_when_snapshot_write_fails() {
+fn get_local_device_credentials_keeps_resolved_creds_when_snapshot_write_fails() {
     let _guard = env_guard();
     let server = MockMicoServer::start();
     let home = make_temp_home("local-credential-write-error-side-effects");
@@ -399,11 +399,11 @@ fn get_local_device_credentials_does_not_abort_probing_when_snapshot_write_fails
     let cache = shared_local_credential_cache(device_id);
     let cache = cache.lock().unwrap();
     assert!(
-        cache.disabled_dids.contains("dev-1"),
-        "probe failure should still disable dev-1 even if snapshot persistence fails"
+        cache.ready_dids.contains("dev-1"),
+        "the in-memory cache should still hold the resolved credential even if snapshot persistence fails"
     );
-    assert!(!cache.ready_dids.contains("dev-1"));
-    assert!(!cache.by_did.contains_key("dev-1"));
+    assert!(cache.by_did.contains_key("dev-1"));
+    assert!(!cache.disabled_dids.contains("dev-1"));
 
     std::env::remove_var("MIT_HOME");
     std::env::remove_var("MIT_PROFILE_DIR");
@@ -641,121 +641,6 @@ fn action_strips_sub_device_suffix_before_requesting() {
 }
 
 #[test]
-fn local_failure_disables_device_for_rest_of_session() {
-    let _guard = env_guard();
-    let server = MockMicoServer::start();
-    let device_id = "mico.disable-local-test";
-    let account = normalize_account(json!({
-        "region": "cn",
-        "redirectUri": "http://127.0.0.1:8000/login_redirect",
-        "uuid": "disable-local-test",
-        "deviceId": device_id,
-        "state": "state-a",
-        "accessToken": "token-a",
-        "refreshToken": "refresh-a",
-        "expiresTs": 12345,
-        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-    }));
-
-    std::env::set_var("MIT_MICO_BASE_URL", server.base_url());
-    std::env::set_var("MIT_USER_PROFILE_URL", server.user_profile_url());
-
-    let client = MicoClient::new(&account).unwrap();
-    {
-        let cache = shared_local_credential_cache(device_id);
-        let mut cache = cache.lock().unwrap();
-        cache.fetched_at = unix_timestamp();
-        cache.by_did.insert(
-            "dev-1".to_string(),
-            LocalDeviceCredential {
-                did: "dev-1".to_string(),
-                name: "living-room".to_string(),
-                model: "xiaomi.wifispeaker.lx04".to_string(),
-                local_ip: "127.0.0.1".to_string(),
-                token: "00112233445566778899aabbccddeeff".to_string(),
-                source: LocalCredentialSource::Direct,
-            },
-        );
-        cache.ready_dids.insert("dev-1".to_string());
-    }
-    assert!(has_cached_local_credential_for_device(device_id, "dev-1"));
-
-    client.invalidate_cached_local_credential("dev-1").unwrap();
-    client.get_local_device_credentials().unwrap();
-
-    assert!(
-        !has_cached_local_credential_for_device(device_id, "dev-1"),
-        "background refresh should not re-enable local after a local failure"
-    );
-
-    std::env::remove_var("MIT_MICO_BASE_URL");
-    std::env::remove_var("MIT_USER_PROFILE_URL");
-}
-
-#[test]
-fn cached_credentials_do_not_mark_device_local_ready_before_probe_success() {
-    let _guard = env_guard();
-    let server = MockMicoServer::start();
-    let device_id = "mico.readiness-status-test";
-    let account = normalize_account(json!({
-        "region": "cn",
-        "redirectUri": "http://127.0.0.1:8000/login_redirect",
-        "uuid": "readiness-status-test",
-        "deviceId": device_id,
-        "state": "state-a",
-        "accessToken": "token-a",
-        "refreshToken": "refresh-a",
-        "expiresTs": 12345,
-        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-    }));
-
-    std::env::set_var("MIT_MICO_BASE_URL", server.base_url());
-    std::env::set_var("MIT_USER_PROFILE_URL", server.user_profile_url());
-
-    let client = MicoClient::new(&account).unwrap();
-    client.get_local_device_credentials().unwrap();
-
-    assert!(
-        !has_cached_local_credential_for_device(device_id, "dev-1"),
-        "cloud-fetched credentials must not be treated as verified local readiness"
-    );
-
-    std::env::remove_var("MIT_MICO_BASE_URL");
-    std::env::remove_var("MIT_USER_PROFILE_URL");
-}
-
-#[test]
-fn local_client_is_unavailable_until_device_readiness_is_verified() {
-    let _guard = env_guard();
-    let server = MockMicoServer::start();
-    let account = normalize_account(json!({
-        "region": "cn",
-        "redirectUri": "http://127.0.0.1:8000/login_redirect",
-        "uuid": "readiness-client-test",
-        "deviceId": "mico.readiness-client-test",
-        "state": "state-a",
-        "accessToken": "token-a",
-        "refreshToken": "refresh-a",
-        "expiresTs": 12345,
-        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
-    }));
-
-    std::env::set_var("MIT_MICO_BASE_URL", server.base_url());
-    std::env::set_var("MIT_USER_PROFILE_URL", server.user_profile_url());
-
-    let client = MicoClient::new(&account).unwrap();
-    client.get_local_device_credentials().unwrap();
-
-    assert!(
-        client.local_miio_client_for_did("dev-1").unwrap().is_none(),
-        "foreground reads/writes should stay on cloud until local readiness is verified"
-    );
-
-    std::env::remove_var("MIT_MICO_BASE_URL");
-    std::env::remove_var("MIT_USER_PROFILE_URL");
-}
-
-#[test]
 fn verified_local_device_stays_local_after_credential_cache_ttl_expires() {
     let device_id = "mico.session-ready-test";
     let account = normalize_account(json!({
@@ -790,12 +675,9 @@ fn verified_local_device_stays_local_after_credential_cache_ttl_expires() {
 
     assert!(
         has_cached_local_credential_for_device(device_id, "dev-1"),
-        "TUI status should stay local for a device that was already verified in this session"
+        "TUI status should stay local for a device that was already cached in this session"
     );
-    assert!(
-        client.local_miio_client_for_did("dev-1").unwrap().is_some(),
-        "foreground control should keep using the session-verified local path"
-    );
+    let _ = client;
 }
 
 #[test]
@@ -807,11 +689,7 @@ fn miot_flow_logging_stays_off_stderr() {
     env::set_var("MIT_PROFILE_DIR", &home);
 
     let stderr = capture_stderr(|| {
-        log_miot_flow(
-            "get_properties",
-            "local-udp",
-            "did=dev-1 stage=first attempt=1",
-        );
+        log_route("get", "dev-1", "auto", "LAN", "eligible", "ok", None);
     });
 
     let profile_home = crate::storage::get_home_dir();
@@ -819,8 +697,8 @@ fn miot_flow_logging_stays_off_stderr() {
     let log = fs::read_to_string(&log_path).unwrap();
 
     assert!(stderr.trim().is_empty(), "unexpected stderr: {stderr}");
-    assert!(log.contains("transport=local-udp"));
-    assert!(log.contains("did=dev-1 stage=first attempt=1"));
+    assert!(log.contains("op=get transport=LAN"));
+    assert!(log.contains("did=dev-1 mode=auto reason=eligible result=ok"));
 
     env::remove_var("MIT_HOME");
     env::remove_var("MIT_PROFILE_DIR");
@@ -873,4 +751,153 @@ fn make_temp_home(prefix: &str) -> std::path::PathBuf {
         .join(format!("{prefix}-{unique}"));
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[test]
+fn device_link_channel_defaults_to_cloud_for_unknown_device() {
+    // A DID that was never discovered on the LAN nor primed into any credential
+    // cache resolves to the cloud channel.
+    assert_eq!(device_link_channel("99900011122233377"), MiotChannel::Cloud);
+}
+
+#[test]
+fn local_credential_cache_keys_include_parent_for_sub_device() {
+    assert_eq!(
+        local_credential_cache_keys("2045038922.s2"),
+        vec!["2045038922.s2".to_string(), "2045038922".to_string()]
+    );
+    assert_eq!(
+        local_credential_cache_keys("2045038922"),
+        vec!["2045038922".to_string()]
+    );
+}
+
+#[test]
+fn transient_lan_errors_are_retryable() {
+    assert!(is_transient_lan_error(&anyhow::anyhow!(
+        "Resource temporarily unavailable (os error 35)"
+    )));
+    assert!(is_transient_lan_error(&anyhow::anyhow!("operation timed out")));
+    assert!(is_transient_lan_error(&anyhow::anyhow!(
+        "miio AES decrypt failed: UnpadError"
+    )));
+    // A genuine protocol/parse error is not retried.
+    assert!(!is_transient_lan_error(&anyhow::anyhow!(
+        "miio command: bad reply"
+    )));
+}
+
+#[test]
+fn public_and_loopback_ips_are_not_on_local_subnet() {
+    use crate::miot_lan::is_on_local_subnet;
+    // Public addresses are never on one of our local subnets, so they are not
+    // LAN-eligible regardless of the host's interfaces.
+    assert!(!is_on_local_subnet("8.8.8.8".parse().unwrap()));
+    assert!(!is_on_local_subnet("223.104.121.41".parse().unwrap()));
+    // Loopback interfaces are excluded from subnet membership.
+    assert!(!is_on_local_subnet("127.0.0.1".parse().unwrap()));
+}
+
+#[test]
+fn forced_lan_fails_fast_when_device_is_off_subnet() {
+    let _guard = env_guard();
+    let device_id = "mico.force-lan-off-subnet";
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "force-lan-off-subnet",
+        "deviceId": device_id,
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 12345,
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }));
+    // Keep LAN discovery enabled so eligibility reaches the same-intranet check
+    // (env_guard disables it by default for the cloud-path tests).
+    std::env::set_var("MIT_DISABLE_LAN_DISCOVERY", "0");
+    let client = MicoClient::new(&account).unwrap();
+    // A primed credential whose IP is a public address (off-subnet).
+    {
+        let cache = shared_local_credential_cache(device_id);
+        let mut cache = cache.lock().unwrap();
+        cache.fetched_at = unix_timestamp();
+        cache.by_did.insert(
+            "dev-1".to_string(),
+            LocalDeviceCredential {
+                did: "dev-1".to_string(),
+                name: "remote".to_string(),
+                model: "xiaomi.wifispeaker.lx04".to_string(),
+                local_ip: "223.104.121.41".to_string(),
+                token: "00112233445566778899aabbccddeeff".to_string(),
+                source: LocalCredentialSource::Direct,
+            },
+        );
+        cache.ready_dids.insert("dev-1".to_string());
+    }
+
+    crate::mico_api::set_force_lan(true);
+    let result = client.get_prop("dev-1", 2, 1);
+    crate::mico_api::set_force_lan(false);
+    // Restore the test-wide default so other (non-env_guard) tests never observe
+    // LAN discovery enabled.
+    std::env::set_var("MIT_DISABLE_LAN_DISCOVERY", "1");
+
+    let error = result.expect_err("--LAN must fail fast for an off-subnet device");
+    let message = error.to_string();
+    assert!(
+        message.contains("--LAN") && message.contains("off-subnet"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn load_snapshot_credential_round_trips_persisted_snapshot() {
+    let _guard = env_guard();
+    let home = make_temp_home("local-credential-snapshot-reuse");
+    env::set_var("MIT_HOME", &home);
+
+    let account = normalize_account(json!({
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "snapshot-reuse",
+        "deviceId": "mico.snapshot-reuse",
+        "accessToken": "token-a",
+        "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }));
+    let client = MicoClient::new(&account).unwrap();
+
+    let mut creds = HashMap::new();
+    creds.insert(
+        "2000354985".to_string(),
+        LocalDeviceCredential {
+            did: "2000354985".to_string(),
+            name: "灯".to_string(),
+            model: "x.y.z".to_string(),
+            local_ip: "192.168.1.50".to_string(),
+            token: "00112233445566778899aabbccddeeff".to_string(),
+            source: LocalCredentialSource::Direct,
+        },
+    );
+    client.write_local_credentials_snapshot(&creds).unwrap();
+
+    // The CLI reuses the persisted snapshot the TUI wrote — without a cloud call.
+    let loaded = client
+        .load_snapshot_credential("2000354985")
+        .unwrap()
+        .expect("snapshot credential should be present");
+    assert_eq!(loaded.local_ip, "192.168.1.50");
+    assert_eq!(loaded.token, "00112233445566778899aabbccddeeff");
+
+    assert!(client
+        .load_snapshot_credential("404040404")
+        .unwrap()
+        .is_none());
+
+    // The TUI hydration path reads every device from the same snapshot.
+    let mut all = client.load_all_snapshot_credentials().unwrap();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].0, "2000354985");
+    assert_eq!(all[0].1.local_ip, "192.168.1.50");
 }

@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_REGION: &str = "cn";
 pub const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8000/login_redirect";
 
+/// Current on-disk schema version for `auth.json` accounts. Version 1 stored the
+/// Xiaomi credentials as flat fields on each account; version 2 nests them under
+/// an `xiaomi` object and adds an optional `mijia` object. Accounts read at an
+/// older version are migrated to this version (see [`normalize_account_ref`]).
+pub const CURRENT_AUTH_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Language {
@@ -75,16 +81,72 @@ pub struct UserProfile {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthAccount {
-    pub version: u32,
-    pub region: String,
-    pub redirect_uri: String,
-    pub uuid: String,
-    pub device_id: String,
-    pub state: String,
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_ts: i64,
+    pub xiaomi: Option<XiaomiAuth>,
+    pub mijia: Option<MijiaAuth>,
     pub user: UserProfile,
+    pub version: u32,
+    #[serde(skip)]
+    pub region: String,
+    #[serde(skip)]
+    pub redirect_uri: String,
+    #[serde(skip)]
+    pub uuid: String,
+    #[serde(skip)]
+    pub device_id: String,
+    #[serde(skip)]
+    pub state: String,
+    #[serde(skip)]
+    pub access_token: String,
+    #[serde(skip)]
+    pub refresh_token: String,
+    #[serde(skip)]
+    pub expires_ts: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XiaomiAuth {
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub redirect_uri: String,
+    #[serde(default)]
+    pub uuid: String,
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub expires_ts: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MijiaAuth {
+    #[serde(default, rename = "ua")]
+    pub ua: String,
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub pass_o: String,
+    #[serde(default)]
+    pub ssecurity: String,
+    #[serde(default)]
+    pub pass_token: String,
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub c_user_id: String,
+    #[serde(default)]
+    pub service_token: String,
+    #[serde(default)]
+    pub expire_time: i64,
+    #[serde(default)]
+    pub save_time: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,7 +224,7 @@ pub fn default_auth() -> AuthState {
 }
 
 pub fn normalize_account(value: Value) -> AuthAccount {
-    normalize_account_ref(&value)
+    normalize_account_ref(&value, true)
 }
 
 pub fn normalize_auth(value: Value) -> Result<AuthState> {
@@ -174,12 +236,7 @@ pub fn normalize_auth_state(auth: &AuthState) -> Result<AuthState> {
 }
 
 pub fn has_persisted_auth_data(account: &AuthAccount) -> bool {
-    !(account.device_id.is_empty()
-        && account.state.is_empty()
-        && account.access_token.is_empty()
-        && account.refresh_token.is_empty()
-        && account.user.uid.is_empty()
-        && account.expires_ts == 0)
+    has_xiaomi_auth_data(account.xiaomi.as_ref()) || has_mijia_auth_data(account.mijia.as_ref())
 }
 
 pub fn get_auth_accounts(auth: &AuthState) -> Result<Vec<AuthAccount>> {
@@ -201,13 +258,28 @@ pub fn upsert_auth_account(auth: &AuthState, account: &AuthAccount) -> Result<Au
     let normalized = normalize_auth_state(auth)?;
     let next_account = normalize_account(serde_json::to_value(account)?);
     let mut next_accounts = normalized.accounts.clone();
-    if let Some(index) = next_accounts
-        .iter()
-        .position(|item| same_account_identity(item, &next_account))
-    {
-        next_accounts[index] = merge_accounts(&next_accounts[index], &next_account);
+    let merge_indexes = account_merge_indexes(&next_accounts, &next_account);
+    if let Some(first_index) = merge_indexes.first().copied() {
+        let mut merged = next_account;
+        for index in &merge_indexes {
+            merged = merge_accounts(&next_accounts[*index], &merged);
+        }
+        let merge_index_set = merge_indexes.to_vec();
+        next_accounts = next_accounts
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                if index == first_index {
+                    Some(merged.clone())
+                } else if merge_index_set.contains(&index) {
+                    None
+                } else {
+                    Some(account)
+                }
+            })
+            .collect();
     } else {
-        next_accounts.push(next_account.clone());
+        next_accounts.push(next_account);
     }
     build_auth_state(next_accounts, normalized.pending_auth)
 }
@@ -437,13 +509,13 @@ fn normalize_auth_ref(value: &Value) -> Result<AuthState> {
     let pending_auth = object
         .get("pendingAuth")
         .filter(|pending| pending.is_object())
-        .map(normalize_account_ref)
+        .map(|pending| normalize_account_ref(pending, false))
         .filter(has_persisted_auth_data);
 
     build_auth_state(normalized_accounts, pending_auth)
 }
 
-fn normalize_account_ref(value: &Value) -> AuthAccount {
+fn normalize_account_ref(value: &Value, allow_flat_xiaomi: bool) -> AuthAccount {
     let object = value.as_object().cloned().unwrap_or_default();
     let user = object
         .get("user")
@@ -451,12 +523,69 @@ fn normalize_account_ref(value: &Value) -> AuthAccount {
         .cloned()
         .unwrap_or_default();
 
-    let region = trimmed_value(object.get("region"));
-    let redirect_uri = trimmed_value(object.get("redirectUri"));
-    let uuid = trimmed_value(object.get("uuid"));
+    // Legacy (version < 2) accounts stored the Xiaomi credentials as flat fields
+    // on the account itself. Migrate them by wrapping those fields into `xiaomi`;
+    // such accounts never had Mijia credentials, so `mijia` becomes null.
+    let stored_version = object.get("version").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let allow_flat_xiaomi = allow_flat_xiaomi || stored_version < CURRENT_AUTH_VERSION;
+
+    let xiaomi = object
+        .get("xiaomi")
+        .and_then(normalize_xiaomi_auth_ref)
+        .or_else(|| {
+            allow_flat_xiaomi
+                .then(|| normalize_xiaomi_auth_ref(value))
+                .flatten()
+        });
+    let mijia = object.get("mijia").and_then(normalize_mijia_auth_ref);
+    let mijia_uid = mijia.as_ref().map(mijia_identity).unwrap_or_default();
+    let user_uid = trimmed_value(user.get("uid")).or_if_empty(&mijia_uid);
+    let xiaomi_values = xiaomi.clone().unwrap_or_default();
 
     AuthAccount {
-        version: 1,
+        version: CURRENT_AUTH_VERSION,
+        xiaomi,
+        mijia,
+        user: UserProfile {
+            uid: user_uid,
+            nickname: trimmed_value(user.get("nickname")),
+            icon: trimmed_value(user.get("icon")),
+            union_id: trimmed_value(user.get("unionId")),
+        },
+        region: xiaomi_values.region,
+        redirect_uri: xiaomi_values.redirect_uri,
+        uuid: xiaomi_values.uuid,
+        device_id: xiaomi_values.device_id,
+        state: xiaomi_values.state,
+        access_token: xiaomi_values.access_token,
+        refresh_token: xiaomi_values.refresh_token,
+        expires_ts: xiaomi_values.expires_ts,
+    }
+}
+
+fn normalize_xiaomi_auth_ref(value: &Value) -> Option<XiaomiAuth> {
+    if !value.is_object() {
+        return None;
+    }
+    let object = value.as_object().cloned().unwrap_or_default();
+    let raw_uuid = trimmed_value(object.get("uuid"));
+    let raw_device_id = trimmed_value(object.get("deviceId"));
+    let raw_state = trimmed_value(object.get("state"));
+    let raw_access_token = trimmed_value(object.get("accessToken"));
+    let raw_refresh_token = trimmed_value(object.get("refreshToken"));
+    let raw_expires_ts = number_value(object.get("expiresTs"));
+    if raw_uuid.is_empty()
+        && raw_device_id.is_empty()
+        && raw_state.is_empty()
+        && raw_access_token.is_empty()
+        && raw_refresh_token.is_empty()
+        && raw_expires_ts == 0
+    {
+        return None;
+    }
+    let region = trimmed_value(object.get("region"));
+    let redirect_uri = trimmed_value(object.get("redirectUri"));
+    let auth = XiaomiAuth {
         region: if region.is_empty() {
             DEFAULT_REGION.to_string()
         } else {
@@ -467,43 +596,130 @@ fn normalize_account_ref(value: &Value) -> AuthAccount {
         } else {
             redirect_uri
         },
-        uuid: if uuid.is_empty() {
+        uuid: if raw_uuid.is_empty() {
             generate_uuid()
         } else {
-            uuid
+            raw_uuid
         },
+        device_id: raw_device_id,
+        state: raw_state,
+        access_token: raw_access_token,
+        refresh_token: raw_refresh_token,
+        expires_ts: raw_expires_ts,
+    };
+    has_xiaomi_auth_data(Some(&auth)).then_some(auth)
+}
+
+fn normalize_mijia_auth_ref(value: &Value) -> Option<MijiaAuth> {
+    let object = value.as_object().cloned().unwrap_or_default();
+    let auth = MijiaAuth {
+        ua: trimmed_value(object.get("ua")),
         device_id: trimmed_value(object.get("deviceId")),
-        state: trimmed_value(object.get("state")),
-        access_token: trimmed_value(object.get("accessToken")),
-        refresh_token: trimmed_value(object.get("refreshToken")),
-        expires_ts: number_value(object.get("expiresTs")),
-        user: UserProfile {
-            uid: trimmed_value(user.get("uid")),
-            nickname: trimmed_value(user.get("nickname")),
-            icon: trimmed_value(user.get("icon")),
-            union_id: trimmed_value(user.get("unionId")),
-        },
-    }
+        pass_o: trimmed_value(object.get("passO")),
+        ssecurity: trimmed_value(object.get("ssecurity")),
+        pass_token: trimmed_value(object.get("passToken")),
+        user_id: trimmed_value(object.get("userId")),
+        c_user_id: trimmed_value(object.get("cUserId")),
+        service_token: trimmed_value(object.get("serviceToken")),
+        expire_time: number_value(object.get("expireTime")),
+        save_time: number_value(object.get("saveTime")),
+    };
+    has_mijia_auth_data(Some(&auth)).then_some(auth)
+}
+
+pub fn has_mijia_auth_data(auth: Option<&MijiaAuth>) -> bool {
+    auth.is_some_and(|auth| {
+        !auth.service_token.is_empty()
+            || !auth.ssecurity.is_empty()
+            || !auth.user_id.is_empty()
+            || !auth.c_user_id.is_empty()
+    })
+}
+
+pub fn has_xiaomi_auth_data(auth: Option<&XiaomiAuth>) -> bool {
+    auth.is_some_and(|auth| {
+        !auth.device_id.is_empty()
+            || !auth.state.is_empty()
+            || !auth.access_token.is_empty()
+            || !auth.refresh_token.is_empty()
+            || !auth.uuid.is_empty()
+    })
+}
+
+pub fn sync_xiaomi_auth(account: &mut AuthAccount) {
+    let auth = XiaomiAuth {
+        region: account.region.clone(),
+        redirect_uri: account.redirect_uri.clone(),
+        uuid: account.uuid.clone(),
+        device_id: account.device_id.clone(),
+        state: account.state.clone(),
+        access_token: account.access_token.clone(),
+        refresh_token: account.refresh_token.clone(),
+        expires_ts: account.expires_ts,
+    };
+    account.xiaomi = has_xiaomi_auth_data(Some(&auth)).then_some(auth);
+}
+
+pub fn mijia_identity(auth: &MijiaAuth) -> String {
+    auth.user_id.clone().or_if_empty(&auth.c_user_id)
 }
 
 fn push_account(accounts: &mut Vec<AuthAccount>, candidate: &Value) {
-    let account = normalize_account_ref(candidate);
+    let account = normalize_account_ref(candidate, false);
     if !has_persisted_auth_data(&account) {
         return;
     }
-    if let Some(index) = accounts
-        .iter()
-        .position(|item| same_account_identity(item, &account))
-    {
-        accounts[index] = merge_accounts(&accounts[index], &account);
+    let merge_indexes = account_merge_indexes(accounts, &account);
+    if let Some(first_index) = merge_indexes.first().copied() {
+        let mut merged = account;
+        for index in &merge_indexes {
+            merged = merge_accounts(&accounts[*index], &merged);
+        }
+        let merge_index_set = merge_indexes.to_vec();
+        let next_accounts = accounts
+            .drain(..)
+            .enumerate()
+            .filter_map(|(index, account)| {
+                if index == first_index {
+                    Some(merged.clone())
+                } else if merge_index_set.contains(&index) {
+                    None
+                } else {
+                    Some(account)
+                }
+            })
+            .collect();
+        *accounts = next_accounts;
     } else {
         accounts.push(account);
     }
 }
 
+fn account_merge_indexes(accounts: &[AuthAccount], account: &AuthAccount) -> Vec<usize> {
+    accounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| same_account_identity(item, account).then_some(index))
+        .collect::<Vec<_>>()
+}
+
 fn same_account_identity(left: &AuthAccount, right: &AuthAccount) -> bool {
-    if !left.user.uid.is_empty() && !right.user.uid.is_empty() {
-        return left.user.uid == right.user.uid;
+    if !left.user.uid.is_empty() && !right.user.uid.is_empty() && left.user.uid == right.user.uid {
+        return true;
+    }
+    if let (Some(left_mijia), Some(right_mijia)) = (&left.mijia, &right.mijia) {
+        if !left_mijia.user_id.is_empty()
+            && !right_mijia.user_id.is_empty()
+            && left_mijia.user_id == right_mijia.user_id
+        {
+            return true;
+        }
+        if !left_mijia.c_user_id.is_empty()
+            && !right_mijia.c_user_id.is_empty()
+            && left_mijia.c_user_id == right_mijia.c_user_id
+        {
+            return true;
+        }
     }
     if !left.device_id.is_empty()
         && !right.device_id.is_empty()
@@ -519,30 +735,95 @@ fn same_account_identity(left: &AuthAccount, right: &AuthAccount) -> bool {
 }
 
 fn merge_accounts(current: &AuthAccount, next: &AuthAccount) -> AuthAccount {
+    let xiaomi = merge_xiaomi_auth(current.xiaomi.as_ref(), next.xiaomi.as_ref());
+    let xiaomi_values = xiaomi.clone().unwrap_or_default();
     AuthAccount {
         version: next.version,
-        region: next.region.clone(),
-        redirect_uri: next.redirect_uri.clone(),
-        uuid: next.uuid.clone(),
-        device_id: next.device_id.clone(),
-        state: next.state.clone(),
-        access_token: next.access_token.clone(),
-        refresh_token: next.refresh_token.clone(),
-        expires_ts: next.expires_ts,
-        user: UserProfile {
-            uid: next.user.uid.clone().or_if_empty(&current.user.uid),
-            nickname: next
-                .user
-                .nickname
+        xiaomi,
+        mijia: merge_mijia_auth(current.mijia.as_ref(), next.mijia.as_ref()),
+        user: merge_user_profile(current, next),
+        region: xiaomi_values.region,
+        redirect_uri: xiaomi_values.redirect_uri,
+        uuid: xiaomi_values.uuid,
+        device_id: xiaomi_values.device_id,
+        state: xiaomi_values.state,
+        access_token: xiaomi_values.access_token,
+        refresh_token: xiaomi_values.refresh_token,
+        expires_ts: xiaomi_values.expires_ts,
+    }
+}
+
+fn merge_user_profile(current: &AuthAccount, next: &AuthAccount) -> UserProfile {
+    let prefer_next = next.xiaomi.is_some() || current.xiaomi.is_none();
+    let (primary, fallback) = if prefer_next {
+        (&next.user, &current.user)
+    } else {
+        (&current.user, &next.user)
+    };
+    UserProfile {
+        uid: primary.uid.clone().or_if_empty(&fallback.uid),
+        nickname: primary.nickname.clone().or_if_empty(&fallback.nickname),
+        icon: primary.icon.clone().or_if_empty(&fallback.icon),
+        union_id: primary.union_id.clone().or_if_empty(&fallback.union_id),
+    }
+}
+
+fn merge_xiaomi_auth(
+    current: Option<&XiaomiAuth>,
+    next: Option<&XiaomiAuth>,
+) -> Option<XiaomiAuth> {
+    match (current, next) {
+        (None, None) => None,
+        (Some(current), None) => Some(current.clone()),
+        (None, Some(next)) => Some(next.clone()),
+        (Some(current), Some(next)) => Some(XiaomiAuth {
+            region: next.region.clone().or_if_empty(&current.region),
+            redirect_uri: next.redirect_uri.clone().or_if_empty(&current.redirect_uri),
+            uuid: next.uuid.clone().or_if_empty(&current.uuid),
+            device_id: next.device_id.clone().or_if_empty(&current.device_id),
+            state: next.state.clone().or_if_empty(&current.state),
+            access_token: next.access_token.clone().or_if_empty(&current.access_token),
+            refresh_token: next
+                .refresh_token
                 .clone()
-                .or_if_empty(&current.user.nickname),
-            icon: next.user.icon.clone().or_if_empty(&current.user.icon),
-            union_id: next
-                .user
-                .union_id
+                .or_if_empty(&current.refresh_token),
+            expires_ts: if next.expires_ts == 0 {
+                current.expires_ts
+            } else {
+                next.expires_ts
+            },
+        }),
+    }
+}
+
+fn merge_mijia_auth(current: Option<&MijiaAuth>, next: Option<&MijiaAuth>) -> Option<MijiaAuth> {
+    match (current, next) {
+        (None, None) => None,
+        (Some(current), None) => Some(current.clone()),
+        (None, Some(next)) => Some(next.clone()),
+        (Some(current), Some(next)) => Some(MijiaAuth {
+            ua: next.ua.clone().or_if_empty(&current.ua),
+            device_id: next.device_id.clone().or_if_empty(&current.device_id),
+            pass_o: next.pass_o.clone().or_if_empty(&current.pass_o),
+            ssecurity: next.ssecurity.clone().or_if_empty(&current.ssecurity),
+            pass_token: next.pass_token.clone().or_if_empty(&current.pass_token),
+            user_id: next.user_id.clone().or_if_empty(&current.user_id),
+            c_user_id: next.c_user_id.clone().or_if_empty(&current.c_user_id),
+            service_token: next
+                .service_token
                 .clone()
-                .or_if_empty(&current.user.union_id),
-        },
+                .or_if_empty(&current.service_token),
+            expire_time: if next.expire_time == 0 {
+                current.expire_time
+            } else {
+                next.expire_time
+            },
+            save_time: if next.save_time == 0 {
+                current.save_time
+            } else {
+                next.save_time
+            },
+        }),
     }
 }
 
