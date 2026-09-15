@@ -92,9 +92,13 @@ mit
 mit --help
 
 # ── 账号管理 ────────────────────────────────────────────────
-mit auth login                                   # 浏览器登录
-mit auth login --region cn                       # 指定区域登录
+mit auth login                                   # 先登录小米，再扫码登录米家
+mit auth login --region cn                       # 指定小米登录区域
+mit auth login xiaomi                            # 只登录小米 OAuth
+mit auth login mijia                             # 只登录米家二维码
 mit auth list                                    # 列出已保存的账号
+mit auth logout                                  # 登出（仅有一个账号时）并删除其缓存
+mit auth logout --uid 1001                       # 登出指定账号
 
 # ── TUI ────────────────────────────────────────────────────
 mit tui                                          # 启动全屏控制台
@@ -102,6 +106,11 @@ mit tui --uid 1234567                            # 以指定账号启动
 
 # ── 设备 ───────────────────────────────────────────────────
 mit devices list                                 # 列出所有账号下的设备
+
+# ── 三方平台 ───────────────────────────────────────────────
+mit third-party list                             # 列出已绑定三方平台及设备
+mit third-party sync                             # 同步已绑定三方设备状态
+mit third-party sync --uid 1001                  # 只同步指定账号
 
 # ── 推送通知 ────────────────────────────────────────────────
 mit push "Hello World"                           # 向所有账号推送
@@ -114,6 +123,15 @@ mit props act did-1 5 1 1 2                      # 触发 Action 并传入参数
 mit props sub                                    # 订阅所有设备属性变化
 mit props sub did-1                              # 订阅单个设备的所有属性变化
 mit props sub did-1 2 1                          # 订阅单个属性
+
+# ── 设备历史与统计（米家）──────────────────────────────────
+mit logs did-1 2.1                               # 查看属性 2.1 的操作记录
+mit logs did-1 2.1 3.1 --limit 100               # 多个键，每个最多 100 条
+mit stats did-1 3.1 --period week                # 查看某个键的统计（week|month|year）
+
+# ── 维护 ───────────────────────────────────────────────────
+mit cache clean                                  # 删除设备/规格缓存（保留登录）
+mit reset --yes                                  # 删除 ~/.mit 下的全部数据（需要 --yes）
 ```
 
 ### 说明
@@ -152,6 +170,8 @@ mit props sub did-1 2 1                          # 订阅单个属性
 mit --json                  # 帮助信息（JSON 格式）
 mit --json auth list        # 账号列表（JSON 格式）
 mit --json devices list     # 设备列表（JSON 格式）
+mit --json third-party list # 已绑定三方平台及设备（JSON 格式）
+mit --json third-party sync # 三方设备同步结果（JSON 格式）
 mit --json push "hello"     # 推送结果（JSON 格式）
 ```
 

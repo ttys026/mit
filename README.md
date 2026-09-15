@@ -92,9 +92,13 @@ mit
 mit --help
 
 # ── Auth ───────────────────────────────────────────────────
-mit auth login                                   # Log in (opens browser)
-mit auth login --region cn                       # Specify region
+mit auth login                                   # Log in to Xiaomi, then Mijia QR login
+mit auth login --region cn                       # Specify Xiaomi region for combined login
+mit auth login xiaomi                            # Log in to Xiaomi OAuth only
+mit auth login mijia                             # Log in to Mijia QR only
 mit auth list                                    # List saved accounts
+mit auth logout                                  # Log out (only one account) and delete its cache
+mit auth logout --uid 1001                       # Log out a specific account
 
 # ── TUI ────────────────────────────────────────────────────
 mit tui                                          # Launch full-screen dashboard
@@ -102,6 +106,11 @@ mit tui --uid 1234567                            # Start with a specific account
 
 # ── Devices ────────────────────────────────────────────────
 mit devices list                                 # List devices for all accounts
+
+# ── Third-party platforms ──────────────────────────────────
+mit third-party list                             # List connected platforms and devices
+mit third-party sync                             # Sync bound third-party device status
+mit third-party sync --uid 1001                  # Sync one account only
 
 # ── Push notifications ─────────────────────────────────────
 mit push "Hello World"                           # Push to all accounts
@@ -114,6 +123,15 @@ mit props act did-1 5 1 1 2                      # Invoke action with parameters
 mit props sub                                    # Subscribe to all device property changes
 mit props sub did-1                              # Subscribe to all changes for one device
 mit props sub did-1 2 1                          # Subscribe to one property
+
+# ── Device history & statistics (Mijia) ────────────────────
+mit logs did-1 2.1                               # Operation records for property 2.1
+mit logs did-1 2.1 3.1 --limit 100               # Multiple keys, up to 100 records each
+mit stats did-1 3.1 --period week                # Statistics for a key (week|month|year)
+
+# ── Maintenance ────────────────────────────────────────────
+mit cache clean                                  # Delete device/spec caches (keep login)
+mit reset --yes                                  # Delete all data under ~/.mit (requires --yes)
 ```
 
 ### Notes
@@ -152,6 +170,8 @@ Commands support machine-readable JSON output via the global `--json` flag:
 mit --json                  # Help as JSON
 mit --json auth list        # Account list as JSON
 mit --json devices list     # Device list as JSON
+mit --json third-party list # Connected third-party devices as JSON
+mit --json third-party sync # Third-party device sync result as JSON
 mit --json push "hello"     # Push result as JSON
 ```
 

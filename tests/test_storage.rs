@@ -28,25 +28,31 @@ fn storage_normalization_matches_previous_js_behavior() {
     let auth_with_accounts = storage::normalize_auth(json!({
     "accounts": [
         {
-            "region": "cn",
-            "redirectUri": "https://127.0.0.1:8000/login_redirect",
-            "uuid": "uuid-a",
-            "deviceId": "mico.a",
-            "state": "state-a",
-            "accessToken": "token-a",
-            "refreshToken": "refresh-a",
-            "expiresTs": 111,
+            "xiaomi": {
+                "region": "cn",
+                "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                "uuid": "uuid-a",
+                "deviceId": "mico.a",
+                "state": "state-a",
+                "accessToken": "token-a",
+                "refreshToken": "refresh-a",
+                "expiresTs": 111
+            },
+            "mijia": null,
             "user": { "uid": "1001", "nickname": "账号A" }
         },
         {
-            "region": "cn",
-            "redirectUri": "https://127.0.0.1:8000/login_redirect",
-            "uuid": "uuid-b",
-            "deviceId": "mico.b",
-            "state": "state-b",
-            "accessToken": "token-b",
-            "refreshToken": "refresh-b",
-            "expiresTs": 222,
+            "xiaomi": {
+                "region": "cn",
+                "redirectUri": "https://127.0.0.1:8000/login_redirect",
+                "uuid": "uuid-b",
+                "deviceId": "mico.b",
+                "state": "state-b",
+                "accessToken": "token-b",
+                "refreshToken": "refresh-b",
+                "expiresTs": 222
+            },
+            "mijia": null,
             "user": { "uid": "1002", "nickname": "账号B" }
         }
     ]
@@ -69,11 +75,14 @@ fn storage_normalization_matches_previous_js_behavior() {
     let pending_auth = storage::set_pending_auth(
         &auth_with_accounts,
         Some(&storage::normalize_account(json!({
-            "region": "us",
-            "redirectUri": "https://example.com/callback",
-            "uuid": "uuid-pending",
-            "deviceId": "mico.pending",
-            "state": "pending-state"
+            "xiaomi": {
+                "region": "us",
+                "redirectUri": "https://example.com/callback",
+                "uuid": "uuid-pending",
+                "deviceId": "mico.pending",
+                "state": "pending-state"
+            },
+            "mijia": null
         }))),
     )
     .unwrap();

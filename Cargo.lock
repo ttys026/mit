@@ -1170,6 +1170,7 @@ dependencies = [
  "cbc",
  "clap",
  "crossterm",
+ "flate2",
  "indexmap",
  "libc",
  "md5",
@@ -1187,6 +1188,7 @@ dependencies = [
  "sha2",
  "time",
  "tui-logger",
+ "tui-menu",
  "unicode-width 0.1.14",
  "url",
  "urlencoding",
@@ -2395,6 +2397,16 @@ dependencies = [
  "parking_lot",
  "ratatui",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "tui-menu"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6d7f10ff29b3543148afcaba50642850082840adc4e8169c7f2c9d2bcdba3b6"
+dependencies = [
+ "ratatui-core",
+ "ratatui-widgets",
 ]
 
 [[package]]

@@ -3,3 +3,4 @@
 /coverage
 /.mit
 .DS_Store
+/docs/superpowers/**/*.md

@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::ListState;
-use std::fs;
 use std::io::BufRead;
 #[cfg(not(test))]
 use std::io::Read;
@@ -10,7 +9,9 @@ use std::io::Read;
 use std::thread;
 use unicode_width::UnicodeWidthStr;
 
-use crate::storage::{get_auth_accounts, save_auth, AuthAccount, Language};
+use crate::mico_api::is_auth_expired;
+use crate::mijia_api::is_mijia_auth_present;
+use crate::storage::{get_auth_accounts, AuthAccount, Language};
 use crate::tui::extract_auth_url_from_line;
 #[cfg(not(test))]
 use crate::tui::open_url_in_browser;
@@ -20,7 +21,7 @@ use crate::tui::shared::{
 };
 use crate::tui::{
     account_list_header_titles, apply_single_line_textarea_key, device_account_uid, lang_str,
-    AccountActionDialog, BoolDialog, BoolDialogTab, TuiApp,
+    AccountActionDialog, PropDialog, PropDialogTab, TuiApp,
 };
 #[cfg(not(test))]
 use crate::tui::{
@@ -75,7 +76,8 @@ pub(crate) struct AccountListRow {
     pub(crate) region: String,
     pub(crate) nickname: String,
     pub(crate) uid: String,
-    pub(crate) status: String,
+    pub(crate) xiaomi_status: String,
+    pub(crate) mijia_status: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,20 +85,33 @@ pub(crate) struct AccountListColumns {
     pub(crate) region: usize,
     pub(crate) nickname: usize,
     pub(crate) uid: usize,
-    pub(crate) status: usize,
+    pub(crate) xiaomi_status: usize,
+    pub(crate) mijia_status: usize,
 }
 
 impl AccountListColumns {
     fn total_width(self) -> usize {
-        self.region + self.nickname + self.uid + self.status
+        self.region + self.nickname + self.uid + self.xiaomi_status + self.mijia_status
     }
 
     fn shrink_largest(&mut self) -> bool {
-        let mut widths = [self.region, self.nickname, self.uid, self.status];
+        let mut widths = [
+            self.region,
+            self.nickname,
+            self.uid,
+            self.xiaomi_status,
+            self.mijia_status,
+        ];
         if !shrink_largest_width(&mut widths) {
             return false;
         }
-        [self.region, self.nickname, self.uid, self.status] = widths;
+        [
+            self.region,
+            self.nickname,
+            self.uid,
+            self.xiaomi_status,
+            self.mijia_status,
+        ] = widths;
         true
     }
 }
@@ -104,6 +119,9 @@ impl AccountListColumns {
 pub(crate) fn account_list_row(
     account: &AuthAccount,
     offline: bool,
+    xiaomi_invalid: bool,
+    mijia_invalid: bool,
+    checking: bool,
     lang: Language,
 ) -> AccountListRow {
     let region = if account.region.trim().is_empty() {
@@ -121,17 +139,44 @@ pub(crate) fn account_list_row(
     } else {
         account.user.uid.trim()
     };
-    let status = match (offline, lang) {
-        (true, Language::Chinese) => "离线",
-        (true, Language::English) => "Offline",
-        (false, Language::Chinese) => "在线",
-        (false, Language::English) => "Online",
+    let t = |zh: &'static str, en: &'static str| match lang {
+        Language::Chinese => zh,
+        Language::English => en,
+    };
+    let has_xiaomi =
+        !account.access_token.trim().is_empty() || !account.refresh_token.trim().is_empty();
+    // A token that is past expiry with no refresh token can never be revived,
+    // so treat it as invalid even before the async check confirms it.
+    let xiaomi_expired_local = is_auth_expired(account) && account.refresh_token.trim().is_empty();
+    let xiaomi_status = if !has_xiaomi {
+        t("未登录", "Missing")
+    } else if xiaomi_invalid || xiaomi_expired_local {
+        t("无效", "Invalid")
+    } else if checking {
+        // The async validity probe is still running; don't claim "logged in"
+        // until it confirms the token actually works.
+        t("检查中", "Checking")
+    } else if offline {
+        t("离线", "Offline")
+    } else {
+        t("已登录", "Logged In")
+    };
+    let mijia_present = is_mijia_auth_present(account.mijia.as_ref());
+    let mijia_status = if !mijia_present {
+        t("未登录", "Missing")
+    } else if mijia_invalid {
+        t("无效", "Invalid")
+    } else if checking {
+        t("检查中", "Checking")
+    } else {
+        t("已登录", "Logged In")
     };
     AccountListRow {
         region: region.to_string().to_uppercase(),
         nickname: nickname.to_string(),
         uid: uid.to_string(),
-        status: status.to_string(),
+        xiaomi_status: xiaomi_status.to_string(),
+        mijia_status: mijia_status.to_string(),
     }
 }
 
@@ -145,7 +190,8 @@ pub(crate) fn compute_account_list_columns(
         region: UnicodeWidthStr::width(headers[0]) + 2,
         nickname: UnicodeWidthStr::width(headers[1]) + 2,
         uid: UnicodeWidthStr::width(headers[2]) + 2,
-        status: UnicodeWidthStr::width(headers[3]) + 2,
+        xiaomi_status: UnicodeWidthStr::width(headers[3]) + 2,
+        mijia_status: UnicodeWidthStr::width(headers[4]) + 2,
     };
     for row in rows {
         columns.region = columns
@@ -157,9 +203,12 @@ pub(crate) fn compute_account_list_columns(
         columns.uid = columns
             .uid
             .max(UnicodeWidthStr::width(row.uid.as_str()) + 2);
-        columns.status = columns
-            .status
-            .max(UnicodeWidthStr::width(row.status.as_str()) + 2);
+        columns.xiaomi_status = columns
+            .xiaomi_status
+            .max(UnicodeWidthStr::width(row.xiaomi_status.as_str()) + 2);
+        columns.mijia_status = columns
+            .mijia_status
+            .max(UnicodeWidthStr::width(row.mijia_status.as_str()) + 2);
     }
     while columns.total_width() > available_width && columns.shrink_largest() {}
     columns
@@ -170,11 +219,12 @@ pub(crate) fn format_account_list_item_with_columns(
     columns: AccountListColumns,
 ) -> String {
     format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         display_truncate_pad(&row.region, columns.region),
         display_truncate_pad_with_ellipsis(&row.nickname, columns.nickname),
         display_truncate_pad(&row.uid, columns.uid),
-        display_truncate_pad(&row.status, columns.status),
+        display_truncate_pad(&row.xiaomi_status, columns.xiaomi_status),
+        display_truncate_pad(&row.mijia_status, columns.mijia_status),
     )
 }
 
@@ -184,11 +234,12 @@ pub(crate) fn format_account_list_header_with_columns(
 ) -> String {
     let headers = account_list_header_titles(lang);
     format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         display_truncate_pad(headers[0], columns.region),
         display_truncate_pad(headers[1], columns.nickname),
         display_truncate_pad(headers[2], columns.uid),
-        display_truncate_pad(headers[3], columns.status),
+        display_truncate_pad(headers[3], columns.xiaomi_status),
+        display_truncate_pad(headers[4], columns.mijia_status),
     )
 }
 
@@ -218,13 +269,13 @@ impl TuiApp {
     pub(crate) fn account_open_offline_prop_dialog_for_current(&mut self, error: &anyhow::Error) {
         if let Some(device) = self.devices.get(self.device_index) {
             let message = format!("{} ({}) offline: {error}", device.name, device.did);
-            self.prop_dialog = Some(BoolDialog {
+            self.prop_dialog = Some(PropDialog {
                 device_did: device.did.clone(),
                 device_name: device.name.clone(),
                 account_uid: device_account_uid(device).unwrap_or_default().to_string(),
                 items: Vec::new(),
                 selected: 0,
-                active_tab: BoolDialogTab::Writable,
+                active_tab: PropDialogTab::Writable,
                 writable_selected: 0,
                 readonly_selected: 0,
                 actions: Vec::new(),
@@ -241,6 +292,7 @@ impl TuiApp {
                 edit_error: None,
                 refreshing: false,
                 refresh_rx: None,
+                statistics_selected_bar: None,
             });
             self.log(message);
         } else {
@@ -257,6 +309,10 @@ impl TuiApp {
                 AccountActionDialog::Reauth { .. } => None,
                 AccountActionDialog::PushMessage { .. } => None,
                 AccountActionDialog::SettingsConfirm { .. } => None,
+                AccountActionDialog::UpdateAvailable { .. }
+                | AccountActionDialog::UpdateRunning { .. }
+                | AccountActionDialog::UpdateFinished { .. }
+                | AccountActionDialog::ThirdCloudSync { .. } => None,
             })
             .ok_or_else(|| anyhow!("账号操作菜单未打开"))?;
         let uid = self.current_uid().unwrap_or("-").to_string();
@@ -270,10 +326,14 @@ impl TuiApp {
                 });
             }
             1 => {
-                let result = self.account_start_reauthenticate_flow();
-                self.account_show_reauth_dialog_for_result("登录", uid.as_str(), result);
+                let result = self.account_start_reauthenticate_flow("xiaomi");
+                self.account_show_reauth_dialog_for_result("登录(小米)", uid.as_str(), result);
             }
             2 => {
+                let result = self.account_start_reauthenticate_flow("mijia");
+                self.account_show_reauth_dialog_for_result("登录(米家)", uid.as_str(), result);
+            }
+            3 => {
                 self.account_logout_current_account(uid.as_str())?;
                 self.account_action_dialog = None;
             }
@@ -371,22 +431,14 @@ impl TuiApp {
     }
 
     pub(crate) fn account_logout_current_account(&mut self, uid: &str) -> Result<()> {
-        if uid.trim().is_empty() || uid == "-" {
-            bail!("当前没有可登出的账号");
-        }
-
-        self.auth_state
-            .accounts
-            .retain(|account| account.user.uid != uid);
-        if self
-            .auth_state
-            .pending_auth
-            .as_ref()
-            .is_some_and(|account| account.user.uid == uid)
-        {
-            self.auth_state.pending_auth = None;
-        }
-        self.auth_state = save_auth(&self.auth_state)?;
+        // Remove the account from auth state and delete its on-disk cache via the
+        // shared action layer (the same path the CLI's `auth logout` uses), then
+        // reconcile the in-memory TUI state below.
+        self.auth_state = crate::actions::logout_account(
+            &self.home_dir.join(".mit"),
+            self.auth_state.clone(),
+            uid,
+        )?;
         self.accounts = get_auth_accounts(&self.auth_state)?
             .into_iter()
             .filter(|a| !a.user.uid.trim().is_empty())
@@ -414,13 +466,8 @@ impl TuiApp {
         }
 
         self.offline_account_uids.remove(uid);
-
-        let account_cache_dir = self.home_dir.join(".mit").join("accounts").join(uid);
-        if let Err(error) = fs::remove_dir_all(&account_cache_dir) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
-        }
+        self.invalid_xiaomi_account_uids.remove(uid);
+        self.invalid_mijia_account_uids.remove(uid);
 
         self.bootstrap_pending = None;
         if self.accounts.is_empty() {
@@ -458,7 +505,7 @@ impl TuiApp {
         }
     }
 
-    pub(crate) fn account_start_reauthenticate_flow(&mut self) -> Result<String> {
+    pub(crate) fn account_start_reauthenticate_flow(&mut self, _flow: &str) -> Result<String> {
         #[cfg(test)]
         {
             if let Ok(error_text) = std::env::var("MIT_TUI_TEST_REAUTH_ERROR") {
@@ -471,76 +518,7 @@ impl TuiApp {
 
         #[cfg(not(test))]
         {
-            use std::sync::mpsc;
-
-            let _ = cancel_active_auth_process(self.auth_flow_generation);
-            self.auth_flow_generation = self.auth_flow_generation.saturating_add(1);
-            let generation = self.auth_flow_generation;
-            let auth_flow_tx = self.auth_flow_tx.clone();
-            let executable = std::env::current_exe()?;
-            let mut child = std::process::Command::new(executable)
-                .arg("--json")
-                .arg("auth")
-                .arg("login")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()?;
-
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow!("failed to capture auth login output"))?;
-            let stderr = child.stderr.take();
-            set_active_auth_process(generation, child.id());
-            let (tx, rx) = mpsc::channel::<Result<String>>();
-
-            thread::spawn(move || {
-                let mut reader = std::io::BufReader::new(stdout);
-                forward_auth_login_output_until_eof(&mut reader, &tx);
-            });
-
-            if let Some(stderr) = stderr {
-                thread::spawn(move || {
-                    let mut reader = std::io::BufReader::new(stderr);
-                    let mut sink = String::new();
-                    let _ = reader.read_to_string(&mut sink);
-                });
-            }
-
-            thread::spawn(move || {
-                let status = child.wait();
-                clear_active_auth_process_if_generation(generation);
-                let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
-                let detail = match status {
-                    Ok(status) if status.success() => "auth login process completed".to_string(),
-                    Ok(status) => format!("auth login process exited with {status}"),
-                    Err(error) => format!("auth login process wait failed: {error}"),
-                };
-                let _ = auth_flow_tx.send(crate::tui::AuthFlowMessage::Completed {
-                    generation,
-                    success,
-                    detail,
-                });
-            });
-
-            let auth_url = match rx.recv_timeout(std::time::Duration::from_secs(6)) {
-                Ok(Ok(auth_url)) => auth_url,
-                Ok(Err(error)) => {
-                    let _ = cancel_active_auth_process(generation);
-                    return Err(error);
-                }
-                Err(_) => {
-                    let _ = cancel_active_auth_process(generation);
-                    return Err(anyhow!("timed out waiting for auth login url"));
-                }
-            };
-
-            if let Err(error) = open_url_in_browser(&auth_url) {
-                self.log(format!("failed to open browser automatically: {error}"));
-            }
-
-            Ok(auth_url)
+            self.account_start_login_process(Some(_flow))
         }
     }
 
@@ -550,9 +528,104 @@ impl TuiApp {
         }
         self.prop_dialog = None;
         let uid = self.current_uid().unwrap_or("-").to_string();
-        let result = self.account_start_reauthenticate_flow();
+        let result = self.account_start_combined_auth_flow();
         self.account_show_reauth_dialog_for_result("add-account", uid.as_str(), result);
         Ok(())
+    }
+
+    pub(crate) fn account_start_combined_auth_flow(&mut self) -> Result<String> {
+        #[cfg(test)]
+        {
+            if let Ok(error_text) = std::env::var("MIT_TUI_TEST_REAUTH_ERROR") {
+                if !error_text.trim().is_empty() {
+                    return Err(anyhow!("{error_text}"));
+                }
+            }
+            Ok("http://127.0.0.1:8000/login_redirect?code=test&state=test".to_string())
+        }
+
+        #[cfg(not(test))]
+        {
+            self.account_start_login_process(None)
+        }
+    }
+
+    #[cfg(not(test))]
+    fn account_start_login_process(&mut self, flow: Option<&str>) -> Result<String> {
+        use std::sync::mpsc;
+
+        let _ = cancel_active_auth_process(self.auth_flow_generation);
+        self.auth_flow_generation = self.auth_flow_generation.saturating_add(1);
+        let generation = self.auth_flow_generation;
+        let auth_flow_tx = self.auth_flow_tx.clone();
+        let executable = std::env::current_exe()?;
+        let mut command = std::process::Command::new(executable);
+        command
+            .arg("--json")
+            .arg("auth")
+            .arg("login")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(flow) = flow {
+            command.arg(flow);
+        }
+        let mut child = command.spawn()?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture auth login output"))?;
+        let stderr = child.stderr.take();
+        set_active_auth_process(generation, child.id());
+        let (tx, rx) = mpsc::channel::<Result<String>>();
+
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            forward_auth_login_output_until_eof(&mut reader, &tx);
+        });
+
+        if let Some(stderr) = stderr {
+            thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(stderr);
+                let mut sink = String::new();
+                let _ = reader.read_to_string(&mut sink);
+            });
+        }
+
+        thread::spawn(move || {
+            let status = child.wait();
+            clear_active_auth_process_if_generation(generation);
+            let success = status.as_ref().map(|s| s.success()).unwrap_or(false);
+            let detail = match status {
+                Ok(status) if status.success() => "auth login process completed".to_string(),
+                Ok(status) => format!("auth login process exited with {status}"),
+                Err(error) => format!("auth login process wait failed: {error}"),
+            };
+            let _ = auth_flow_tx.send(crate::tui::AuthFlowMessage::Completed {
+                generation,
+                success,
+                detail,
+            });
+        });
+
+        let auth_url = match rx.recv_timeout(std::time::Duration::from_secs(6)) {
+            Ok(Ok(auth_url)) => auth_url,
+            Ok(Err(error)) => {
+                let _ = cancel_active_auth_process(generation);
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = cancel_active_auth_process(generation);
+                return Err(anyhow!("timed out waiting for auth login url"));
+            }
+        };
+
+        if let Err(error) = open_url_in_browser(&auth_url) {
+            self.log(format!("failed to open browser automatically: {error}"));
+        }
+
+        Ok(auth_url)
     }
 }
 

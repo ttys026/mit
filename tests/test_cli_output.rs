@@ -52,6 +52,237 @@ fn auth_status_json_mode_is_rejected_as_invalid_subcommand() {
 }
 
 #[test]
+fn auth_list_json_reports_xiaomi_and_validates_mijia_status() {
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-cli-output-auth-list-status");
+    let auth_dir = test_home.join(".mit");
+    fs::create_dir_all(&auth_dir).unwrap();
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{
+  "accounts": [
+    {
+      "version": 1,
+      "xiaomi": {
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "abcd1234abcd1234abcd1234abcd1234",
+        "deviceId": "mico.abcd1234abcd1234abcd1234abcd1234",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 32503680000
+      },
+      "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+      "mijia": {
+        "ua": "Android-15-test",
+        "deviceId": "mijia-device-a",
+        "passO": "pass-o-a",
+        "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+        "passToken": "pass-token-a",
+        "userId": "1001",
+        "cUserId": "c-1001",
+        "serviceToken": "service-token-a",
+        "expireTime": 222,
+        "saveTime": 123
+      }
+    }
+  ],
+  "pendingAuth": null
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "auth", "list"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(payload["accounts"][0]["xiaomiStatus"], "loggedIn");
+    assert_eq!(payload["accounts"][0]["mijiaStatus"], "loggedIn");
+    let requests = server.requests();
+    let check_request = requests
+        .iter()
+        .find(|request| request.path == "/app/v2/message/v2/check_new_msg")
+        .expect("check_new_msg request");
+    let cookie = check_request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+    assert!(cookie.contains("userId=1001;"), "{cookie}");
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/app/v2/message/v2/check_new_msg"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn auth_list_json_renews_expired_mijia_service_token() {
+    let server = MockMicoServer::start_with_mijia_renewal();
+    let test_home = make_temp_dir("mit-cli-output-auth-list-renew-mijia");
+    let auth_dir = test_home.join(".mit");
+    fs::create_dir_all(&auth_dir).unwrap();
+    let auth_path = auth_dir.join("auth.json");
+    fs::write(
+        &auth_path,
+        r#"{
+  "accounts": [
+    {
+      "version": 1,
+      "xiaomi": null,
+      "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+      "mijia": {
+        "ua": "Android-15-test",
+        "deviceId": "mijia-device-a",
+        "passO": "pass-o-a",
+        "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+        "passToken": "pass-token-a",
+        "userId": "1001",
+        "cUserId": "c-1001",
+        "serviceToken": "service-token-old",
+        "expireTime": 222,
+        "saveTime": 123
+      }
+    }
+  ],
+  "pendingAuth": null
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "auth", "list"])
+        .env("MIT_HOME", &test_home)
+        .env(
+            "MIT_MIJIA_SERVICE_LOGIN_URL",
+            server.mijia_service_login_url(),
+        )
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(payload["accounts"][0]["mijiaStatus"], "loggedIn");
+
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let mijia = &saved["accounts"][0]["mijia"];
+    assert_eq!(mijia["serviceToken"], "service-token-renewed");
+    assert_eq!(mijia["passToken"], "pass-token-renewed");
+    assert_eq!(mijia["userId"], "1001");
+    assert!(mijia["expireTime"].as_i64().unwrap() > 222);
+    assert!(mijia["saveTime"].as_i64().unwrap() > 123);
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/message/v2/check_new_msg")
+            .count(),
+        2
+    );
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/pass/serviceLogin"));
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/mijia/renew-callback"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn auth_list_json_renews_mijia_service_token_after_http_401() {
+    let server = MockMicoServer::start_with_mijia_renewal_unauthorized();
+    let test_home = make_temp_dir("mit-cli-output-auth-list-renew-mijia-401");
+    let auth_dir = test_home.join(".mit");
+    fs::create_dir_all(&auth_dir).unwrap();
+    let auth_path = auth_dir.join("auth.json");
+    fs::write(
+        &auth_path,
+        r#"{
+  "accounts": [
+    {
+      "version": 1,
+      "xiaomi": null,
+      "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+      "mijia": {
+        "ua": "Android-15-test",
+        "deviceId": "mijia-device-a",
+        "passO": "pass-o-a",
+        "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+        "passToken": "pass-token-a",
+        "userId": "1001",
+        "cUserId": "c-1001",
+        "serviceToken": "service-token-old",
+        "expireTime": 222,
+        "saveTime": 123
+      }
+    }
+  ],
+  "pendingAuth": null
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "auth", "list"])
+        .env("MIT_HOME", &test_home)
+        .env(
+            "MIT_MIJIA_SERVICE_LOGIN_URL",
+            server.mijia_service_login_url(),
+        )
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(payload["accounts"][0]["mijiaStatus"], "loggedIn");
+
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+    let mijia = &saved["accounts"][0]["mijia"];
+    assert_eq!(mijia["serviceToken"], "service-token-renewed");
+    assert_eq!(mijia["passToken"], "pass-token-renewed");
+    assert_eq!(mijia["userId"], "1001");
+    assert!(mijia["expireTime"].as_i64().unwrap() > 222);
+    assert!(mijia["saveTime"].as_i64().unwrap() > 123);
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/message/v2/check_new_msg")
+            .count(),
+        2
+    );
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/pass/serviceLogin"));
+    assert!(requests
+        .iter()
+        .any(|request| request.path == "/mijia/renew-callback"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
 fn bare_root_json_mode_prints_json() {
     let output = Command::new(env!("CARGO_BIN_EXE_mit"))
         .arg("--json")
@@ -79,8 +310,14 @@ fn bare_root_uses_chinese_summary_by_default() {
             "mit 可用命令：",
             "- auth：登录与账号管理",
             "- devices：列出设备",
+            "- third-party：管理三方平台设备",
             "- props：读写 MIoT 属性和 action",
             "- push：向已登录账号发送通知",
+            "- logs：查看设备操作记录（米家历史日志）",
+            "- stats：查看设备统计数据（米家统计）",
+            "- cache：清理缓存（保留登录）",
+            "- reset：重置全部数据（删除 ~/.mit）",
+            "- update：检查并升级到最新版本",
             "- tui：启动全屏 TUI 控制台",
             "",
             "运行 `mit --help` 查看完整帮助。",
@@ -90,7 +327,10 @@ fn bare_root_uses_chinese_summary_by_default() {
 
 #[test]
 fn cli_source_does_not_keep_unused_command_formatters() {
-    let source = include_str!("../src/cli.rs");
+    let source = concat!(
+        include_str!("../src/cli/mod.rs"),
+        include_str!("../src/cli/login.rs"),
+    );
 
     assert!(!source.contains("pub fn format_props_set_command("));
     assert!(!source.contains("pub fn format_props_act_command("));
@@ -118,6 +358,160 @@ fn devices_list_all_groups_results_by_account_across_multiple_accounts() {
     assert!(stdout.contains("账号B（1002）:"));
     assert!(stdout.contains("living-room"));
     assert!(stdout.contains("bedroom"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn third_party_list_json_lists_groups() {
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-cli-output-third-party-list");
+    write_mijia_auth_fixture(&test_home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "third-party", "list", "--uid", "1001"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(payload["type"], "thirdPartyList");
+    assert_eq!(payload["accounts"].as_array().unwrap().len(), 1);
+    let account = &payload["accounts"][0];
+    assert_eq!(account["uid"], "1001");
+    assert_eq!(account["nickname"], "账号A");
+    let groups = account["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    let juhl = groups
+        .iter()
+        .find(|group| group["groupId"] == 2069)
+        .unwrap();
+    assert_eq!(juhl["name"], "海信爱家");
+    assert_eq!(juhl["deviceCount"], 2);
+    assert_eq!(juhl["devices"][0]["did"], "third-juhl-1");
+    assert_eq!(juhl["devices"][1]["did"], "third-juhl-2");
+    let eco = groups
+        .iter()
+        .find(|group| group["groupId"] == 1128)
+        .unwrap();
+    assert_eq!(eco["name"], "科沃斯机器人");
+    assert_eq!(eco["deviceCount"], 1);
+    assert_eq!(eco["devices"][0]["did"], "third-eco-1");
+    assert!(!groups.iter().any(|group| group["groupId"] == 9999));
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/business/thirdcloud/api/group/sortedList")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/device_list")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/sync")
+            .count(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn third_party_list_text_renders_device_tree() {
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-cli-output-third-party-list-text");
+    write_mijia_auth_fixture(&test_home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["third-party", "list", "--uid", "1001"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains("账号A（1001）:"));
+    assert!(stdout.contains("海信爱家 / juhl（2069）"));
+    assert!(stdout.contains("├─ third-juhl-1"));
+    assert!(stdout.contains("└─ third-juhl-2"));
+    assert!(stdout.contains("科沃斯机器人 / eco（1128）"));
+    assert!(stdout.contains("└─ third-eco-1"));
+    assert!(!stdout.contains("未绑定平台"));
+
+    let _ = fs::remove_dir_all(&test_home);
+}
+
+#[test]
+fn third_party_sync_json_syncs_bound_groups() {
+    let server = MockMicoServer::start();
+    let test_home = make_temp_dir("mit-cli-output-third-party-sync");
+    write_mijia_auth_fixture(&test_home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "third-party", "sync", "--uid", "1001"])
+        .env("MIT_HOME", &test_home)
+        .env("MIT_MIJIA_API_BASE_URL", server.mijia_api_base_url())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(payload["type"], "thirdPartyDeviceSync");
+    assert_eq!(payload["accounts"].as_array().unwrap().len(), 1);
+    let account = &payload["accounts"][0];
+    assert_eq!(account["uid"], "1001");
+    assert_eq!(account["nickname"], "账号A");
+    let groups = account["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["groupId"], 2069);
+    assert_eq!(groups[0]["name"], "海信爱家");
+    assert_eq!(groups[0]["success"], true);
+    assert_eq!(groups[0]["result"], "ok");
+    assert_eq!(groups[0]["deviceCount"], 2);
+    assert_eq!(groups[1]["groupId"], 1128);
+    assert_eq!(groups[1]["name"], "科沃斯机器人");
+    assert_eq!(groups[1]["success"], true);
+    assert_eq!(groups[1]["deviceCount"], 1);
+    assert!(!groups.iter().any(|group| group["groupId"] == 9999));
+
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/business/thirdcloud/api/group/sortedList")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/sync")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/app/v2/thirdcloud2cloud/device_list")
+            .count(),
+        2
+    );
 
     let _ = fs::remove_dir_all(&test_home);
 }
@@ -342,15 +736,50 @@ fn write_auth_fixture(home: &std::path::Path) {
   "accounts": [
     {
       "version": 1,
-      "region": "cn",
-      "redirectUri": "http://127.0.0.1:8000/login_redirect",
-      "uuid": "abcd1234abcd1234abcd1234abcd1234",
-      "deviceId": "mico.abcd1234abcd1234abcd1234abcd1234",
-      "state": "state-a",
-      "accessToken": "token-a",
-      "refreshToken": "refresh-a",
-      "expiresTs": 12345,
+      "xiaomi": {
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "abcd1234abcd1234abcd1234abcd1234",
+        "deviceId": "mico.abcd1234abcd1234abcd1234abcd1234",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 12345
+      },
+      "mijia": null,
       "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
+    }
+  ],
+  "pendingAuth": null
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn write_mijia_auth_fixture(home: &std::path::Path) {
+    let auth_dir = home.join(".mit");
+    fs::create_dir_all(&auth_dir).unwrap();
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{
+  "accounts": [
+    {
+      "version": 1,
+      "xiaomi": null,
+      "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"},
+      "mijia": {
+        "ua": "Android-15-test",
+        "deviceId": "mijia-device-a",
+        "passO": "pass-o-a",
+        "ssecurity": "AQIDBAUGBwgJCgsMDQ4PEA==",
+        "passToken": "pass-token-a",
+        "userId": "1001",
+        "cUserId": "c-1001",
+        "serviceToken": "service-token-a",
+        "expireTime": 222,
+        "saveTime": 123
+      }
     }
   ],
   "pendingAuth": null
@@ -414,8 +843,13 @@ fn source_tests_live_under_tests_folder() {
         "src/mico_api.rs",
     );
     assert_externalized_test_hook(
+        include_str!("../src/mijia_api.rs"),
+        "#[path = \"../tests/module_tests/mijia_api.rs\"]",
+        "src/mijia_api.rs",
+    );
+    assert_externalized_test_hook(
         include_str!("../src/tui/mod.rs"),
-        "#[path = \"../../tests/module_tests/tui.rs\"]",
+        "#[path = \"../../tests/module_tests/tui/mod.rs\"]",
         "src/tui/mod.rs",
     );
 }
@@ -662,26 +1096,32 @@ fn write_partial_failure_auth_fixture(home: &std::path::Path) {
   "accounts": [
     {
       "version": 1,
-      "region": "cn",
-      "redirectUri": "http://127.0.0.1:8000/login_redirect",
-      "uuid": "abcd1234abcd1234abcd1234abcd1234",
-      "deviceId": "mico.abcd1234abcd1234abcd1234abcd1234",
-      "state": "state-a",
-      "accessToken": "token-a",
-      "refreshToken": "refresh-a",
-      "expiresTs": 12345,
+      "xiaomi": {
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "abcd1234abcd1234abcd1234abcd1234",
+        "deviceId": "mico.abcd1234abcd1234abcd1234abcd1234",
+        "state": "state-a",
+        "accessToken": "token-a",
+        "refreshToken": "refresh-a",
+        "expiresTs": 12345
+      },
+      "mijia": null,
       "user": {"uid": "1001", "nickname": "账号A", "icon": "", "unionId": "union-a"}
     },
     {
       "version": 1,
-      "region": "cn",
-      "redirectUri": "http://127.0.0.1:8000/login_redirect",
-      "uuid": "abcd1234abcd1234abcd1234abcd1235",
-      "deviceId": "mico.abcd1234abcd1234abcd1234abcd1235",
-      "state": "state-b",
-      "accessToken": "token-b",
-      "refreshToken": "refresh-b",
-      "expiresTs": 67890,
+      "xiaomi": {
+        "region": "cn",
+        "redirectUri": "http://127.0.0.1:8000/login_redirect",
+        "uuid": "abcd1234abcd1234abcd1234abcd1235",
+        "deviceId": "mico.abcd1234abcd1234abcd1234abcd1235",
+        "state": "state-b",
+        "accessToken": "token-b",
+        "refreshToken": "refresh-b",
+        "expiresTs": 67890
+      },
+      "mijia": null,
       "user": {"uid": "1002", "nickname": "账号B", "icon": "", "unionId": "union-b"}
     }
   ],
@@ -690,4 +1130,57 @@ fn write_partial_failure_auth_fixture(home: &std::path::Path) {
 "#,
     )
     .unwrap();
+}
+
+#[test]
+fn update_check_text_reports_newer_version() {
+    let server = MockMicoServer::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["update", "--check"])
+        .env("MIT_GITHUB_API_BASE", server.base_url())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("发现新版本 v9.9.9"), "stdout was: {stdout}");
+}
+
+#[test]
+fn update_json_reports_latest_release() {
+    let server = MockMicoServer::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["--json", "update"])
+        .env("MIT_GITHUB_API_BASE", server.base_url())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["type"], "updateCheck");
+    assert_eq!(value["latest"], "v9.9.9");
+    assert_eq!(value["upToDate"], false);
+}
+
+#[test]
+fn update_check_reports_rate_limit_clearly() {
+    let server = MockMicoServer::start();
+    let output = Command::new(env!("CARGO_BIN_EXE_mit"))
+        .args(["update", "--check"])
+        .env(
+            "MIT_GITHUB_API_BASE",
+            format!("{}/ratelimited", server.base_url()),
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("限流"), "stderr was: {stderr}");
 }
