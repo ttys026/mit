@@ -124,6 +124,11 @@ mit props sub                                    # Subscribe to all device prope
 mit props sub did-1                              # Subscribe to all changes for one device
 mit props sub did-1 2 1                          # Subscribe to one property
 
+# ── Legacy miIO commands (LAN only) ───────────────────────
+mit raw 123456789 get_prop '["tds_warn_thd","lightMode"]'
+mit --json raw 123456789 get_prop '["tds_warn_thd","lightMode"]' > water-settings.json
+mit raw 123456789 set_lightMode '["0"]'          # Example only: verify your model first
+
 # ── Device history & statistics (Mijia) ────────────────────
 mit logs did-1 2.1                               # Operation records for property 2.1
 mit logs did-1 2.1 3.1 --limit 100               # Multiple keys, up to 100 records each
@@ -139,6 +144,8 @@ mit reset --yes                                  # Delete all data under ~/.mit 
 - After browser login completes, `mit auth login` finalises auth automatically and shows a success page in the browser.
 - `mit props get/set/act/sub` work directly without opening the TUI.
 - `mit props sub` streams subscription logs and property updates to stdout until interrupted.
+- `mit raw <DID> <METHOD> [PARAMS]` sends a legacy miIO command using only the per-account local credential snapshot. Log in and let `mit tui` sync devices once first. No OAuth refresh, cloud lookup/fallback, or automatic retry is performed; expired cloud credentials do not prevent local use. Use `--uid` if multiple accounts have the device. A stale IP/token requires a new sync.
+- Raw `PARAMS` must be a JSON array or object (default `[]`); strings and numbers are passed unchanged. Output is the device's `result` payload (`--json` prints compact JSON). Device errors exit nonzero on stderr with no success output. A timeout after sending may still mean the command executed; read back before retrying writes. Method/property support depends on the device firmware; this does not establish that any water-purifier setting is writable.
 - `mit tui` syncs devices and caches MIoT specs under `~/.mit/cache/specs/`.
 - bare `auth` keeps compatibility with `mit auth --help`.
 - bare `devices` keeps compatibility with `mit devices --help`.
