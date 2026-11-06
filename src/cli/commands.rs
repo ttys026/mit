@@ -738,6 +738,49 @@ struct UpdateCheckOutput<'a> {
     up_to_date: bool,
 }
 
+pub(in crate::cli) fn handle_raw(output_mode: OutputMode, args: RawArgs) -> Result<()> {
+    // Do not use find_target_device / ensure_fresh_account here: they may fetch
+    // devices or refresh OAuth over the cloud, even when --LAN is set.
+    let accounts = get_auth_accounts(&load_auth()?)?;
+    let mut credentials = Vec::new();
+    for account in accounts {
+        if args
+            .uid
+            .as_ref()
+            .is_some_and(|uid| uid != &account.user.uid)
+        {
+            continue;
+        }
+        if let Some(credential) =
+            MicoClient::load_snapshot_credential_for_uid(&account.user.uid, &args.did)?
+        {
+            credentials.push(credential);
+        }
+    }
+    let credential = match credentials.as_slice() {
+        [] => bail!(
+            "未找到设备 {} 的本地凭据；请先登录并进入 mit tui 同步设备",
+            args.did
+        ),
+        [credential] => credential,
+        _ => bail!("设备 {} 出现在多个账号中，请用 --uid 指定账号", args.did),
+    };
+    // Raw commands may write settings or trigger actions. Send exactly once:
+    // a lost reply does not mean the device failed to execute the command.
+    let result = crate::miot_lan::lan_request_direct(
+        &credential.local_ip,
+        &credential.token,
+        &args.method,
+        &args.params,
+        std::time::Duration::from_secs(3),
+    )?;
+    match output_mode {
+        OutputMode::Json => print_json(&result)?,
+        OutputMode::Text => println!("{}", serde_json::to_string_pretty(&result)?),
+    }
+    Ok(())
+}
+
 pub(in crate::cli) fn handle_props(output_mode: OutputMode, args: PropsArgs) -> Result<()> {
     let Some(command) = args.command else {
         return show_subcommand_help(output_mode, "props");

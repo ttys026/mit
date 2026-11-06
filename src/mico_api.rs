@@ -229,10 +229,9 @@ impl MicoClient {
         })
     }
 
-    fn validated_account_uid(&self) -> Result<&str> {
+    fn local_credentials_path_for_uid(uid: &str) -> Result<PathBuf> {
         use std::path::Component;
 
-        let uid = self.account_uid.as_str();
         if uid.trim().is_empty() {
             return Err(anyhow!(
                 "account uid is empty; refusing to write per-account local credential snapshot"
@@ -246,7 +245,9 @@ impl MicoClient {
 
         let mut components = std::path::Path::new(uid).components();
         match (components.next(), components.next()) {
-            (Some(Component::Normal(_)), None) => Ok(uid),
+            (Some(Component::Normal(_)), None) => {
+                Ok(get_account_dir(uid).join("local_credentials.json"))
+            }
             _ => Err(anyhow!(
                 "account uid is not a safe path component: {uid}; refusing to write per-account local credential snapshot"
             )),
@@ -254,7 +255,7 @@ impl MicoClient {
     }
 
     fn local_credentials_path(&self) -> Result<PathBuf> {
-        Ok(get_account_dir(self.validated_account_uid()?).join("local_credentials.json"))
+        Self::local_credentials_path_for_uid(&self.account_uid)
     }
 
     fn write_local_credentials_snapshot(
@@ -917,7 +918,15 @@ impl MicoClient {
     /// Load a single device's `{localIp, token}` from the persisted snapshot the
     /// TUI writes, if present and complete.
     fn load_snapshot_credential(&self, did: &str) -> Result<Option<LocalDeviceCredential>> {
-        let path = self.local_credentials_path()?;
+        Self::load_snapshot_credential_for_uid(&self.account_uid, did)
+    }
+
+    /// Read a local snapshot without constructing an OAuth/HTTP client.
+    pub(crate) fn load_snapshot_credential_for_uid(
+        uid: &str,
+        did: &str,
+    ) -> Result<Option<LocalDeviceCredential>> {
+        let path = Self::local_credentials_path_for_uid(uid)?;
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(_) => return Ok(None),

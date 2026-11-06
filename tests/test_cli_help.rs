@@ -60,6 +60,7 @@ fn bare_root_prints_command_summary() {
             "- devices：列出设备",
             "- third-party：管理三方平台设备",
             "- props：读写 MIoT 属性和 action",
+            "- raw：发送原始 miIO 命令（仅局域网）",
             "- push：向已登录账号发送通知",
             "- logs：查看设备操作记录（米家历史日志）",
             "- stats：查看设备统计数据（米家统计）",

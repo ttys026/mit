@@ -21,7 +21,7 @@ pub use commands::{
 };
 use commands::{
     handle_auth_logout, handle_cache, handle_devices, handle_logs, handle_props, handle_push,
-    handle_reset, handle_stats, handle_third_party, handle_tui, handle_update,
+    handle_raw, handle_reset, handle_stats, handle_third_party, handle_tui, handle_update,
 };
 use login::{run_mijia_login, run_xiaomi_login};
 
@@ -57,6 +57,8 @@ pub enum RootCommand {
     ThirdParty(ThirdPartyArgs),
     #[command(about = "读写 MIoT 属性和 action")]
     Props(PropsArgs),
+    #[command(about = "发送原始 miIO 命令（仅局域网）")]
+    Raw(RawArgs),
     #[command(about = "向已登录账号发送通知")]
     Push(PushArgs),
     #[command(about = "查看设备操作记录（米家历史日志）")]
@@ -156,6 +158,27 @@ pub struct ThirdPartyArgs {
 pub struct PropsArgs {
     #[command(subcommand)]
     pub command: Option<PropsCommand>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RawArgs {
+    #[arg(help = "设备 DID（必须已有本地凭据缓存）")]
+    pub did: String,
+    #[arg(value_parser = parse_non_empty_text, help = "miIO 方法名，例如 get_prop")]
+    pub method: String,
+    #[arg(default_value = "[]", value_parser = parse_raw_params, help = "JSON 数组或对象；保留字符串和数字类型")]
+    pub params: serde_json::Value,
+    #[arg(long, help = "目标账号 UID；设备出现在多个账号时必须指定")]
+    pub uid: Option<String>,
+}
+
+fn parse_raw_params(text: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| format!("无效 JSON 参数: {error}"))?;
+    if !value.is_array() && !value.is_object() {
+        return Err("参数必须是 JSON 数组或对象".to_string());
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -461,6 +484,7 @@ pub fn run(args: Cli) -> Result<()> {
         Some(RootCommand::Devices(args)) => handle_devices(output_mode, args),
         Some(RootCommand::ThirdParty(args)) => handle_third_party(output_mode, args),
         Some(RootCommand::Props(args)) => handle_props(output_mode, args),
+        Some(RootCommand::Raw(args)) => handle_raw(output_mode, args),
         Some(RootCommand::Push(args)) => handle_push(output_mode, args),
         Some(RootCommand::Logs(args)) => handle_logs(output_mode, args),
         Some(RootCommand::Stats(args)) => handle_stats(output_mode, args),

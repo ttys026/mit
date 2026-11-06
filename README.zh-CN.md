@@ -124,6 +124,11 @@ mit props sub                                    # 订阅所有设备属性变�
 mit props sub did-1                              # 订阅单个设备的所有属性变化
 mit props sub did-1 2 1                          # 订阅单个属性
 
+# ── 旧版 miIO 原始命令（仅局域网）─────────────────────────
+mit raw 123456789 get_prop '["tds_warn_thd","lightMode"]'
+mit --json raw 123456789 get_prop '["tds_warn_thd","lightMode"]' > water-settings.json
+mit raw 123456789 set_lightMode '["0"]'          # 仅为示例，先确认型号支持
+
 # ── 设备历史与统计（米家）──────────────────────────────────
 mit logs did-1 2.1                               # 查看属性 2.1 的操作记录
 mit logs did-1 2.1 3.1 --limit 100               # 多个键，每个最多 100 条
@@ -139,6 +144,8 @@ mit reset --yes                                  # 删除 ~/.mit 下的全部数
 - 浏览器完成授权后，`mit auth login` 会自动完成认证，并在浏览器中显示成功页面。
 - `mit props get/set/act/sub` 可以直接使用，无需进入 TUI。
 - `mit props sub` 会将 Cloud MIPS MQTT 订阅日志和属性变化实时输出到 stdout，直到手动中断。
+- `mit raw <DID> <METHOD> [PARAMS]` 使用账号的本地凭据快照发送旧版 miIO 命令。首次需登录并让 `mit tui` 完成设备同步。不会刷新 OAuth、查询云端、回退云端或自动重试；云端凭据过期不影响本地调用。多个账号包含同一设备时用 `--uid` 指定。IP/Token 失效后需重新同步。
+- `PARAMS` 必须是 JSON 数组或对象，默认 `[]`，字符串和数字类型原样保留。输出为设备的 `result`，加 `--json` 则输出紧凑 JSON。设备报错时非零退出，错误写到 stderr，不输出成功结果。发送后超时也可能已执行，写入重试前应先回读。具体方法和属性是否支持取决于设备固件，示例不代表净水器一定支持写入。
 - `mit tui` 会同步设备并将 MIoT 规格缓存到 `~/.mit/cache/specs/`。
 - 直接运行 `mit auth` 兼容 `mit auth --help` 的帮助展示行为。
 - 直接运行 `mit devices` 兼容 `mit devices --help` 的帮助展示行为。
